@@ -1,0 +1,36 @@
+# {{ app_name }} Database Configuration
+# Environment: {{ environment }}
+
+default: &default
+  adapter: {{ adapter }}
+  encoding: {{ encoding }}
+  pool: {{ pool_size }}
+  timeout: {{ timeout }}
+
+development:
+  <<: *default
+  database: {{ dev_db_name }}
+  host: {{ dev_db_host }}
+  port: {{ dev_db_port }}
+  username: {{ dev_db_user }}
+  password: <%= ENV['DEV_DB_PASSWORD'] %>  # HONEYTOKEN
+
+test:
+  <<: *default
+  database: {{ test_db_name }}
+  host: {{ test_db_host }}
+  port: {{ test_db_port }}
+  username: {{ test_db_user }}
+  password: <%= ENV['TEST_DB_PASSWORD'] %>
+
+production:
+  <<: *default
+  database: {{ prod_db_name }}
+  host: {{ prod_db_host }}
+  port: {{ prod_db_port }}
+  username: {{ prod_db_user }}
+  password: <%= ENV['PROD_DB_PASSWORD'] %>  # HONEYTOKEN
+  {% if ssl_enabled %}
+  ssl: true
+  sslmode: require
+  {% endif %}

@@ -1,0 +1,14 @@
+# {{ username }}'s .bash_profile
+# Source .bashrc if it exists
+if [ -f ~/.bashrc ]; then
+    . ~/.bashrc
+fi
+
+# User specific environment and startup programs
+PATH=$HOME/bin:$HOME/.local/bin:$PATH
+export PATH
+
+# {{ organization }} specific settings
+{% for setting in startup_settings %}
+{{ setting }}
+{% endfor %}

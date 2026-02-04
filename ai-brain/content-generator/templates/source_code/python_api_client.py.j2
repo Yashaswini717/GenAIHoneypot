@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""
+API client for {{ service_name }}.
+Handles authentication and API requests.
+"""
+import os
+import requests
+from typing import Optional, Dict, Any
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+class {{ class_name }}:
+    """Client for {{ service_name }} API."""
+    
+    def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
+        """
+        Initialize API client.
+        
+        Args:
+            base_url: API base URL (defaults to env variable)
+            api_key: API authentication key (defaults to env variable)
+        """
+        self.base_url = base_url or os.getenv('{{ env_prefix }}_BASE_URL', '{{ default_base_url }}')
+        self.api_key = api_key or os.getenv('{{ env_prefix }}_API_KEY', '{{ default_api_key }}')  # HONEYTOKEN
+        
+        self.session = requests.Session()
+        
+        # Configure retries
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        # Set default headers
+        self.session.headers.update({
+            'Authorization': f'Bearer {self.api_key}',
+            'Content-Type': 'application/json',
+            'User-Agent': '{{ user_agent }}'
+        })
+    
+    def _request(self, method: str, endpoint: str, **kwargs) -> Dict[Any, Any]:
+        """
+        Make API request.
+        
+        Args:
+            method: HTTP method
+            endpoint: API endpoint
+            **kwargs: Additional request parameters
+            
+        Returns:
+            Response JSON data
+        """
+        url = f"{self.base_url}{endpoint}"
+        
+        try:
+            response = self.session.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            print(f"HTTP error: {e}")
+            raise
+        except requests.exceptions.RequestException as e:
+            print(f"Request error: {e}")
+            raise
+    
+    {% for endpoint in endpoints %}
+    def {{ endpoint.method_name }}(self, {{ endpoint.params }}):
+        """{{ endpoint.docstring }}"""
+        {% if endpoint.http_method == 'GET' %}
+        return self._request('GET', '{{ endpoint.path }}')
+        {% elif endpoint.http_method == 'POST' %}
+        return self._request('POST', '{{ endpoint.path }}', json={{ endpoint.body_param }})
+        {% elif endpoint.http_method == 'PUT' %}
+        return self._request('PUT', '{{ endpoint.path }}', json={{ endpoint.body_param }})
+        {% elif endpoint.http_method == 'DELETE' %}
+        return self._request('DELETE', '{{ endpoint.path }}')
+        {% endif %}
+    
+    {% endfor %}
+
+if __name__ == '__main__':
+    # Example usage
+    client = {{ class_name }}()
+    
+    # Test connection
+    try:
+        result = client.{{ first_endpoint_name }}()
+        print(f"Connection successful: {result}")
+    except Exception as e:
+        print(f"Connection failed: {e}")

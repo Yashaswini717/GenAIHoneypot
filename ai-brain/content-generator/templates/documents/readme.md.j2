@@ -1,0 +1,60 @@
+# {{ project_name }}
+
+{{ tagline }}
+
+## Overview
+
+{{ overview }}
+
+## Features
+
+{% for feature in features %}
+- {{ feature }}
+{% endfor %}
+
+## Installation
+
+```bash
+{{ install_commands }}
+```
+
+## Usage
+
+{{ usage_instructions }}
+
+## Configuration
+
+{{ configuration_details }}
+
+## API Documentation
+
+{% if api_endpoints %}
+{% for endpoint in api_endpoints %}
+### {{ endpoint.method }} {{ endpoint.path }}
+
+{{ endpoint.description }}
+
+**Request:**
+```json
+{{ endpoint.request_example }}
+```
+
+**Response:**
+```json
+{{ endpoint.response_example }}
+```
+
+{% endfor %}
+{% endif %}
+
+## Contributing
+
+{{ contributing_guidelines }}
+
+## License
+
+{{ license }}
+
+## Contact
+
+{{ contact_info }}
