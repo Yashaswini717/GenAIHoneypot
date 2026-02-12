@@ -37,6 +37,7 @@ async def generate_source_code(
         "language": request.language,
         "script_type": request.script_type,
         "purpose": request.purpose,
+        "artifact_layer": request.artifact_layer.value,
         **request.context,
     }
     
@@ -77,6 +78,7 @@ async def generate_config(
     context = {
         "config_type": request.config_type,
         "persona": request.persona,
+        "artifact_layer": request.artifact_layer.value,
         **request.context,
     }
     
@@ -122,6 +124,7 @@ async def generate_logs(
         "log_format": request.log_format,
         "industry": request.industry,
         "compliance": request.compliance,
+        "artifact_layer": request.artifact_layer.value,
         **request.context,
     }
     
@@ -168,6 +171,7 @@ async def generate_document(
         "hide_honeypot_concepts": request.hide_honeypot_concepts,
         "industry": request.industry,
         "compliance": request.compliance,
+        "artifact_layer": request.artifact_layer.value,
         **request.context,
     }
     

@@ -17,9 +17,9 @@ from .base import BaseGenerator, GeneratedContent
 class UserDocumentGenerator(BaseGenerator):
     """Generate realistic user documents."""
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, artifact_layer: str = "system") -> str:
         """Get system prompt for document generation."""
-        return get_system_prompt("document")
+        return get_system_prompt("document", artifact_layer)
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         """Build prompt for document generation."""
@@ -54,22 +54,14 @@ class UserDocumentGenerator(BaseGenerator):
         """
         doc_type = context.get("doc_type", "notes")
         
-        # Build and generate
-        prompt = self.build_prompt(context)
-        document = await self._generate_with_llm(prompt, temperature=0.8)
+        # Set default temperature for documents
+        if "temperature" not in context:
+            context = {**context, "temperature": 0.8}
         
-        # Validate
-        validation_results = await self._validate_content(
-            content=document,
-            file_type="generic",
+        return await self._generate_and_enforce(
             context=context,
-        )
-        
-        return self._create_content(
-            content=document,
             content_type="document",
             file_type="generic",
-            validation_results=validation_results,
             doc_type=doc_type,
             audience=context.get("audience", "internal"),
             realism_level=context.get("realism_level", "high"),

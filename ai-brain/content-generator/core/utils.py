@@ -264,3 +264,73 @@ def format_file_size(size_bytes: int) -> str:
             return f"{size_bytes:.2f} {unit}"
         size_bytes /= 1024.0
     return f"{size_bytes:.2f} PB"
+
+
+# ──────────────────────────────────────────────
+# Shared patterns for AI narration detection
+# ──────────────────────────────────────────────
+
+# Patterns that indicate AI narration leaking into output
+AI_NARRATION_PATTERNS = [
+    re.compile(r'^(?:Here(?:\'s| is) (?:a|an|the) .+?[:\.]\s*\n)', re.IGNORECASE),
+    re.compile(r'^(?:Below is .+?[:\.]\s*\n)', re.IGNORECASE),
+    re.compile(r'^(?:This (?:script|file|code|config|log|document) .+?[:\.]\s*\n)', re.IGNORECASE),
+    re.compile(r'^(?:I\'ve (?:created|generated|written) .+?[:\.]\s*\n)', re.IGNORECASE),
+    re.compile(r'^(?:Sure[,!].*?\n)', re.IGNORECASE),
+    re.compile(r'^(?:Certainly[,!] .+?[:\.]\s*\n)', re.IGNORECASE),
+    re.compile(r'^(?:Of course[,!] .+?[:\.]\s*\n)', re.IGNORECASE),
+    re.compile(r'^(?:Let me .+?[:\.]\s*\n)', re.IGNORECASE),
+    re.compile(r'^(?:As requested[,.:] .+?\n)', re.IGNORECASE),
+    re.compile(r'^(?:The following .+?[:\.]\s*\n)', re.IGNORECASE),
+    re.compile(r'^(?:Here you go[,!:.].*?\n)', re.IGNORECASE),
+    re.compile(r'^(?:I have (?:created|generated|written|prepared) .+?[:\.]\s*\n)', re.IGNORECASE),
+]
+
+# Trailing AI narration patterns (appended after main content)
+AI_TRAILING_PATTERNS = [
+    re.compile(r'\n(?:This (?:script|file|code|config|log|document) (?:demonstrates|shows|provides|contains|implements|includes) .+?)$', re.IGNORECASE),
+    re.compile(r'\n(?:Note(?:s)?:\s*.+?)$', re.IGNORECASE | re.DOTALL),
+    re.compile(r'\n(?:Key (?:features|points|highlights):\s*.+?)$', re.IGNORECASE | re.DOTALL),
+    re.compile(r'\n(?:Feel free to .+?)$', re.IGNORECASE),
+    re.compile(r'\n(?:Let me know if .+?)$', re.IGNORECASE),
+    re.compile(r'\n(?:I hope this .+?)$', re.IGNORECASE),
+    re.compile(r'\n(?:You can (?:modify|adjust|customize) .+?)$', re.IGNORECASE),
+    re.compile(r'\n(?:Make sure to .+?)$', re.IGNORECASE),
+    re.compile(r'\n(?:Remember to .+?)$', re.IGNORECASE),
+    re.compile(r'\n(?:Don\'t forget to .+?)$', re.IGNORECASE),
+    re.compile(r'\n(?:If you (?:need|want|have) .+?)$', re.IGNORECASE),
+    re.compile(r'\n(?:Hope this helps.*)$', re.IGNORECASE),
+    re.compile(r'\n(?:Happy coding.*)$', re.IGNORECASE),
+]
+
+# Analysis-layer terms that should not appear in system-layer artifacts
+ANALYSIS_LAYER_TERMS = [
+    "threat_score", "anomaly_score", "risk_level", "detection_rule",
+    "correlation_id", "alert_severity", "ioc_match", "siem",
+    "honeypot", "deception", "canary_token",
+    "indicator_of_compromise", "malware_analysis", "forensic",
+    "triage", "incident_response", "threat_intel",
+    "detection_engine", "alert_triggered", "security_orchestration",
+    "event_category", "event_type", "severity", "suspicious",
+    "detected", "alert", "threat_intelligence", "security_event",
+    "event_severity", "risk_score",
+]
+
+# Pre-compiled regex for efficient analysis-term detection in a single pass
+ANALYSIS_LAYER_TERMS_PATTERN = re.compile(
+    r'\b(?:' + '|'.join(re.escape(term) for term in ANALYSIS_LAYER_TERMS) + r')\b',
+    re.IGNORECASE,
+)
+
+# Syslog format pattern: "Mon DD HH:MM:SS hostname process[pid]: message"
+# Matches: 3-letter month, 1-2 digit day, HH:MM:SS time, hostname, process identifier
+SYSLOG_LINE_PATTERN = re.compile(
+    r'^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\S+\s+\S+',
+)
+
+# Combined Log Format (Apache/nginx):
+# Matches: IPv4 address, identity field, userid field, opening bracket of timestamp
+# Full format: IP identity userid [timestamp] "request" status size
+COMBINED_LOG_PATTERN = re.compile(
+    r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s+\S+\s+\S+\s+\[',
+)

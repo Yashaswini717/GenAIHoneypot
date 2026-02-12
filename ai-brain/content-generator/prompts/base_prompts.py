@@ -1,29 +1,57 @@
+# Hard constraints that apply to ALL system-layer (attacker-facing) artifact generation
+SYSTEM_LAYER_CONSTRAINTS = """
+CRITICAL RULES — You are reconstructing a file from disk. You are NOT writing documentation, analysis, or reports.
+
+ABSOLUTE PROHIBITIONS:
+- Do NOT include any introductory text, preambles, or explanations (e.g., "Here is a...", "This file does...", "Below is...")
+- Do NOT use markdown headings (# or ##) unless the file format requires them (e.g., README.md)
+- Do NOT include security analysis terms: threat_score, anomaly, correlation_id, risk_level, severity, detection, alert
+- Do NOT reference honeypots, deception, monitoring, SIEM, SOC, or incident response
+- Do NOT wrap output in code fences (``` or ~~~)
+- Do NOT add summaries, explanations, or commentary after the content
+- Do NOT narrate what the content is or does
+
+OUTPUT FORMAT:
+- Output ONLY the raw file content, exactly as it would appear if copied from disk
+- Start directly with the first line of the file (shebang, import, config directive, log entry, etc.)
+- End with the last line of the file — no trailing explanation
+- Preserve the exact formatting of the target file type
+"""
+
 # System prompts for different content types
 SYSTEM_PROMPTS = {
-    "general": """You are an expert content generator for realistic honeypot systems.
-Generate authentic, production-quality content that mimics real development environments.
+    "general": f"""You are reconstructing files from a real production system.
+Your output must be indistinguishable from a real file found on an actual machine.
 Content must be syntactically valid, contextually appropriate, and highly realistic.
-Never include placeholder text, TODOs, or obviously fake data.
-Use realistic naming conventions, coding patterns, and configuration values.""",
+Use realistic naming conventions, coding patterns, and configuration values.
+{SYSTEM_LAYER_CONSTRAINTS}""",
     
-    "source_code": """You are an expert software developer generating realistic source code.
-Write production-quality code with proper error handling, documentation, and best practices.
-Include realistic variable names, comments, and logic. Code must be syntactically valid.
-Mimic the style of experienced developers. Include some technical debt and legacy patterns.""",
+    "source_code": f"""You are reconstructing source code files from a real developer's machine.
+Write code as a real developer would — with practical comments about technical debt, shortcuts, and TODOs.
+Code must be syntactically valid and executable. Include realistic variable names and logic.
+Mimic the style of a real developer: imperfect, pragmatic, with accumulated cruft.
+Comments should reflect engineering concerns (performance, deadlines, workarounds), NOT documentation for a reader.
+{SYSTEM_LAYER_CONSTRAINTS}""",
     
-    "config": """You are a senior DevOps engineer generating realistic configuration files.
-Create production-ready configs with appropriate security settings, realistic values, and comments.
-Include both good practices and occasional misconfigurations that appear in real systems.""",
+    "config": f"""You are reconstructing configuration files from a real production server.
+Create configs exactly as they would appear on disk — with realistic values, accumulated edits, and occasional commented-out lines.
+Include both good practices and the kind of misconfigurations that appear in real systems.
+Comments should look like notes from the admin who last edited the file, not documentation.
+{SYSTEM_LAYER_CONSTRAINTS}""",
     
-    "logs": """You are a system administrator generating realistic log files.
+    "logs": f"""You are reconstructing log files from a real server's filesystem.
 Create authentic log entries with proper timestamps, IP addresses, and event sequences.
+Output must match the exact format of the target log type (syslog, combined log format, etc.).
 Include normal operations, occasional errors, and realistic access patterns.
-Mix successful and failed operations in realistic proportions.""",
+Mix successful and failed operations in realistic proportions.
+Do NOT include JSON structured logs unless explicitly requested — default to plain-text syslog format.
+{SYSTEM_LAYER_CONSTRAINTS}""",
     
-    "document": """You are a developer creating realistic documentation and notes.
-Write authentic developer documentation, notes, and TODO lists.
-Include incomplete thoughts, technical jargon, and realistic work-in-progress content.
-Mimic how real developers document their work.""",
+    "document": f"""You are reconstructing internal documents and notes from a real developer's filesystem.
+Write as a real person would for their own reference — messy, incomplete, with jargon and abbreviations.
+Include incomplete thoughts, scratch notes, and work-in-progress content.
+These are private working documents, NOT polished documentation for an audience.
+{SYSTEM_LAYER_CONSTRAINTS}""",
 }
 
 # Few-shot examples for better generation
@@ -127,17 +155,34 @@ Dec 15 09:15:18 web-server-01 sshd[12453]: pam_unix(sshd:session): session close
 }
 
 
-def get_system_prompt(content_type: str) -> str:
+def get_system_prompt(content_type: str, artifact_layer: str = "system") -> str:
     """
-    Get system prompt for content type.
+    Get system prompt for content type and artifact layer.
     
     Args:
         content_type: Type of content (source_code, config, logs, document)
+        artifact_layer: 'system' for raw attacker-facing files, 'analysis' for defender-facing reports
     
     Returns:
         System prompt string
     """
-    return SYSTEM_PROMPTS.get(content_type, SYSTEM_PROMPTS["general"])
+    base_prompt = SYSTEM_PROMPTS.get(content_type, SYSTEM_PROMPTS["general"])
+    
+    if artifact_layer == "analysis":
+        _ANALYSIS_LAYER_OUTPUT_RULES = """
+OUTPUT FORMAT:
+- Output structured, labeled content appropriate for security analysts.
+- Use proper formatting for the target format (JSON, CEF, markdown reports, etc.).
+- Do NOT include AI narration or preambles — start directly with the content.
+- Do NOT wrap the output in code fences (``` or ~~~).
+"""
+        # Replace the system-layer constraints with analysis-layer rules.
+        # If the constraints are not found (e.g., a custom prompt), append the rules.
+        if SYSTEM_LAYER_CONSTRAINTS in base_prompt:
+            return base_prompt.replace(SYSTEM_LAYER_CONSTRAINTS, _ANALYSIS_LAYER_OUTPUT_RULES)
+        return base_prompt + _ANALYSIS_LAYER_OUTPUT_RULES
+    
+    return base_prompt
 
 
 def get_few_shot_examples(category: str) -> list[dict[str, str]]:

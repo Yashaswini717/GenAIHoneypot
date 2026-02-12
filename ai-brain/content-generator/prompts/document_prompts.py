@@ -1,5 +1,16 @@
 from typing import Any
 
+# Hard constraint appended to all document prompts
+_DOCUMENT_CONSTRAINTS = """
+
+IMPORTANT — Output rules:
+- Output ONLY the raw document content as it would be found on disk.
+- Start directly with the document content — no introductory AI narration.
+- End with the last line of the document — no trailing explanation.
+- Do NOT wrap the output in code fences (``` or ~~~).
+- Do NOT mention honeypots, deception, or security traps.
+- Write as the document author, NOT as an AI describing the document."""
+
 
 def _get_audience_instruction(audience: str) -> str:
     """Get instructions based on target audience."""
@@ -63,7 +74,7 @@ Include:
 - License information
 - Some TODOs or known issues
 - Badges (build, coverage, version)
-Make it look like real project documentation with some incompleteness."""
+Make it look like real project documentation with some incompleteness.{_DOCUMENT_CONSTRAINTS}"""
 
 
 def get_notes_prompt(context: dict[str, Any]) -> str:
@@ -102,7 +113,7 @@ Include:
 - Incomplete thoughts and TODOs
 - Links to resources
 - Timestamps and dates
-Make it look like authentic working notes."""
+Make it look like authentic working notes.{_DOCUMENT_CONSTRAINTS}"""
 
 
 def get_todo_prompt(context: dict[str, Any]) -> str:
@@ -138,7 +149,7 @@ Include:
 - Some tasks with deadlines
 - Some tasks assigned to people
 - Use markdown checkboxes
-Make it look like real project management."""
+Make it look like real project management.{_DOCUMENT_CONSTRAINTS}"""
 
 
 def get_api_docs_prompt(context: dict[str, Any]) -> str:
@@ -171,7 +182,7 @@ Include:
 - Common use cases
 - Webhook documentation
 - Testing with curl examples
-Make it comprehensive but realistic."""
+Make it comprehensive but realistic.{_DOCUMENT_CONSTRAINTS}"""
 
 
 def get_runbook_prompt(context: dict[str, Any]) -> str:
@@ -206,7 +217,7 @@ Include:
 - On-call procedures
 - Configuration management
 - Credentials location (use realistic paths)
-Make it practical and detailed."""
+Make it practical and detailed.{_DOCUMENT_CONSTRAINTS}"""
 
 
 def get_changelog_prompt(context: dict[str, Any]) -> str:
@@ -236,7 +247,7 @@ Include:
 - Breaking changes
 - Migration notes
 Follow "Keep a Changelog" format.
-Make it look like real project history."""
+Make it look like real project history.{_DOCUMENT_CONSTRAINTS}"""
 
 
 def get_architecture_doc_prompt(context: dict[str, Any]) -> str:
@@ -270,4 +281,4 @@ Include:
 - Deployment architecture
 - Trade-offs and decisions
 - Future improvements
-Make it technical and detailed."""
+Make it technical and detailed.{_DOCUMENT_CONSTRAINTS}"""

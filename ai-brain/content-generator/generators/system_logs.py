@@ -18,9 +18,9 @@ from .base import BaseGenerator, GeneratedContent
 class SystemLogGenerator(BaseGenerator):
     """Generate realistic system log files."""
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, artifact_layer: str = "system") -> str:
         """Get system prompt for log generation."""
-        return get_system_prompt("logs")
+        return get_system_prompt("logs", artifact_layer)
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         """Build prompt for log generation based on log_type and log_category."""
@@ -44,8 +44,12 @@ class SystemLogGenerator(BaseGenerator):
             builder = get_application_log_prompt
         elif log_category == "audit":
             builder = get_audit_log_prompt
+            # Force analysis layer for audit logs (SIEM/compliance content)
+            context["artifact_layer"] = "analysis"
         elif log_category == "security":
             builder = get_security_event_log_prompt
+            # Force analysis layer for security event logs (SIEM content)
+            context["artifact_layer"] = "analysis"
         elif log_category == "access":
             # Use nginx_access or apache_access based on log_type
             builder = prompt_builders.get(log_type, get_nginx_access_prompt)
@@ -72,22 +76,30 @@ class SystemLogGenerator(BaseGenerator):
         log_type = context.get("log_type", "auth")
         log_category = context.get("log_category", "system")
         
-        # Build and generate
-        prompt = self.build_prompt(context)
-        log_content = await self._generate_with_llm(prompt, temperature=0.9)
+        # Map log_type to a more specific file_type for format-aware validation
+        file_type_map = {
+            "auth": "syslog",
+            "syslog": "syslog",
+            "bash_history": "generic",
+            "apache_access": "access_log",
+            "nginx_access": "access_log",
+            "application": "generic",
+            "audit": "generic",
+            "security": "generic",
+        }
+        file_type = file_type_map.get(log_type, "generic")
         
-        # Validate
-        validation_results = await self._validate_content(
-            content=log_content,
-            file_type="generic",
+        # Set default temperature for logs
+        if "temperature" not in context:
+            context = {**context, "temperature": 0.9}
+        
+        # Pass log_type into validation context
+        context = {**context, "log_type": log_type}
+        
+        return await self._generate_and_enforce(
             context=context,
-        )
-        
-        return self._create_content(
-            content=log_content,
             content_type="logs",
-            file_type="generic",
-            validation_results=validation_results,
+            file_type=file_type,
             log_type=log_type,
             log_category=log_category,
             duration_hours=context.get("duration_hours", 24),

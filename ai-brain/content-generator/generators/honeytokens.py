@@ -10,7 +10,7 @@ from .base import BaseGenerator, GeneratedContent
 class HoneytokenGenerator(BaseGenerator):
     """Generate realistic but fake honeytokens."""
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, artifact_layer: str = "system") -> str:
         """Honeytokens don't use LLM, so this returns empty."""
         return ""
 

@@ -4,6 +4,12 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+class ArtifactLayer(str, Enum):
+    """Artifact layer — controls whether output is raw (attacker-facing) or analytical (defender-facing)."""
+    SYSTEM = "system"      # Raw files as found on disk — attacker-facing
+    ANALYSIS = "analysis"  # Correlated, labeled, structured — defender-facing
+
+
 class AudienceType(str, Enum):
     """Target audience for generated content."""
     INTERNAL = "internal"  # Internal SOC/security team
@@ -35,6 +41,10 @@ class GenerateRequest(BaseModel):
     honeypot_id: Optional[str] = Field(None, description="Associated honeypot ID")
     industry: Optional[str] = Field(None, description="Industry context (healthcare, finance, tech, retail, etc.)")
     compliance: Optional[list[str]] = Field(None, description="Compliance standards (HIPAA, PCI-DSS, SOX, GDPR)")
+    artifact_layer: ArtifactLayer = Field(
+        ArtifactLayer.SYSTEM,
+        description="Artifact layer: 'system' for raw attacker-facing files, 'analysis' for defender-facing reports"
+    )
 
 
 class SourceCodeRequest(GenerateRequest):

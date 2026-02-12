@@ -1,5 +1,17 @@
 from typing import Any
 
+# Hard constraint appended to all source code prompts
+_SOURCE_CODE_CONSTRAINTS = """
+
+IMPORTANT — Output rules:
+- Output ONLY the raw source code file, nothing else.
+- Start with the first line of code (shebang, import, package declaration).
+- Do NOT include any introductory text, explanation, or description before or after the code.
+- Do NOT wrap the output in code fences (``` or ~~~).
+- Comments in the code should reflect real developer concerns (TODOs, workarounds, technical debt), NOT documentation for a reader.
+- Code must be syntactically valid and executable.
+- Include realistic imperfections: inconsistent formatting, legacy patterns, commented-out code, shortcut workarounds."""
+
 
 def get_python_prompt(context: dict[str, Any]) -> str:
     """Generate prompt for Python code."""
@@ -16,7 +28,7 @@ Include:
 - Authentication middleware
 - API endpoints with validation
 - Requirements comments at top
-Make it look like production code with some technical debt.""",
+Make it look like production code with some technical debt.{_SOURCE_CODE_CONSTRAINTS}""",
         
         "db_script": f"""Generate a realistic Python database script for {purpose}.
 Include:
@@ -26,7 +38,7 @@ Include:
 - Error handling and logging
 - Configuration from environment variables
 - Migration or data manipulation logic
-- Comments explaining business logic""",
+- Comments explaining business logic{_SOURCE_CODE_CONSTRAINTS}""",
         
         "automation": f"""Generate a realistic Python automation script for {purpose}.
 Include:
@@ -36,7 +48,7 @@ Include:
 - Progress logging
 - Configuration file reading
 - Subprocess execution if needed
-- Cron-ready with proper exit codes""",
+- Cron-ready with proper exit codes{_SOURCE_CODE_CONSTRAINTS}""",
         
         "data_processing": f"""Generate a realistic Python data processing script for {purpose}.
 Include:
@@ -46,7 +58,7 @@ Include:
 - Error handling for bad data
 - Progress bars or logging
 - Output file generation
-- Command-line interface""",
+- Command-line interface{_SOURCE_CODE_CONSTRAINTS}""",
     }
     
     return prompts.get(script_type, prompts["automation"])
@@ -68,7 +80,7 @@ Include:
 - Environment configuration
 - CORS setup
 - Logging with Winston or similar
-Make it look like real production code.""",
+Make it look like real production code.{_SOURCE_CODE_CONSTRAINTS}""",
         
         "frontend": f"""Generate a realistic React component for {purpose}.
 Include:
@@ -79,7 +91,7 @@ Include:
 - API calls with fetch or axios
 - Error boundaries
 - Loading states
-- CSS modules or styled-components""",
+- CSS modules or styled-components{_SOURCE_CODE_CONSTRAINTS}""",
         
         "cli": f"""Generate a realistic Node.js CLI tool for {purpose}.
 Include:
@@ -89,7 +101,7 @@ Include:
 - Colorful console output (chalk)
 - Progress indicators
 - Error handling
-- Configuration file support""",
+- Configuration file support{_SOURCE_CODE_CONSTRAINTS}""",
     }
     
     return prompts.get(script_type, prompts["api"])
@@ -110,7 +122,7 @@ Include:
 - Error checking after each command
 - Cleanup of old backups
 - Email notification on failure
-- Lock file to prevent concurrent runs""",
+- Lock file to prevent concurrent runs{_SOURCE_CODE_CONSTRAINTS}""",
         
         "deployment": f"""Generate a realistic bash deployment script for {purpose}.
 Include:
@@ -121,7 +133,7 @@ Include:
 - Rollback mechanism
 - Logging with timestamps
 - Environment checks
-- Backup before deployment""",
+- Backup before deployment{_SOURCE_CODE_CONSTRAINTS}""",
         
         "monitoring": f"""Generate a realistic bash monitoring script for {purpose}.
 Include:
@@ -131,7 +143,7 @@ Include:
 - Alert generation
 - Log rotation
 - Metric collection
-- Notification on thresholds""",
+- Notification on thresholds{_SOURCE_CODE_CONSTRAINTS}""",
     }
     
     return prompts.get(script_type, prompts["backup"])
@@ -154,7 +166,7 @@ Include:
 - Structured logging
 - Health check endpoints
 - Context usage
-Make it idiomatic Go code.""",
+Make it idiomatic Go code.{_SOURCE_CODE_CONSTRAINTS}""",
         
         "cli": f"""Generate a realistic Go CLI application for {purpose}.
 Include:
@@ -165,7 +177,7 @@ Include:
 - Logging with levels
 - Concurrent operations with goroutines
 - Progress reporting
-- Exit codes""",
+- Exit codes{_SOURCE_CODE_CONSTRAINTS}""",
         
         "worker": f"""Generate a realistic Go background worker for {purpose}.
 Include:
@@ -176,7 +188,7 @@ Include:
 - Metrics collection
 - Context cancellation
 - Database operations
-- Structured logging""",
+- Structured logging{_SOURCE_CODE_CONSTRAINTS}""",
     }
     
     return prompts.get(script_type, prompts["server"])

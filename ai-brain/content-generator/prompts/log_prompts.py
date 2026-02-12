@@ -1,5 +1,27 @@
 from typing import Any
 
+# Hard constraints for system-layer logs (attacker-facing: auth.log, syslog, etc.)
+_SYSTEM_LOG_CONSTRAINTS = """
+
+IMPORTANT — Output rules:
+- Output ONLY raw log lines, exactly as they would appear in the log file on disk.
+- Start with the first log entry — no introductory text, no explanation.
+- End with the last log entry — no trailing commentary or summary.
+- Do NOT wrap the output in code fences (``` or ~~~).
+- Do NOT include security analysis terms: threat_score, anomaly, correlation_id, severity, risk_level.
+- Do NOT reference honeypots, deception, detection, SIEM, or SOC.
+- Match the exact format of real OS/service logs (syslog, combined log format, etc.).
+- Do NOT output JSON unless the target log type is explicitly JSON-formatted (e.g., application structured logs)."""
+
+# Constraints for analysis-layer logs (defender-facing: SIEM, audit, security events)
+_ANALYSIS_LOG_CONSTRAINTS = """
+
+IMPORTANT — Output rules:
+- Output ONLY the log entries in the specified structured format.
+- Start with the first log entry — no introductory text.
+- End with the last log entry — no trailing commentary.
+- Do NOT wrap the output in code fences (``` or ~~~)."""
+
 
 def get_auth_log_prompt(context: dict[str, Any]) -> str:
     """Generate prompt for auth.log."""
@@ -22,7 +44,7 @@ Include:
 - Mix of successful and failed events
 - Different usernames (admin, deploy, ubuntu, etc.)
 - Realistic IP addresses (both internal and external)
-Make it look like real server authentication logs."""
+Make it look like real server authentication logs.{_SYSTEM_LOG_CONSTRAINTS}"""
 
 
 def get_syslog_prompt(context: dict[str, Any]) -> str:
@@ -41,9 +63,9 @@ Include:
 - System startup/shutdown messages
 - Package manager operations
 - Realistic timestamps
-- Proper severity levels
+- Proper syslog facility.priority levels (e.g., kern.warning, auth.info)
 - Realistic facility tags
-Make it look like real system logs."""
+Make it look like real system logs.{_SYSTEM_LOG_CONSTRAINTS}"""
 
 
 def get_bash_history_prompt(context: dict[str, Any]) -> str:
@@ -65,7 +87,7 @@ Include:
 - Some typos and corrected commands
 - Repeated common commands
 - Commands with sensitive info (accidentally typed passwords, then deleted)
-Make it look authentic with realistic patterns."""
+Make it look authentic with realistic patterns.{_SYSTEM_LOG_CONSTRAINTS}"""
 
 
 def get_apache_access_prompt(context: dict[str, Any]) -> str:
@@ -86,7 +108,7 @@ Include:
 - Response times
 - Some bot traffic
 - Some suspicious scanning attempts
-Use Combined Log Format."""
+Use Combined Log Format.{_SYSTEM_LOG_CONSTRAINTS}"""
 
 
 def get_nginx_access_prompt(context: dict[str, Any]) -> str:
@@ -105,10 +127,10 @@ Include:
 - Different status codes (200, 201, 400, 401, 404, 500, 502, 503)
 - Realistic IP addresses
 - User agents
-- Request IDs
+- X-Request-ID header values when present in the request
 - Upstream response times
 - Some automated scanner traffic
-Use nginx combined format with timing."""
+Use nginx combined format with timing.{_SYSTEM_LOG_CONSTRAINTS}"""
 
 
 def get_nginx_error_prompt(context: dict[str, Any]) -> str:
@@ -128,7 +150,7 @@ Include:
 - Different error levels (error, warn, notice)
 - Realistic timestamps
 - Connection details
-Make it look like real production errors."""
+Make it look like real production errors.{_SYSTEM_LOG_CONSTRAINTS}"""
 
 
 def get_application_log_prompt(context: dict[str, Any]) -> str:
@@ -136,7 +158,7 @@ def get_application_log_prompt(context: dict[str, Any]) -> str:
     app_type = context.get("app_type", "web_api")
     duration_hours = context.get("duration_hours", 24)
     industry = context.get("industry", "technology")
-    log_format = context.get("log_format", "json")
+    log_format = context.get("log_format", "syslog")
     
     format_instruction = ""
     if log_format == "json":
@@ -163,13 +185,13 @@ Include:
 - WARN level: Deprecated API usage, slow queries
 - ERROR level: Exceptions, failed operations
 - DEBUG level: Detailed execution flow
-- Request IDs and correlation IDs
+- Request IDs for tracing
 - Execution times
 - Database query logs
 - External API call logs
 - User IDs and actions
 - Stack traces for errors
-Make it look like real application logging for a {industry} company."""
+Make it look like real application logging for a {industry} company.{_SYSTEM_LOG_CONSTRAINTS}"""
 
 
 def get_audit_log_prompt(context: dict[str, Any]) -> str:
@@ -199,7 +221,7 @@ Include:
 - Resource identifiers (what was accessed)
 - Outcome status (success, failure, denied)
 - Client metadata (IP, device, location)
-Make these production-quality audit logs suitable for compliance review."""
+Make these production-quality audit logs suitable for compliance review.{_ANALYSIS_LOG_CONSTRAINTS}"""
 
 
 def get_security_event_log_prompt(context: dict[str, Any]) -> str:
@@ -233,14 +255,25 @@ Include:
 - Event severity levels (low, medium, high, critical)
 - Source and destination information
 - Correlation IDs for related events
-Make these look like real SIEM security events."""
+Make these look like real SIEM security events.{_ANALYSIS_LOG_CONSTRAINTS}"""
 
 
 def get_database_log_prompt(context: dict[str, Any]) -> str:
     """Generate prompt for database log."""
     db_type = context.get("db_type", "postgresql")
     
-    return f"""Generate realistic {db_type} log entries.
+    # Provide explicit format example for PostgreSQL (the default and most common)
+    # to prevent LLM from defaulting to JSON or inventing a format
+    format_example = ""
+    if db_type.lower() == "postgresql":
+        format_example = """
+Format: PostgreSQL default log format.
+Example:
+2024-01-15 10:23:45.123 UTC [12345] LOG:  statement: SELECT * FROM users WHERE id = 42
+2024-01-15 10:23:45.456 UTC [12345] WARNING:  table "sessions" has no indexes
+"""
+    
+    return f"""Generate realistic {db_type} log entries.{format_example}
 Include:
 - Connection events
 - Query execution logs
@@ -254,4 +287,4 @@ Include:
 - Configuration changes
 - Error messages with SQL states
 - Performance statistics
-Make it production-realistic."""
+Make it production-realistic.{_SYSTEM_LOG_CONSTRAINTS}"""

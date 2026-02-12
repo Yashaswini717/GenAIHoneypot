@@ -1,5 +1,16 @@
 from typing import Any
 
+# Hard constraint appended to all config prompts
+_CONFIG_CONSTRAINTS = """
+
+IMPORTANT — Output rules:
+- Output ONLY the raw configuration file content, nothing else.
+- Start with the first line of the config file (comment header, directive, or setting).
+- Do NOT include any introductory text, explanation, or description before or after the content.
+- Do NOT wrap the output in code fences (``` or ~~~).
+- Comments should look like they were written by the admin who last edited the file.
+- Do NOT mention honeypots, deception, monitoring, or security analysis."""
+
 
 def get_bashrc_prompt(context: dict[str, Any]) -> str:
     """Generate prompt for .bashrc file."""
@@ -16,7 +27,7 @@ Include:
 - Function definitions
 - Tool-specific configurations (nvm, pyenv, etc.)
 - Comments explaining sections
-Make it look like a file evolved over time with accumulated customizations."""
+Make it look like a file evolved over time with accumulated customizations.{_CONFIG_CONSTRAINTS}"""
 
 
 def get_ssh_config_prompt(context: dict[str, Any]) -> str:
@@ -35,7 +46,7 @@ Include:
 - ServerAliveInterval settings
 - IdentityFile paths
 - User mappings
-- Comments explaining each host's purpose"""
+- Comments explaining each host's purpose{_CONFIG_CONSTRAINTS}"""
 
 
 def get_env_file_prompt(context: dict[str, Any]) -> str:
@@ -54,7 +65,7 @@ Include:
 - Third-party service credentials (AWS, Stripe, etc.)
 - Comments for sections
 - Mix of commented out and active variables
-Make credentials look real but use honeytokens."""
+Make credentials look real but use honeytokens.{_CONFIG_CONSTRAINTS}"""
 
 
 def get_nginx_conf_prompt(context: dict[str, Any]) -> str:
@@ -75,7 +86,7 @@ Include:
 - Location blocks with proper routing
 - WebSocket support if applicable
 - Static file serving
-Make it production-ready with some common misconfigurations."""
+Make it production-ready with some common misconfigurations.{_CONFIG_CONSTRAINTS}"""
 
 
 def get_docker_compose_prompt(context: dict[str, Any]) -> str:
@@ -96,7 +107,7 @@ Include:
 - Build contexts
 - Realistic image versions
 - Comments explaining services
-Make it look like a real development/production setup."""
+Make it look like a real development/production setup.{_CONFIG_CONSTRAINTS}"""
 
 
 def get_database_config_prompt(context: dict[str, Any]) -> str:
@@ -115,7 +126,7 @@ Include:
 - Backup configurations
 - Security settings
 - Comments explaining each section
-Make it production-ready with realistic values."""
+Make it production-ready with realistic values.{_CONFIG_CONSTRAINTS}"""
 
 
 def get_apache_conf_prompt(context: dict[str, Any]) -> str:
@@ -134,7 +145,7 @@ Include:
 - Module configurations
 - Security headers
 - Performance settings
-Make it look like real production config."""
+Make it look like real production config.{_CONFIG_CONSTRAINTS}"""
 
 
 def get_systemd_service_prompt(context: dict[str, Any]) -> str:
@@ -153,4 +164,4 @@ Include:
 - Working directory
 - [Install] section
 - Security hardening options
-Make it production-ready."""
+Make it production-ready.{_CONFIG_CONSTRAINTS}"""

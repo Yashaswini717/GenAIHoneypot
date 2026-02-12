@@ -15,9 +15,9 @@ from .base import BaseGenerator, GeneratedContent
 class ConfigGenerator(BaseGenerator):
     """Generate realistic configuration files."""
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, artifact_layer: str = "system") -> str:
         """Get system prompt for config generation."""
-        return get_system_prompt("config")
+        return get_system_prompt("config", artifact_layer)
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         """Build prompt for config generation."""
@@ -56,21 +56,13 @@ class ConfigGenerator(BaseGenerator):
         }
         file_type = file_type_map.get(config_type, "generic")
         
-        # Build and generate
-        prompt = self.build_prompt(context)
-        config = await self._generate_with_llm(prompt, temperature=0.8)
+        # Set default temperature for configs
+        if "temperature" not in context:
+            context = {**context, "temperature": 0.8}
         
-        # Validate
-        validation_results = await self._validate_content(
-            content=config,
-            file_type=file_type,
+        return await self._generate_and_enforce(
             context=context,
-        )
-        
-        return self._create_content(
-            content=config,
             content_type="config",
             file_type=file_type,
-            validation_results=validation_results,
             config_type=config_type,
         )

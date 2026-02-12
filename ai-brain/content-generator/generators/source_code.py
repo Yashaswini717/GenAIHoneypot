@@ -14,9 +14,9 @@ from .base import BaseGenerator, GeneratedContent
 class SourceCodeGenerator(BaseGenerator):
     """Generate realistic source code files."""
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, artifact_layer: str = "system") -> str:
         """Get system prompt for source code generation."""
-        return get_system_prompt("source_code")
+        return get_system_prompt("source_code", artifact_layer)
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         """Build prompt for source code generation."""
@@ -47,22 +47,10 @@ class SourceCodeGenerator(BaseGenerator):
         """
         language = context.get("language", "python")
         
-        # Build and generate
-        prompt = self.build_prompt(context)
-        code = await self._generate_with_llm(prompt)
-        
-        # Validate
-        validation_results = await self._validate_content(
-            content=code,
-            file_type=language,
+        return await self._generate_and_enforce(
             context=context,
-        )
-        
-        return self._create_content(
-            content=code,
             content_type="source_code",
             file_type=language,
-            validation_results=validation_results,
             language=language,
             script_type=context.get("script_type"),
             purpose=context.get("purpose"),
