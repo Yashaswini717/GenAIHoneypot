@@ -2,6 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 from contextlib import asynccontextmanager
+import asyncio
+from websocket.feed import redis_listener
 
 from config import settings
 from database.elastic import init_elasticsearch
@@ -20,8 +22,9 @@ async def lifespan(app: FastAPI):
     await init_elasticsearch()
     await init_postgres()
     await init_neo4j()
+    # start Redis → WebSocket broadcaster
+    asyncio.create_task(redis_listener())
     yield
-
 
 app = FastAPI(
     title="GenAI Honeypot — Intelligence Hub",
