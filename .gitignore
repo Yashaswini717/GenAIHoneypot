@@ -1,12 +1,20 @@
+# Python
 .env
 .env.*
 __pycache__/
 *.pyc
 venv/
-.DS_Store
 
-intelligence_hub/frontend/node_modules/
-intelligence_hub/frontend/dist/
+# Node
 node_modules/
 package-lock.json
-package.json
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.zip
+logs/
+geoip/*.mmdb
