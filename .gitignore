@@ -1,20 +1,13 @@
-# Python
 .env
 .env.*
 __pycache__/
 *.pyc
 venv/
-
-# Node
 node_modules/
 package-lock.json
 dist/
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Misc
 *.zip
 logs/
 geoip/*.mmdb
