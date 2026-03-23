@@ -5,7 +5,7 @@ __pycache__/
 venv/
 node_modules/
 package-lock.json
-package.json
+intelligence_hub/frontend/package.json
 dist/
 .DS_Store
 Thumbs.db
