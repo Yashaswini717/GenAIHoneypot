@@ -8,3 +8,4 @@ venv/
 intelligence_hub/frontend/node_modules/
 intelligence_hub/frontend/dist/
 node_modules/
+package-lock.json
