@@ -1,0 +1,14 @@
+# {{ title }}
+# Author: {{ author }}
+# Date: {{ date }}
+
+{{ content }}
+
+{% if sections %}
+{% for section in sections %}
+## {{ section.title }}
+
+{{ section.content }}
+
+{% endfor %}
+{% endif %}

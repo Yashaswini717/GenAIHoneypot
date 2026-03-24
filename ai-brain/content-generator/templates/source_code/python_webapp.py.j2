@@ -1,0 +1,91 @@
+"""
+Flask web application template for honeypot content generation.
+"""
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+import os
+from datetime import datetime
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///{{ db_name }}.db')
+app.config['SECRET_KEY'] = '{{ secret_key }}'
+app.config['DEBUG'] = {{ debug }}
+
+db = SQLAlchemy(app)
+
+{% if include_models %}
+# Database Models
+class {{ model_name }}(db.Model):
+    __tablename__ = '{{ table_name }}'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    {% for field in fields %}
+    {{ field.name }} = db.Column(db.{{ field.type }}, {{ 'nullable=' + field.nullable|string if field.nullable is defined else '' }})
+    {% endfor %}
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            {% for field in fields %}
+            '{{ field.name }}': self.{{ field.name }},
+            {% endfor %}
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+{% endif %}
+
+# Routes
+@app.route('/')
+def index():
+    """Home page."""
+    return jsonify({'message': 'Welcome to {{ app_name }}', 'status': 'healthy'})
+
+{% if include_api_endpoints %}
+@app.route('/api/{{ resource_name }}', methods=['GET'])
+def list_{{ resource_name }}():
+    """List all {{ resource_name }}."""
+    try:
+        items = {{ model_name }}.query.all()
+        return jsonify([item.to_dict() for item in items]), 200
+    except Exception as e:
+        app.logger.error(f"Error fetching {{ resource_name }}: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+@app.route('/api/{{ resource_name }}/<int:id>', methods=['GET'])
+def get_{{ resource_name }}(id):
+    """Get a single {{ resource_name }} by ID."""
+    item = {{ model_name }}.query.get_or_404(id)
+    return jsonify(item.to_dict()), 200
+
+@app.route('/api/{{ resource_name }}', methods=['POST'])
+def create_{{ resource_name }}():
+    """Create a new {{ resource_name }}."""
+    data = request.get_json()
+    
+    try:
+        item = {{ model_name }}(**data)
+        db.session.add(item)
+        db.session.commit()
+        return jsonify(item.to_dict()), 201
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error creating {{ resource_name }}: {str(e)}")
+        return jsonify({'error': 'Failed to create resource'}), 400
+{% endif %}
+
+@app.route('/health')
+def health():
+    """Health check endpoint."""
+    return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()}), 200
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    
+    app.run(
+        host='{{ host }}',
+        port={{ port }},
+        debug={{ debug }}
+    )

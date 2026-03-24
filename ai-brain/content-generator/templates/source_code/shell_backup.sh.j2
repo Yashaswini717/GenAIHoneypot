@@ -1,0 +1,70 @@
+#!/bin/bash
+# {{ script_name }} - {{ description }}
+# Created: {{ created_date }}
+# Author: {{ author }}
+
+set -euo pipefail
+
+# Configuration
+BACKUP_DIR="{{ backup_dir }}"
+RETENTION_DAYS={{ retention_days }}
+LOG_FILE="{{ log_file }}"
+{% if aws_enabled %}
+AWS_S3_BUCKET="{{ s3_bucket }}"
+AWS_ACCESS_KEY="{{ aws_access_key }}"  # HONEYTOKEN
+AWS_SECRET_KEY="{{ aws_secret_key }}"  # HONEYTOKEN
+{% endif %}
+
+# Logging function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# Error handler
+error_exit() {
+    log "ERROR: $1"
+    exit 1
+}
+
+# Create backup directory
+mkdir -p "$BACKUP_DIR" || error_exit "Failed to create backup directory"
+
+# Generate backup filename
+TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+BACKUP_FILE="${BACKUP_DIR}/{{ backup_prefix }}_${TIMESTAMP}.tar.gz"
+
+log "Starting backup: $BACKUP_FILE"
+
+# Perform backup
+{% for source in backup_sources %}
+if [ -d "{{ source.path }}" ] || [ -f "{{ source.path }}" ]; then
+    log "Backing up {{ source.path }}"
+    tar -czf "${BACKUP_FILE}.part" -C "{{ source.parent }}" "{{ source.name }}" || error_exit "Backup failed for {{ source.path }}"
+else
+    log "WARNING: {{ source.path }} not found, skipping"
+fi
+{% endfor %}
+
+# Finalize backup
+mv "${BACKUP_FILE}.part" "$BACKUP_FILE" || error_exit "Failed to finalize backup"
+log "Backup completed: $BACKUP_FILE"
+
+{% if aws_enabled %}
+# Upload to S3
+log "Uploading to S3: $AWS_S3_BUCKET"
+aws s3 cp "$BACKUP_FILE" "s3://${AWS_S3_BUCKET}/backups/" \
+    --region {{ aws_region }} || error_exit "S3 upload failed"
+log "S3 upload completed"
+{% endif %}
+
+# Cleanup old backups
+log "Cleaning up old backups (retention: $RETENTION_DAYS days)"
+find "$BACKUP_DIR" -name "{{ backup_prefix }}_*.tar.gz" -type f -mtime +$RETENTION_DAYS -delete
+log "Cleanup completed"
+
+# Calculate backup size
+BACKUP_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
+log "Backup size: $BACKUP_SIZE"
+
+log "Backup process finished successfully"
+exit 0

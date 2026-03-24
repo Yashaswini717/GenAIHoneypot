@@ -1,0 +1,27 @@
+# {{ meeting_title }}
+
+**Date:** {{ date }}  
+**Time:** {{ time }}  
+**Attendees:** {{ attendees }}  
+**Location:** {{ location }}
+
+## Agenda
+
+{% for item in agenda %}
+{{ loop.index }}. {{ item }}
+{% endfor %}
+
+## Discussion
+
+{{ discussion_summary }}
+
+## Action Items
+
+{% for action in action_items %}
+- [ ] {{ action.task }} - Assigned to: {{ action.assignee }} - Due: {{ action.due_date }}
+{% endfor %}
+
+## Next Meeting
+
+**Date:** {{ next_meeting_date }}  
+**Topics:** {{ next_meeting_topics }}

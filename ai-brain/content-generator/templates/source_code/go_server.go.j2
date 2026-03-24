@@ -1,0 +1,145 @@
+// {{ package_name }} - {{ description }}
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/gorilla/mux"
+)
+
+// Configuration
+type Config struct {
+	Port       string
+	APIKey     string  // HONEYTOKEN
+	DBHost     string
+	DBPort     string
+	DBName     string
+	DBUser     string
+	DBPassword string  // HONEYTOKEN
+}
+
+func loadConfig() *Config {
+	return &Config{
+		Port:       getEnv("PORT", "{{ port }}"),
+		APIKey:     getEnv("API_KEY", "{{ api_key }}"),
+		DBHost:     getEnv("DB_HOST", "{{ db_host }}"),
+		DBPort:     getEnv("DB_PORT", "{{ db_port }}"),
+		DBName:     getEnv("DB_NAME", "{{ db_name }}"),
+		DBUser:     getEnv("DB_USER", "{{ db_user }}"),
+		DBPassword: getEnv("DB_PASSWORD", "{{ db_password }}"),
+	}
+}
+
+func getEnv(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	return value
+}
+
+// Middleware
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		log.Printf("%s %s", r.Method, r.URL.Path)
+		next.ServeHTTP(w, r)
+		log.Printf("Completed in %v", time.Since(start))
+	})
+}
+
+func authMiddleware(apiKey string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			key := r.Header.Get("X-API-Key")
+			if key != apiKey {
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// Handlers
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	response := map[string]interface{}{
+		"status":    "healthy",
+		"timestamp": time.Now().Format(time.RFC3339),
+		"service":   "{{ service_name }}",
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+{% for handler in handlers %}
+func {{ handler.name }}Handler(w http.ResponseWriter, r *http.Request) {
+	{% if handler.method == "GET" %}
+	// Handle GET request
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "{{ handler.message }}",
+	})
+	{% elif handler.method == "POST" %}
+	// Handle POST request
+	var data map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	
+	// Process data
+	log.Printf("Received data: %v", data)
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteStatus(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "{{ handler.message }}",
+		"status":  "created",
+	})
+	{% endif %}
+}
+
+{% endfor %}
+
+func main() {
+	config := loadConfig()
+	
+	router := mux.NewRouter()
+	
+	// Apply middlewares
+	router.Use(loggingMiddleware)
+	
+	// Public routes
+	router.HandleFunc("/health", healthHandler).Methods("GET")
+	
+	// Protected routes
+	api := router.PathPrefix("/api/v1").Subrouter()
+	api.Use(authMiddleware(config.APIKey))
+	
+	{% for route in routes %}
+	api.HandleFunc("{{ route.path }}", {{ route.handler }}Handler).Methods("{{ route.method }}")
+	{% endfor %}
+	
+	// Start server
+	addr := fmt.Sprintf(":%s", config.Port)
+	log.Printf("{{ service_name }} starting on %s", addr)
+	
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	
+	if err := srv.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
+}
