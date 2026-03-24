@@ -1,8 +1,10 @@
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from config.logging_config import LoggerMixin
 from config.settings import settings
@@ -15,6 +17,19 @@ from .models import Base, HoneytokenCreate, HoneytokenDB, HoneytokenResponse
 class HoneytokenStore(LoggerMixin):
     """Store and track honeytokens."""
 
+    @staticmethod
+    def _create_engine(database_url: str):
+        """Create a database engine with sane defaults for SQLite files."""
+        engine_kwargs = {"echo": settings.database_echo}
+
+        if database_url.startswith("sqlite:///"):
+            db_path = database_url.removeprefix("sqlite:///")
+            if db_path and db_path != ":memory:":
+                Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+                engine_kwargs["poolclass"] = NullPool
+
+        return create_engine(database_url, **engine_kwargs)
+
     def __init__(self, database_url: Optional[str] = None):
         """
         Initialize honeytoken store.
@@ -23,10 +38,7 @@ class HoneytokenStore(LoggerMixin):
             database_url: Database connection URL (uses settings if not provided)
         """
         self.database_url = database_url or settings.database_url
-        self.engine = create_engine(
-            self.database_url,
-            echo=settings.database_echo,
-        )
+        self.engine = self._create_engine(self.database_url)
         self.SessionLocal = sessionmaker(bind=self.engine)
         
         # Create tables
@@ -161,7 +173,7 @@ class HoneytokenStore(LoggerMixin):
                 if active_only:
                     stmt = stmt.where(HoneytokenDB.is_active == True)
                 
-                stmt = stmt.limit(limit).order_by(HoneytokenDB.created_at.desc())
+                stmt = stmt.order_by(HoneytokenDB.created_at.desc()).limit(limit)
                 
                 results = session.execute(stmt).scalars().all()
                 return [HoneytokenResponse.model_validate(r) for r in results]
@@ -193,3 +205,7 @@ class HoneytokenStore(LoggerMixin):
         except Exception as e:
             self.logger.error("honeytoken_deactivation_failed", token_id=token_id, error=str(e))
             raise DatabaseError(f"Failed to deactivate honeytoken: {e}") from e
+
+    def close(self) -> None:
+        """Dispose engine resources."""
+        self.engine.dispose()

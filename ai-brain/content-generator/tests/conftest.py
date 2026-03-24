@@ -34,13 +34,17 @@ async def llm_client():
 @pytest.fixture
 def honeytoken_store(test_database_url):
     """Create honeytoken store for tests."""
-    return HoneytokenStore(database_url=test_database_url)
+    store = HoneytokenStore(database_url=test_database_url)
+    yield store
+    store.close()
 
 
 @pytest.fixture
 def generation_log(test_database_url):
     """Create generation log for tests."""
-    return GenerationLog(database_url=test_database_url)
+    log = GenerationLog(database_url=test_database_url)
+    yield log
+    log.close()
 
 
 @pytest.fixture

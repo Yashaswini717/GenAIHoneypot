@@ -65,8 +65,8 @@ class HoneytokenGenerator(BaseGenerator):
         # Validate
         validation_results = await self._validate_content(
             content=token_content,
-            file_type="generic",
-            context=context,
+            file_type="honeytoken",
+            context={**context, "content_type": "honeytoken"},
         )
         
         return self._create_content(

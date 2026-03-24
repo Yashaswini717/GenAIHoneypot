@@ -51,6 +51,15 @@ class SecurityValidator(BaseValidator):
         errors = []
         warnings = []
         findings = []
+        context = context or {}
+
+        if context.get("content_type") == "honeytoken" or context.get("token_type"):
+            return self._create_result(
+                valid=True,
+                score=1.0,
+                warnings=["Honeytoken content intentionally contains credential-like patterns"],
+                findings=[],
+            )
 
         # Check for real secrets
         for secret_type, pattern in self.SECRET_PATTERNS.items():

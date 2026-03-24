@@ -1,7 +1,9 @@
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 from config.logging_config import LoggerMixin
 from config.settings import settings
@@ -14,10 +16,23 @@ from .models import Base, GenerationLogCreate, GenerationLogDB, GenerationLogRes
 class GenerationLog(LoggerMixin):
     """Log all content generation operations."""
 
+    @staticmethod
+    def _create_engine(database_url: str):
+        """Create a database engine with sane defaults for SQLite files."""
+        engine_kwargs = {"echo": settings.database_echo}
+
+        if database_url.startswith("sqlite:///"):
+            db_path = database_url.removeprefix("sqlite:///")
+            if db_path and db_path != ":memory:":
+                Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+                engine_kwargs["poolclass"] = NullPool
+
+        return create_engine(database_url, **engine_kwargs)
+
     def __init__(self, database_url: Optional[str] = None):
         """Initialize generation log."""
         self.database_url = database_url or settings.database_url
-        self.engine = create_engine(self.database_url, echo=settings.database_echo)
+        self.engine = self._create_engine(self.database_url)
         self.SessionLocal = sessionmaker(bind=self.engine)
         Base.metadata.create_all(self.engine)
         self.logger.info("generation_log_initialized")
@@ -59,9 +74,13 @@ class GenerationLog(LoggerMixin):
                     stmt = stmt.where(GenerationLogDB.honeypot_id == honeypot_id)
                 if content_type:
                     stmt = stmt.where(GenerationLogDB.content_type == content_type)
-                stmt = stmt.limit(limit).order_by(GenerationLogDB.created_at.desc())
+                stmt = stmt.order_by(GenerationLogDB.created_at.desc()).limit(limit)
                 results = session.execute(stmt).scalars().all()
                 return [GenerationLogResponse.model_validate(r) for r in results]
         except Exception as e:
             self.logger.error("get_logs_failed", error=str(e))
             raise DatabaseError(f"Failed to get logs: {e}") from e
+
+    def close(self) -> None:
+        """Dispose engine resources."""
+        self.engine.dispose()

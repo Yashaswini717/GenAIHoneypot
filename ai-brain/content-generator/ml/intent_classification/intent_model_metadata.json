@@ -1,0 +1,20 @@
+{
+  "model_name": "RandomForestClassifier",
+  "model_type": "random_forest",
+  "labels": [
+    "reconnaissance",
+    "privilege_escalation",
+    "persistence",
+    "lateral_movement",
+    "data_exfiltration"
+  ],
+  "feature_count": 149,
+  "training_samples": 600,
+  "class_balance": {
+    "lateral_movement": 120,
+    "data_exfiltration": 120,
+    "privilege_escalation": 120,
+    "persistence": 120,
+    "reconnaissance": 120
+  }
+}

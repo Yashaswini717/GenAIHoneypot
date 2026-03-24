@@ -8,7 +8,7 @@ from api.routes import generate, health, honeytokens, populate
 from config.logging_config import setup_logging
 from config.settings import settings
 from core.exceptions import ContentGeneratorError
-
+from api.intent import router as intent_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -26,7 +26,7 @@ app = FastAPI(
     description="AI-Powered Content Generator for Honeypot Systems",
     lifespan=lifespan,
 )
-
+app.include_router(intent_router, prefix="/api/v1")
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,

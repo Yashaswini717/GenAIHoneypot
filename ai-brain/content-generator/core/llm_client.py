@@ -32,6 +32,8 @@ class LLMClient(LoggerMixin):
         self.timeout = settings.llm_timeout
         self.max_retries = settings.llm_max_retries
         self.retry_delay = settings.llm_retry_delay
+        self.client = None
+        self._client_init_error: Exception | None = None
 
         # Initialize provider-specific client
         if self.provider == LLMProvider.OPENAI:
@@ -50,7 +52,10 @@ class LLMClient(LoggerMixin):
     def _init_openai(self) -> None:
         """Initialize OpenAI client."""
         if not settings.openai_api_key:
-            raise LLMAuthenticationError("OpenAI API key not configured")
+            self._client_init_error = LLMAuthenticationError(
+                "OpenAI API key not configured"
+            )
+            return
 
         # Build default headers for OpenRouter compatibility
         default_headers = {}
@@ -68,6 +73,7 @@ class LLMClient(LoggerMixin):
             max_retries=0,  # We handle retries manually
             default_headers=default_headers if default_headers else None,
         )
+        self._client_init_error = None
 
     def _init_azure_openai(self) -> None:
         """Initialize Azure OpenAI client."""
@@ -76,7 +82,10 @@ class LLMClient(LoggerMixin):
             settings.azure_openai_endpoint,
             settings.azure_openai_deployment,
         ]):
-            raise LLMAuthenticationError("Azure OpenAI configuration incomplete")
+            self._client_init_error = LLMAuthenticationError(
+                "Azure OpenAI configuration incomplete"
+            )
+            return
 
         self.client = AsyncAzureOpenAI(
             api_key=settings.azure_openai_api_key,
@@ -86,12 +95,21 @@ class LLMClient(LoggerMixin):
             max_retries=0,
         )
         self.model = settings.azure_openai_deployment
+        self._client_init_error = None
 
     def _init_ollama(self) -> None:
         """Initialize Ollama client."""
         self.base_url = settings.ollama_base_url
         self.model = settings.ollama_model
         self.client = httpx.AsyncClient(timeout=self.timeout)
+        self._client_init_error = None
+
+    def _ensure_client(self) -> None:
+        """Raise a clear configuration error if the provider client is unavailable."""
+        if self.client is None:
+            if self._client_init_error is not None:
+                raise self._client_init_error
+            raise LLMConnectionError("LLM client is not initialized")
 
     async def generate(
         self,
@@ -170,6 +188,7 @@ class LLMClient(LoggerMixin):
     ) -> str:
         """Generate using OpenAI/Azure OpenAI."""
         try:
+            self._ensure_client()
             messages = []
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
@@ -213,6 +232,7 @@ class LLMClient(LoggerMixin):
     ) -> str:
         """Generate using Ollama."""
         try:
+            self._ensure_client()
             payload = {
                 "model": self.model,
                 "prompt": prompt,
@@ -252,10 +272,15 @@ class LLMClient(LoggerMixin):
 
     async def close(self) -> None:
         """Close client connections."""
-        if self.provider == LLMProvider.OLLAMA and hasattr(self, "client"):
+        if self.client is None:
+            return
+
+        if hasattr(self.client, "aclose"):
             await self.client.aclose()
-        elif hasattr(self, "client"):
-            await self.client.close()
+        elif hasattr(self.client, "close"):
+            result = self.client.close()
+            if asyncio.iscoroutine(result):
+                await result
 
     async def __aenter__(self):
         """Async context manager entry."""

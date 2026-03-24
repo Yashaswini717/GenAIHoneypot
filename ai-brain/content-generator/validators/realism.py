@@ -39,6 +39,8 @@ class RealismValidator(BaseValidator):
         context = context or {}
         file_type = context.get("file_type", "unknown")
         artifact_layer = context.get("artifact_layer", "system")
+        if context.get("content_type") == "honeytoken" or context.get("token_type"):
+            return self._create_result(valid=True, score=1.0)
         
         # Hard-fail checks for system-layer artifacts
         hard_fail_errors = []
