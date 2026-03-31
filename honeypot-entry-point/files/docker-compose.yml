@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  honeypot:
+    build: .
+    container_name: ssh-honeypot
+    hostname: dev-server
+    restart: unless-stopped
+    ports:
+      - "22:22"       # expose on 2222 externally, map to 22 inside
+    volumes:
+      - ./logs:/var/log/honeypot   # persist all session logs to host
+    environment:
+      - WEBHOOK_URL=${WEBHOOK_URL:-}   # set in .env or shell for Discord/Slack alerts
+    networks:
+      - honeypot-net
+    # Resource limits — don't let an attacker DoS your host
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+networks:
+  honeypot-net:
+    driver: bridge
+    # To fully block outbound internet access, set internal: true
+    # This prevents attackers from pulling malware or exfiltrating data
+    # internal: true
