@@ -38,3 +38,4 @@ mypy==1.8.0
 pandas
 scikit-learn
 joblib
+requests==2.32.3
