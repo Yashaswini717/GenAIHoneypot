@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, JSON
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, JSON, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 
@@ -112,6 +112,96 @@ class GenerationLogResponse(BaseModel):
     created_at: datetime
     generation_time_ms: int
     token_metadata: dict
+
+    class Config:
+        from_attributes = True
+
+
+# ──────────────────────────────────────────────
+# Adaptive learning (contextual bandit) models
+# ──────────────────────────────────────────────
+
+
+class AdaptiveArmDB(Base):
+    """
+    One row per (intent, action) 'arm' of the contextual bandit.
+
+    alpha/beta are the Beta-distribution posterior parameters. They start at
+    (1, 1) — a uniform prior, i.e. "no evidence yet" — and are nudged by
+    every resolved decision: alpha += reward, beta += (1 - reward), where
+    reward is clamped to [0, 1]. The posterior mean alpha / (alpha + beta)
+    is the arm's current estimated success rate.
+    """
+
+    __tablename__ = "adaptive_arms"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    intent = Column(String(50), nullable=False, index=True)
+    action = Column(String(100), nullable=False)
+    alpha = Column(Float, default=1.0, nullable=False)
+    beta = Column(Float, default=1.0, nullable=False)
+    times_selected = Column(Integer, default=0, nullable=False)
+    total_reward = Column(Float, default=0.0, nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("intent", "action", name="uq_adaptive_arm_intent_action"),
+    )
+
+
+class AdaptiveDecisionDB(Base):
+    """
+    One row per action the bandit selected for a session. Created 'pending'
+    (resolved=False) when the action is chosen, then resolved later once a
+    reward signal is available (next intent-classify call for the same
+    session, or an explicit /adaptive/feedback call).
+    """
+
+    __tablename__ = "adaptive_decisions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    decision_id = Column(String(100), unique=True, nullable=False, index=True)
+    session_id = Column(String(200), nullable=False, index=True)
+    honeypot_id = Column(String(100))
+    intent = Column(String(50), nullable=False)
+    action = Column(String(100), nullable=False)
+    selected_at = Column(DateTime, default=func.now(), nullable=False)
+    resolved = Column(Boolean, default=False, nullable=False, index=True)
+    resolved_at = Column(DateTime)
+    reward = Column(Float)
+    resolution_reason = Column(String(100))
+
+
+class AdaptiveArmStats(BaseModel):
+    """Pydantic view of a bandit arm, for the /adaptive/stats endpoint."""
+
+    intent: str
+    action: str
+    alpha: float
+    beta: float
+    posterior_mean: float
+    times_selected: int
+    total_reward: float
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AdaptiveDecisionResponse(BaseModel):
+    """Pydantic view of a persisted bandit decision."""
+
+    decision_id: str
+    session_id: str
+    honeypot_id: Optional[str]
+    intent: str
+    action: str
+    selected_at: datetime
+    resolved: bool
+    resolved_at: Optional[datetime]
+    reward: Optional[float]
+    resolution_reason: Optional[str]
 
     class Config:
         from_attributes = True
