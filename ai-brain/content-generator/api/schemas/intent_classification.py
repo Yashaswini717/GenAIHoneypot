@@ -59,6 +59,20 @@ class IntentClassificationResponse(BaseModel):
     inference_time_ms: float = Field(description="Inference latency in milliseconds")
     feature_values: dict[str, float] = Field(description="Extracted feature vector for observability")
     matched_rules: list[str] = Field(default_factory=list, description="Rules that triggered the decision")
+    decision_id: Optional[str] = Field(
+        default=None,
+        description="ID of the pending adaptive-bandit decision, if session_id was provided. "
+        "Resolves automatically on the next /intent-classify call for the same session, or "
+        "explicitly via POST /api/v1/adaptive/feedback.",
+    )
+    action_confidence: float = Field(
+        default=0.0,
+        description="Bandit's current posterior mean (success rate estimate) for the chosen action, in [0,1]",
+    )
+    action_times_selected: int = Field(
+        default=0,
+        description="How many times this (intent, action) arm has been selected so far",
+    )
 
     @field_validator("intent")
     @classmethod

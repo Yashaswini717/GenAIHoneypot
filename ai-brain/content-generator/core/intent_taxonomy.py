@@ -12,6 +12,19 @@ INTENT_CLASSES: Final[list[str]] = [
 ]
 
 
+# Depth of each intent along the attacker kill chain. Higher = further along
+# (i.e. the attacker has invested more effort / revealed more of their
+# tradecraft). Used by the adaptive decision engine to reward decoy actions
+# that keep an attacker progressing rather than bouncing off immediately.
+KILL_CHAIN_ORDER: Final[dict[str, int]] = {
+    "reconnaissance": 0,
+    "privilege_escalation": 1,
+    "persistence": 2,
+    "lateral_movement": 3,
+    "data_exfiltration": 4,
+}
+
+
 COMMAND_KEYWORDS: Final[dict[str, tuple[str, ...]]] = {
     "reconnaissance": (
         "nmap",
