@@ -1,0 +1,156 @@
+# The phase 1 vertical slice: one node, fully instrumented, end to end.
+#
+# Three networks, and the separation between them is the security model:
+#
+#   edge          the only network with a published port. The SSH proxy sits
+#                 here and nothing else does.
+#   control       proxy, broker and sidecar talk to each other here. Internal
+#                 only. This is where the HMAC key and the Docker socket live.
+#   deception     where attacker containers run. `internal: true`, so it has
+#                 no route to the internet, the hub, or the brain.
+#
+# What a rooted node can and cannot reach is the whole security model:
+#
+#   internet, hub, brain    no — deception is an internal network
+#   the sidecar, and so     no — the sidecar is on control only, so the HMAC
+#   the signing key              key is unreachable
+#   the session broker      no — control only. This matters more than it
+#                                looks: the broker holds the Docker socket,
+#                                and its API creates containers. An earlier
+#                                revision had it on deception, which handed
+#                                any rooted node a container-creation
+#                                endpoint. (Note the socket's `:ro` mount is
+#                                not what protects it — read-only affects the
+#                                socket file, not what the Docker API will
+#                                do once connected. Network isolation is the
+#                                actual control.)
+#   the SSH proxy           yes, and unavoidably: the proxy has to reach
+#                           nodes in order to bridge the session, so it sits
+#                           on deception too. An attacker who finds it gets
+#                           what they already have — another honeypot session.
+#                           Accepted residual, tracked for the phase 3 audit.
+#
+# Node containers are created by the broker at runtime rather than declared
+# here, because there is one per attacker.
+
+name: honeypot-ecosystem
+
+services:
+
+  ssh-proxy:
+    build:
+      context: .
+      dockerfile: shared/ssh-proxy/Dockerfile
+    image: honeypot/ssh-proxy:current
+    container_name: hp-ssh-proxy
+    restart: unless-stopped
+    # 2222 while we are local. Phase 3 publishes 22 instead, after the host's
+    # own sshd has been moved to another port.
+    ports:
+      - "${PROXY_PUBLISH_PORT:-2222}:2222"
+    environment:
+      PROXY_LISTEN_PORT: 2222
+      PROXY_ADVERTISED_PORT: "${PROXY_ADVERTISED_PORT:-22}"
+      SENSOR_ID: node-01-jump
+      BROKER_URL: http://session-broker:8080
+      BACKEND_USER: devuser
+      BACKEND_KEY_PATH: /run/secrets/backend_key
+      EVENT_PATH: /var/spool/honeypot/events.ndjson
+      TRANSCRIPT_DIR: /var/spool/honeypot/transcripts
+      HOST_KEY_DIR: /var/lib/honeypot/hostkeys
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      - telemetry:/var/spool/honeypot
+      - hostkeys:/var/lib/honeypot/hostkeys
+      - ./secrets/backend_key:/run/secrets/backend_key:ro
+    # deception is required: bridging a session means connecting to the node.
+    networks: [edge, control, deception]
+    depends_on: [session-broker]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+  session-broker:
+    build:
+      context: .
+      dockerfile: shared/session-broker/Dockerfile
+    image: honeypot/session-broker:current
+    container_name: hp-session-broker
+    restart: unless-stopped
+    environment:
+      NODE_IMAGE: honeypot/node-01-jump:current
+      NODE_NETWORK: "${COMPOSE_PROJECT_NAME:-honeypot-ecosystem}_deception"
+      NODE_HOSTNAME: jump-01
+      NODE_DOMAIN: cs.internal
+      SESSION_IDLE_TTL: "${SESSION_IDLE_TTL:-21600}"
+      MAX_CONTAINERS: "${MAX_CONTAINERS:-40}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      # The one place the socket is mounted, and never on an internet-facing
+      # service. The `:ro` is defence in depth only -- it makes the socket
+      # file read-only, which does not restrict what the Docker API will do
+      # once a client connects. Keeping this service off the deception
+      # network is the control that actually matters.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # control ONLY. The broker owns the Docker socket, so it must not be
+    # reachable from the network attackers get root on.
+    networks: [control]
+    # No published ports: reachable only from the control network.
+
+  sidecar:
+    build:
+      context: .
+      dockerfile: shared/sidecar/Dockerfile
+    image: honeypot/sidecar:current
+    container_name: hp-sidecar
+    restart: unless-stopped
+    environment:
+      HUB_URL: "${HUB_URL:-http://host.docker.internal:8000}"
+      HMAC_SECRET: "${HMAC_SECRET:?set HMAC_SECRET - run tools/bootstrap.py}"
+      EVENT_PATH: /var/spool/honeypot/events.ndjson
+      STATE_PATH: /var/lib/sidecar/offset.json
+      SPOOL_DIR: /var/lib/sidecar/pending
+      BATCH_MAX: "${BATCH_MAX:-50}"
+      FLUSH_INTERVAL: "${FLUSH_INTERVAL:-1.0}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      # Read-only: the sidecar consumes telemetry, it never produces or
+      # rewrites it.
+      - telemetry:/var/spool/honeypot:ro
+      - sidecar-state:/var/lib/sidecar
+    # control reaches the telemetry volume's producer; uplink reaches the hub.
+    # control is internal:true, so without a second, non-internal network the
+    # sidecar has no route out and every batch spools forever -- the one
+    # service that must egress was sealed in.
+    networks: [control, uplink]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on: [ssh-proxy]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+networks:
+  edge:
+    driver: bridge
+  # Outbound only, and only for the sidecar. Nothing an attacker can reach
+  # joins this network, so it is not a path back into the deception side.
+  uplink:
+    driver: bridge
+  control:
+    driver: bridge
+    internal: true
+  deception:
+    name: "${COMPOSE_PROJECT_NAME:-honeypot-ecosystem}_deception"
+    driver: bridge
+    # No route off this network. An attacker with root on a node cannot reach
+    # the hub, the brain, the internet, or the host — phase 2 adds the
+    # fake-internet gateway so that containment does not *feel* like
+    # containment.
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.60.0.0/24
+
+volumes:
+  telemetry:
+  hostkeys:
+  sidecar-state:

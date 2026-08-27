@@ -1,0 +1,170 @@
+# Single source of truth for who this node claims to be.
+#
+# The prototype this replaces contradicted itself in three places at once:
+# /etc/hostname said dev-server.cs.university.edu, the motd said
+# cs.pesu.pes.edu, and /etc/issue said "PES UNIVERSITY". Any one of those is
+# fine; all three together tell an attacker the box was assembled rather than
+# grown. Everything identity-related is rendered from this file so that cannot
+# happen again.
+#
+# CHANGE domain BEFORE PUBLIC EXPOSURE. It must be a domain we actually
+# control, so forward DNS, reverse DNS and the TLS certificate all agree. A
+# host claiming a domain whose rDNS does not match is a free tell, and we
+# cannot set rDNS for a domain we do not own.
+
+host:
+  name: jump-01
+  domain: cs.internal
+  role: Development and staging jump host
+  # Reported in /etc/os-release and matched by the SSH banner the proxy
+  # presents. These two must never drift apart.
+  os_release: "22.04.4 LTS (Jammy Jellyfish)"
+  os_version_id: "22.04"
+  kernel: "5.15.0-118-generic"
+  arch: x86_64
+
+# How long the box claims to have been up when its logs are seeded. Real
+# uptime accrues on its own once the golden master runs continuously; this
+# only governs how far back the seeded history reaches.
+history:
+  days: 94
+  # Activity follows an academic timetable rather than a flat rate: busy in
+  # working hours, quiet overnight, quieter at weekends.
+  timezone: Asia/Kolkata
+  workday_start: 9
+  workday_end: 19
+
+# Accounts with real home directories and real shells.
+#
+# `login` marks accounts the SSH proxy will accept a password for; the rest
+# exist, own files, and appear in logs and `last` output, but nobody logs in
+# as them. A box where every account in /etc/passwd is loggable is not a real
+# box.
+users:
+  - name: devuser
+    uid: 1000
+    gecos: "Dev Account"
+    login: true
+    sudo: true
+    shell: /bin/bash
+    # The richest home, and where the decoy chain begins.
+    profile: developer
+    # 0755, not the 22.04 default of 0750. Every account without sudo -- test,
+    # student, git, the ones bots actually land on -- would otherwise be walled
+    # off from the breadcrumbs entirely. 0755 homes are also completely
+    # ordinary in the wild: it was the distro default until 21.04, so any
+    # upgraded host still has them.
+    home_mode: "0755"
+
+  - name: ta_miller
+    uid: 1001
+    gecos: "S. Miller (TA)"
+    login: false
+    sudo: true
+    shell: /bin/bash
+    profile: teaching_assistant
+
+  - name: prof_davis
+    uid: 1002
+    gecos: "Prof. A. Davis"
+    login: false
+    sudo: false
+    shell: /bin/bash
+    profile: faculty
+
+  - name: student
+    uid: 1003
+    gecos: "Shared student account"
+    login: true
+    sudo: false
+    shell: /bin/bash
+    profile: student
+
+  - name: test
+    uid: 1004
+    gecos: "test account - REMOVE"
+    login: true
+    sudo: false
+    shell: /bin/bash
+    profile: minimal
+
+  - name: ubuntu
+    uid: 1005
+    gecos: "Ubuntu"
+    login: true
+    sudo: true
+    shell: /bin/bash
+    profile: minimal
+
+  - name: git
+    uid: 1006
+    gecos: "Git repositories"
+    login: true
+    sudo: false
+    shell: /bin/bash
+    profile: minimal
+
+  # NOT "backup": that is a distro system account (uid 34) and recreating it
+  # would break the packages that own it. The renderer refuses the collision.
+  - name: erpsync
+    uid: 1007
+    gecos: "ERP content sync service"
+    login: false
+    sudo: false
+    shell: /usr/sbin/nologin
+    profile: service
+
+# Hosts this node knows about. The pivot targets must resolve, because a
+# deploy script referencing a hostname that does not resolve is obviously
+# staged. Until node-02 and node-03 exist in phase 5, these resolve but do
+# not answer, which is exactly how a host that is down behaves.
+known_hosts:
+  - name: erp-web
+    address: 10.60.0.21
+    aliases: [erp, erp-web.cs.internal]
+  - name: db-01
+    address: 10.60.0.31
+    aliases: [db-01.cs.internal]
+  - name: backup-01
+    address: 10.60.0.41
+    aliases: [backup-01.cs.internal]
+
+# Services whose presence must be corroborated everywhere it would be: a
+# process in `ps`, an entry in `systemctl`, a socket in `ss`, a config under
+# /etc and a log under /var/log. Listing a service here without those is how
+# fake boxes get caught.
+services:
+  - name: ssh
+    unit: ssh.service
+    port: 22
+  - name: cron
+    unit: cron.service
+  - name: rsyslog
+    unit: rsyslog.service
+  - name: node_exporter
+    unit: node_exporter.service
+    port: 9100
+
+# The decoy chain. Medium depth by design: nothing on the surface, a hint that
+# costs a little searching, and a second step that costs privilege. Roughly
+# 20-40 minutes for a competent attacker, which rewards real work without
+# turning into a puzzle.
+decoy_chain:
+  target: erp-web
+  # Step one: a readable deploy script names the key's location.
+  hint:
+    path: /opt/deploy/sync-erp.sh
+    mode: "0755"
+    owner: root
+  # Step two: the key itself is somewhere the finder cannot read yet, so they
+  # have to escalate. devuser has sudo, so this is achievable, not a wall.
+  key:
+    path: /home/ta_miller/.ssh/id_erp_deploy
+    mode: "0600"
+    owner: ta_miller
+  # An independent, deeper second route to the same key, for attackers who
+  # dig through source control rather than the filesystem. Real systems leak
+  # in more than one way.
+  alternate:
+    repo: /home/devuser/projects/erp-backend
+    removed_in_commit: true

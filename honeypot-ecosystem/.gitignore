@@ -1,0 +1,19 @@
+# Never commit. Regenerate with tools/bootstrap.py
+secrets/
+.env
+nodes/*/backend_key.pub
+nodes/*/sshd_policy.conf
+nodes/*/honeytokens.json
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# The repo-root .gitignore carries a Python-template `build/` rule, which
+# swallows nodes/*/build/ — the directory holding render_node.py and
+# seed_history.py. Without those the node image cannot be built by anyone who
+# clones this, so re-include the directory explicitly.
+#
+# The directory itself has to be un-excluded, not just the files: git cannot
+# re-include a path whose parent directory is excluded.
+!nodes/*/build/
