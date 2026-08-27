@@ -121,7 +121,7 @@ services:
     # control is internal:true, so without a second, non-internal network the
     # sidecar has no route out and every batch spools forever -- the one
     # service that must egress was sealed in.
-    networks: [control, uplink]
+    networks: [control, uplink, telemetry]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on: [ssh-proxy]
@@ -135,6 +135,12 @@ networks:
   # joins this network, so it is not a path back into the deception side.
   uplink:
     driver: bridge
+  # Shared with the intelligence hub so the sidecar reaches it by name rather
+  # than through a host port that another service may already own.
+  # Create once:  docker network create honeypot-telemetry
+  telemetry:
+    external: true
+    name: honeypot-telemetry
   control:
     driver: bridge
     internal: true

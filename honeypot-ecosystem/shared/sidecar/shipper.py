@@ -180,9 +180,23 @@ class Shipper:
             log.warning("hub unreachable: %s", exc)
             return False
 
-        if response.status_code >= 400:
-            # 401 here almost always means the secret does not match the hub's.
-            log.warning("hub rejected a batch: %s %s", response.status_code, response.text[:200])
+        # Only 2xx counts as accepted. Treating "anything under 400" as success
+        # is how 28 events were silently fed into an unrelated Splunk instance
+        # that happened to hold the host's port 8000 and answered 303 — the
+        # sidecar logged every one of them as delivered. A redirect is not an
+        # acceptance, and telemetry that goes to the wrong service is worse
+        # than telemetry that fails loudly.
+        if not 200 <= response.status_code < 300:
+            if response.status_code in (301, 302, 303, 307, 308):
+                log.error(
+                    "HUB_URL points at something that redirects (%s -> %s). That is not "
+                    "the intelligence hub; check what else holds that port.",
+                    response.status_code,
+                    response.headers.get("location", "?"),
+                )
+            else:
+                # 401 here almost always means the secret does not match the hub's.
+                log.warning("hub rejected a batch: %s %s", response.status_code, response.text[:200])
             return False
 
         count = body.count(b"\n")
