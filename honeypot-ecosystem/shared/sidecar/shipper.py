@@ -7,21 +7,33 @@ holds the HMAC signing key. Nothing an attacker can reach can produce a valid
 signature, and nothing they can reach can tamper with a batch without
 invalidating one.
 
-It tails the NDJSON the SSH proxy writes, batches lines, signs the exact bytes
-it is about to send with HMAC-SHA256, and POSTs them to /ingest/batch with the
-digest in X-Signature — matching `verify_hmac` in the hub's receiver.
+It tails the NDJSON the SSH proxy writes and streams events to the hub one at
+a time, signing each event's exact bytes with HMAC-SHA256 and POSTing to
+`/ingest/` with the digest in X-Signature — matching `verify_hmac` in the
+hub's receiver.
 
-Delivery is at-least-once and durable. A batch that cannot be delivered is
+Why one event per request rather than batches
+---------------------------------------------
+The hub verifies signatures on `/ingest/` but not on `/ingest/batch`, which
+parses lines straight from the body. Shipping in batches therefore meant every
+event travelled the one path where the zero-trust check does not run — the
+guarantee existed on paper and nowhere else. Streaming single signed events
+closes that: every event that reaches the hub has been cryptographically
+verified as ours.
+
+It also matches the requirement more honestly. "Every activity logged and sent
+in real time" is not a batch every second, it is an event the moment it
+happens, and it puts each event on the live WebSocket feed immediately.
+
+Ordering is preserved by sending sequentially. That matters: the hub upserts a
+session row on first sight, so `session.connect` has to arrive before the
+commands belonging to it. Throughput is not a concern at honeypot volumes —
+even heavy distributed brute force is a few tens of events per second.
+
+Delivery is at-least-once and durable. An event that cannot be delivered is
 written to a spool directory and retried with backoff, so a hub restart costs
 latency rather than evidence. Read offsets are persisted, so a sidecar restart
 does not replay or skip.
-
-  NOTE for the hub side: `POST /ingest/` verifies the signature but
-  `POST /ingest/batch` currently does not — it parses lines straight from the
-  body. Signing every batch here is deliberate so the honeypot is already
-  correct once that check is added, but until it is, the batch path accepts
-  unsigned events and the zero-trust guarantee has a hole in it. Tracked as an
-  intelligence-hub fix.
 """
 
 from __future__ import annotations
@@ -54,9 +66,9 @@ class ShipperConfig:
     state_path: Path = Path(os.environ.get("STATE_PATH", "/var/lib/sidecar/offset.json"))
     spool_dir: Path = Path(os.environ.get("SPOOL_DIR", "/var/lib/sidecar/pending"))
 
-    #: Kept small. "Every activity logged and sent in real time" is the
-    #: requirement, so we trade throughput for latency deliberately.
-    batch_max: int = int(os.environ.get("BATCH_MAX", "50"))
+    #: How often to check the spool file for new events. Events are sent
+    #: individually the moment they are seen, so this is poll latency, not a
+    #: batching window.
     flush_interval: float = float(os.environ.get("FLUSH_INTERVAL", "1.0"))
     request_timeout: float = float(os.environ.get("REQUEST_TIMEOUT", "15"))
     max_backoff: float = float(os.environ.get("MAX_BACKOFF", "60"))
@@ -68,6 +80,17 @@ config = ShipperConfig()
 # --------------------------------------------------------------------------
 # signing
 # --------------------------------------------------------------------------
+
+
+def _describe(body: bytes) -> str:
+    """A short label for one event, for the delivery log."""
+    try:
+        event = json.loads(body)
+        eid = event.get("eventid", "?")
+        session = event.get("session", "?")
+        return f"{eid} [{session}]"
+    except Exception:
+        return f"{len(body)} bytes"
 
 
 def sign(body: bytes) -> str:
@@ -166,13 +189,18 @@ class Shipper:
         await self.client.aclose()
 
     async def deliver(self, body: bytes) -> bool:
-        """POST one signed batch. Returns True when the hub accepted it."""
+        """POST one signed event to the zero-trust ingest path.
+
+        `/ingest/` is the endpoint that actually verifies the signature.
+        `/ingest/batch` exists for the operator's manual log-upload UI and
+        does not verify, so no sensor traffic goes through it.
+        """
         try:
             response = await self.client.post(
-                f"{config.hub_url}/ingest/batch",
+                f"{config.hub_url}/ingest/",
                 content=body,
                 headers={
-                    "Content-Type": "application/x-ndjson",
+                    "Content-Type": "application/json",
                     "X-Signature": sign(body),
                 },
             )
@@ -199,9 +227,12 @@ class Shipper:
                 log.warning("hub rejected a batch: %s %s", response.status_code, response.text[:200])
             return False
 
-        count = body.count(b"\n")
-        self.delivered += count
-        log.info("delivered %d event(s); total %d", count, self.delivered)
+        self.delivered += 1
+        log.info(
+            "delivered %s (total %d)",
+            _describe(body),
+            self.delivered,
+        )
         return True
 
     async def drain_spool(self) -> None:
@@ -249,10 +280,10 @@ class Shipper:
 
     async def run(self) -> None:
         log.info(
-            "sidecar up: %s -> %s | batch<=%d every %.1fs | signing %s",
+            "sidecar up: %s -> %s/ingest/ | streaming single signed events, "
+            "polling every %.1fs | signing %s",
             config.event_path,
             config.hub_url,
-            config.batch_max,
             config.flush_interval,
             "enabled" if config.hmac_secret != "dev" else "with the dev secret",
         )
@@ -272,16 +303,18 @@ class Shipper:
                     await asyncio.sleep(config.flush_interval)
                     continue
 
-                for start in range(0, len(lines), config.batch_max):
-                    batch = lines[start : start + config.batch_max]
-                    body = b"\n".join(batch) + b"\n"
-                    if not await self.deliver(body):
-                        self.spool.add(body)
-                        self.failed += len(batch)
+                # Sequential and one at a time. Sequential because the hub
+                # upserts a session row on first sight, so session.connect has
+                # to land before the commands that belong to it; one at a time
+                # because only /ingest/ verifies the signature.
+                for event in lines:
+                    if not await self.deliver(event):
+                        self.spool.add(event)
+                        self.failed += 1
 
                 if self.spool.depth:
                     backoff = min(backoff * 2, config.max_backoff)
-                    log.info("%d batch(es) spooled; backing off %.0fs", self.spool.depth, backoff)
+                    log.info("%d event(s) spooled; backing off %.0fs", self.spool.depth, backoff)
                     await asyncio.sleep(backoff)
                 else:
                     backoff = 1.0

@@ -42,7 +42,12 @@ services:
       context: .
       dockerfile: shared/ssh-proxy/Dockerfile
     image: honeypot/ssh-proxy:current
-    container_name: hp-ssh-proxy
+    # NOT "hp-ssh-proxy". Docker's embedded DNS answers reverse lookups with
+    # the container name, so `netstat` on a node printed
+    # "hp-ssh-proxy.honeypot-ecosystem_deception" for the inbound connection --
+    # naming both the proxy and the word "honeypot" in one line. It now reads
+    # as an ordinary management gateway on an ordinary departmental subnet.
+    container_name: gw-01
     restart: unless-stopped
     # 2222 while we are local. Phase 3 publishes 22 instead, after the host's
     # own sshd has been moved to another port.
@@ -55,6 +60,9 @@ services:
       BROKER_URL: http://session-broker:8080
       BACKEND_USER: devuser
       BACKEND_KEY_PATH: /run/secrets/backend_key
+      # Generated from nodes/*/identity.yaml so the login password and
+      # the password sudo accepts on the node are the same string.
+      HONEYPOT_CREDENTIALS_PATH: /run/secrets/credentials.yaml
       EVENT_PATH: /var/spool/honeypot/events.ndjson
       TRANSCRIPT_DIR: /var/spool/honeypot/transcripts
       HOST_KEY_DIR: /var/lib/honeypot/hostkeys
@@ -63,8 +71,13 @@ services:
       - telemetry:/var/spool/honeypot
       - hostkeys:/var/lib/honeypot/hostkeys
       - ./secrets/backend_key:/run/secrets/backend_key:ro
+      - ./secrets/credentials.yaml:/run/secrets/credentials.yaml:ro
     # deception is required: bridging a session means connecting to the node.
-    networks: [edge, control, deception]
+    networks:
+      edge: {}
+      control: {}
+      deception:
+        aliases: [gw-01, gw-01.cs.internal]
     depends_on: [session-broker]
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
@@ -78,7 +91,7 @@ services:
     restart: unless-stopped
     environment:
       NODE_IMAGE: honeypot/node-01-jump:current
-      NODE_NETWORK: "${COMPOSE_PROJECT_NAME:-honeypot-ecosystem}_deception"
+      NODE_NETWORK: cs.internal
       NODE_HOSTNAME: jump-01
       NODE_DOMAIN: cs.internal
       SESSION_IDLE_TTL: "${SESSION_IDLE_TTL:-21600}"
@@ -109,7 +122,6 @@ services:
       EVENT_PATH: /var/spool/honeypot/events.ndjson
       STATE_PATH: /var/lib/sidecar/offset.json
       SPOOL_DIR: /var/lib/sidecar/pending
-      BATCH_MAX: "${BATCH_MAX:-50}"
       FLUSH_INTERVAL: "${FLUSH_INTERVAL:-1.0}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     volumes:
@@ -145,7 +157,9 @@ networks:
     driver: bridge
     internal: true
   deception:
-    name: "${COMPOSE_PROJECT_NAME:-honeypot-ecosystem}_deception"
+    # The network name shows up in reverse lookups too, so it must read like
+    # a real departmental subnet rather than naming the project.
+    name: cs.internal
     driver: bridge
     # No route off this network. An attacker with root on a node cannot reach
     # the hub, the brain, the internet, or the host — phase 2 adds the

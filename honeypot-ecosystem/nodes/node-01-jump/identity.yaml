@@ -40,11 +40,22 @@ history:
 # exist, own files, and appear in logs and `last` output, but nobody logs in
 # as them. A box where every account in /etc/passwd is loggable is not a real
 # box.
+#
+# `password` is set as the real Unix password too, not just at the proxy.
+# That matters more than it sounds: the accounts used to be locked with
+# `usermod -p '!'`, so `sudo` could never authenticate and every escalation
+# attempt failed with "Sorry, try again". A dev jump box where sudo is broken
+# for everyone is not a real box either -- and it dead-ended the decoy chain,
+# whose second step is exactly `sudo cat` on another user's key.
+#
+# tools/bootstrap.py generates the proxy's credential file from these, so the
+# password that logs you in is the password sudo accepts.
 users:
   - name: devuser
     uid: 1000
     gecos: "Dev Account"
     login: true
+    password: "dev@123"
     sudo: true
     shell: /bin/bash
     # The richest home, and where the decoy chain begins.
@@ -76,6 +87,7 @@ users:
     uid: 1003
     gecos: "Shared student account"
     login: true
+    password: "student123"
     sudo: false
     shell: /bin/bash
     profile: student
@@ -84,6 +96,7 @@ users:
     uid: 1004
     gecos: "test account - REMOVE"
     login: true
+    password: "test123"
     sudo: false
     shell: /bin/bash
     profile: minimal
@@ -92,6 +105,7 @@ users:
     uid: 1005
     gecos: "Ubuntu"
     login: true
+    password: "ubuntu"
     sudo: true
     shell: /bin/bash
     profile: minimal
@@ -100,6 +114,7 @@ users:
     uid: 1006
     gecos: "Git repositories"
     login: true
+    password: "git"
     sudo: false
     shell: /bin/bash
     profile: minimal

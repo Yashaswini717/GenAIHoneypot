@@ -27,6 +27,7 @@ preserved even though the container is not.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -233,8 +234,15 @@ async def list_sessions() -> dict[str, Any]:
 
 
 def _safe_name(src_ip: str) -> str:
-    cleaned = "".join(c if c.isalnum() else "-" for c in src_ip)
-    return f"hp-node01-{cleaned}-{int(time.time())}"
+    """A container name that does not advertise what this is.
+
+    Docker answers reverse DNS with the container name, so anything an
+    attacker can reach will eventually print it -- `netstat`, `w`, `last`,
+    ssh's "Last login from". A name like "hp-node01-..." names the project in
+    one line, so nodes are named after the role they claim instead.
+    """
+    digest = hashlib.sha256(f"{src_ip}:{NODE_HOSTNAME}".encode()).hexdigest()[:6]
+    return f"{NODE_HOSTNAME}-{digest}"
 
 
 def _container_alive(container_id: str) -> bool:
@@ -257,8 +265,6 @@ def _kvm_style_mac(key: str) -> str:
     Derived from the session key so a returning attacker sees the same address
     on the same container.
     """
-    import hashlib
-
     digest = hashlib.sha256(key.encode()).hexdigest()
     return "52:54:00:" + ":".join(digest[i : i + 2] for i in (0, 2, 4))
 

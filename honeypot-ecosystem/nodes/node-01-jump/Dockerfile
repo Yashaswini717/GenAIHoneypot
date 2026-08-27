@@ -23,6 +23,30 @@
 # agent and no event spool inside the attacker's reach, because recording
 # happens on the wire in the SSH proxy. Nothing here for them to find.
 
+# --------------------------------------------------------------------------
+# Builder: compile the uname() shim
+# --------------------------------------------------------------------------
+#
+# A separate stage purely so gcc never reaches the final image. The shim makes
+# uname() report the kernel we claim rather than the host's — see
+# build/unamed.c for why that matters.
+
+FROM ubuntu:22.04 AS shimbuilder
+
+ARG KERNEL_RELEASE="5.15.0-118-generic"
+ARG KERNEL_VERSION="#128-Ubuntu SMP Fri Jul 5 09:28:59 UTC 2026"
+
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY build/unamed.c /tmp/unamed.c
+RUN gcc -shared -fPIC -O2 -Wall \
+        -DFAKE_RELEASE="\"${KERNEL_RELEASE}\"" \
+        -DFAKE_VERSION="\"${KERNEL_VERSION}\"" \
+        -o /tmp/libnodeenv.so /tmp/unamed.c -ldl \
+    && test -s /tmp/libnodeenv.so
+
+
 FROM ubuntu:22.04
 
 ARG NODE_TZ=Asia/Kolkata
@@ -62,6 +86,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         htop \
         net-tools \
         iproute2 \
+        dnsutils \
         procps \
         psmisc \
         rsync \
@@ -73,6 +98,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ln -snf "/usr/share/zoneinfo/${NODE_TZ}" /etc/localtime \
     && echo "${NODE_TZ}" > /etc/timezone \
     && dpkg-reconfigure -f noninteractive tzdata
+
+# --------------------------------------------------------------------------
+# Kill the dynamic MOTD
+# --------------------------------------------------------------------------
+#
+# Ubuntu's /etc/update-motd.d scripts run at every login and build a banner
+# from the LIVE kernel, which in a container is the Docker host's. A real
+# session showed our carefully written motd immediately after this:
+#
+#   Welcome to Ubuntu 22.04.5 LTS (GNU/Linux 6.6.87.2-microsoft-standard-WSL2 ...)
+#   This system has been minimized by removing packages ...
+#   To restore this content, you can run the 'unminimize' command.
+#
+# Two banners is odd; a banner naming WSL2 and "minimized" is conclusive. The
+# scripts go, so pam_motd prints exactly one thing: /etc/motd, which we wrote.
+RUN rm -rf /etc/update-motd.d/* /etc/legal /var/lib/update-notifier \
+    && rm -f /etc/motd.dynamic /run/motd.dynamic \
+    && touch /etc/update-motd.d/.keep
 
 # --------------------------------------------------------------------------
 # Identity, history and decoys
@@ -108,6 +151,27 @@ COPY --chmod=0755 entrypoint.sh /usr/local/sbin/node-init
 # cron and rsyslog as ordinary children at ordinary PIDs -- which is the shape
 # of a real boot.
 RUN cp /usr/bin/tini /sbin/init && chmod 0755 /sbin/init
+
+# --------------------------------------------------------------------------
+# uname() shim
+# --------------------------------------------------------------------------
+#
+# Installed last, and verified immediately. /etc/ld.so.preload applies to every
+# dynamically linked process on the system, so a broken library here would make
+# the loader print a warning before every single command an attacker runs —
+# considerably louder than the WSL2 kernel string it exists to hide. The build
+# fails rather than shipping that.
+
+COPY --from=shimbuilder /tmp/libnodeenv.so /lib/x86_64-linux-gnu/libnodeenv.so
+
+RUN chmod 0644 /lib/x86_64-linux-gnu/libnodeenv.so \
+    && echo "/lib/x86_64-linux-gnu/libnodeenv.so" > /etc/ld.so.preload \
+    && ldconfig \
+    && echo "--- verifying the preload does not break the system ---" \
+    && /bin/true \
+    && test -z "$(/bin/echo -n 2>&1)" \
+    && uname -r | grep -qv microsoft \
+    && echo "uname now reports: $(uname -r)"
 
 EXPOSE 22
 ENTRYPOINT ["/sbin/init", "-s", "--"]

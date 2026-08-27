@@ -164,7 +164,11 @@ class NodeRenderer:
             "  Memory usage: 34%               IPv4 address for eth0: 10.60.0.11\n"
             "  Swap usage:   0%\n"
             "\n"
-            f"  {host['role']} — {self.fqdn}\n"
+            # ASCII only. The motd is rendered by a terminal whose encoding we
+            # do not control, and an em-dash came back as a replacement
+            # character in a real session — a small thing, but a real server's
+            # banner does not have mojibake in it.
+            f"  {host['role']} - {self.fqdn}\n"
             f"  Last patched {uptime_days - self.rng.randint(20, 60)} days ago. "
             "Maintenance window: Sundays 02:00-04:00 IST.\n"
             "  Issues: itsupport (ext. 4412)\n"
@@ -207,10 +211,25 @@ class NodeRenderer:
                 "--comment", user["gecos"],
                 name,
             )
-            # Locked local passwords: authentication happens at the proxy, so
-            # a shadow entry here would be a second, contradictory source of
-            # truth about who can log in.
-            self.run("usermod", "-p", "!", name)
+            # Real passwords for login accounts, locked for the rest.
+            #
+            # These were previously locked with `usermod -p '!'` on the theory
+            # that authentication belongs to the proxy. That was wrong twice
+            # over: `sudo` then failed for everyone with "Sorry, try again",
+            # which no working dev box does, and it dead-ended the decoy chain
+            # whose second step is `sudo cat` on another user's key. The proxy
+            # gets the same passwords from tools/bootstrap.py, so the two
+            # never disagree.
+            password = user.get("password")
+            if user.get("login") and password:
+                subprocess.run(
+                    ["chpasswd"],
+                    input=f"{name}:{password}\n".encode(),
+                    check=True,
+                    capture_output=True,
+                )
+            else:
+                self.run("usermod", "-p", "!", name)
 
             if user.get("sudo"):
                 self.run("usermod", "-aG", "sudo", name)
@@ -617,6 +636,161 @@ class NodeRenderer:
         )
         print(f"planted {len(self.honeytokens)} honeytokens", file=sys.stderr)
 
+    # -- lived-in home directories -----------------------------------------
+
+    def render_homes(self) -> None:
+        """Give every account a home that looks used.
+
+        Nothing populated homes before this, and it showed: `/home/test` was
+        completely empty and `/home/devuser` held a single `projects` folder.
+        An attacker who lands in an empty home on a machine claiming ninety
+        days of uptime has learned everything they need in one `ls`.
+
+        Content is per role. A TA's home does not look like a student's, a
+        student's does not look like a developer's, and the shared `test`
+        account looks like what it is: an account someone created years ago
+        and never cleaned up.
+        """
+        for user in self.identity["users"]:
+            name = user["name"]
+            profile = user.get("profile")
+            home = self.path(f"/home/{name}")
+            if not home.exists():
+                continue
+
+            files = HOME_CONTENT.get(profile, {})
+            for relative, body in files.items():
+                target = home / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(
+                    body.format(domain=self.domain, host=self.hostname),
+                    encoding="utf-8",
+                )
+                target.chmod(0o600 if relative.startswith(".") else 0o644)
+
+            # ssh client state, which every account that reaches other hosts
+            # accumulates. known_hosts naming the pivot targets is a hint in
+            # its own right, and its absence on a jump box would be strange.
+            if profile in ("developer", "teaching_assistant"):
+                ssh_dir = home / ".ssh"
+                ssh_dir.mkdir(parents=True, exist_ok=True)
+                ssh_dir.chmod(0o700)
+                (ssh_dir / "known_hosts").write_text(
+                    "\n".join(
+                        f"{entry['name']},{entry['address']} ssh-ed25519 "
+                        f"AAAAC3NzaC1lZDI1NTE5AAAAI{_fake_fingerprint(self.rng)[:32]}"
+                        for entry in self.identity.get("known_hosts", [])
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (ssh_dir / "config").write_text(
+                    "Host erp erp-web\n"
+                    f"  HostName erp-web.{self.domain}\n"
+                    "  User deploy\n"
+                    "  IdentityFile ~/.ssh/id_erp_deploy\n"
+                    "\n"
+                    "Host db-01\n"
+                    f"  HostName db-01.{self.domain}\n"
+                    "  User dbadmin\n",
+                    encoding="utf-8",
+                )
+                for item in ssh_dir.iterdir():
+                    item.chmod(0o600)
+
+            self.run("chown", "-R", f"{name}:{name}", str(home))
+
+    # -- the rest of the estate --------------------------------------------
+
+    def render_environment(self) -> None:
+        """Populate the parts of the filesystem the story depends on.
+
+        Every one of these is referenced somewhere an attacker can read, and
+        a reference that leads nowhere is worse than no reference at all. The
+        sshd_config comment points at /opt/deploy/CHANGELOG; cron logs a
+        nightly run of /opt/deploy/nightly-sync.sh; the deploy script rsyncs
+        /srv/erp-content. Before this, all three were missing, /var/backups
+        was empty despite a nightly backup job, and /var/mail had nothing in
+        it despite cron running for ninety days.
+        """
+        # The content the deploy script actually syncs.
+        for relative, body in ERP_CONTENT.items():
+            self.write(f"/srv/erp-content/{relative}", body, when=self.random_moment(1, 40))
+
+        self.write(
+            "/opt/deploy/CHANGELOG",
+            "2026-02-14  ssh hardening applied per CIS benchmark (ITS-2104)\n"
+            "2026-03-02  rotated deploy key after ta handover\n"
+            "2026-04-19  nightly-sync moved to 02:17 to clear the backup window\n"
+            "2026-06-08  added erp-content pre-flight check\n"
+            "2026-07-30  reviewed sshd config, no changes\n",
+            when=self.random_moment(25, 40),
+        )
+
+        self.write(
+            "/opt/deploy/nightly-sync.sh",
+            "#!/bin/bash\n"
+            "# Wrapper invoked from the backup user's crontab at 02:17.\n"
+            "set -eo pipefail\n"
+            'LOG="/var/log/erp-sync.log"\n'
+            'echo "[$(date -Is)] nightly sync starting" >> "$LOG"\n'
+            '/opt/deploy/sync-erp.sh >> "$LOG" 2>&1 || echo "[$(date -Is)] sync FAILED" >> "$LOG"\n'
+            'tar czf "/var/backups/erp-content-$(date +%Y%m%d).tar.gz" /srv/erp-content 2>/dev/null\n'
+            'find /var/backups -name "erp-content-*.tar.gz" -mtime +14 -delete\n',
+            mode=0o755,
+            when=self.random_moment(25, 40),
+        )
+
+        # Backups the nightly job would have left behind, with the retention
+        # window the script itself declares.
+        for days_ago in range(1, 15):
+            when = self.now - timedelta(days=days_ago)
+            stamp = when.strftime("%Y%m%d")
+            path = self.write(
+                f"/var/backups/erp-content-{stamp}.tar.gz",
+                f"\x1f\x8b\x08\x00{'archive placeholder ' * self.rng.randint(40, 90)}",
+            )
+            self.set_time(path, when.replace(hour=2, minute=18))
+
+        # The log that job appends to.
+        sync_lines = []
+        for days_ago in range(60, 0, -1):
+            when = (self.now - timedelta(days=days_ago)).replace(hour=2, minute=17)
+            sync_lines.append(f"[{when.isoformat()}] nightly sync starting")
+            if self.rng.random() < 0.06:
+                sync_lines.append(f"[{when.isoformat()}] sync FAILED")
+        self.write("/var/log/erp-sync.log", "\n".join(sync_lines) + "\n", mode=0o644)
+
+        # Cron mail. An account that has existed for months with an empty
+        # mail spool has never had a cron job fail, which is not how servers
+        # work.
+        self.write(
+            "/var/mail/devuser",
+            "From root@{host}  Tue Aug 11 02:17:41 2026\n"
+            "From: root@{host} (Cron Daemon)\n"
+            "To: devuser@{host}\n"
+            "Subject: Cron <backup@{host}> /opt/deploy/nightly-sync.sh\n"
+            "\n"
+            "rsync: connection unexpectedly closed (0 bytes received so far)\n"
+            "rsync error: error in rsync protocol data stream (code 12)\n"
+            "\n".format(host=self.hostname),
+            mode=0o660,
+            when=self.random_moment(14, 18),
+        )
+        self.run("chown", "devuser:mail", str(self.path("/var/mail/devuser")))
+
+        # Real crontabs, so `crontab -l` and /etc/cron.d agree with the
+        # syslog entries and with the mail above.
+        self.write(
+            "/etc/cron.d/erp-sync",
+            "# Nightly ERP staging sync\n"
+            "SHELL=/bin/bash\n"
+            "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+            "MAILTO=devuser\n"
+            "17 2 * * *  root  /opt/deploy/nightly-sync.sh\n"
+            "*/15 * * * *  root  /usr/bin/find /tmp -type f -mtime +7 -delete\n",
+        )
+
     # -- filesystem realism ------------------------------------------------
 
     def scatter_mtimes(self) -> None:
@@ -704,6 +878,219 @@ _HISTORY = {
 }
 
 
+#: Per-role home directory content.
+#
+# Written through str.format with {domain} and {host}, so any literal brace in
+# a value must be doubled. Keep shell variables out of these files for that
+# reason; scripts belong in render_environment where no formatting happens.
+HOME_CONTENT: dict[str, dict[str, str]] = {
+    "developer": {
+        "notes.txt": (
+            "ERP staging notes\n"
+            "=================\n"
+            "- staging box is erp-web, deploy user is 'deploy'\n"
+            "- key lives with ta_miller since the handover, ask before rotating\n"
+            "- db-01 only accepts connections from erp-web, not from here\n"
+            "- nightly sync runs 02:17, check /var/log/erp-sync.log if content is stale\n"
+            "- ITS ticket for moving creds into the vault: ITS-2291 (still open)\n"
+        ),
+        "TODO.md": (
+            "# This week\n\n"
+            "- [x] patch sshd config to match the CIS profile\n"
+            "- [x] move nightly sync off the backup window\n"
+            "- [ ] rotate the deploy key, it predates the TA handover\n"
+            "- [ ] get creds out of sync-erp.sh and into the vault (ITS-2291)\n"
+            "- [ ] attendance-api still has no tests\n"
+            "- [ ] ask prof davis about the exam server capacity for December\n"
+        ),
+        "Documents/handover.md": (
+            "Handover notes\n"
+            "==============\n\n"
+            "Written up after Sanjay left in March.\n\n"
+            "Deployments\n"
+            "-----------\n"
+            "Everything staging goes through /opt/deploy/sync-erp.sh. It reads the\n"
+            "deploy key from a path set in DEPLOY_KEY; the default in the script is\n"
+            "correct. Sanjay kept the key in his home, we moved it to ta_miller\n"
+            "so the TAs could run deployments during the semester.\n\n"
+            "Databases\n"
+            "---------\n"
+            "db-01 is reachable from erp-web only. If you need a dump, run it there\n"
+            "and rsync it back rather than opening the firewall.\n\n"
+            "Access\n"
+            "------\n"
+            "Everyone in the sudo group can run the deploy. Students on this box\n"
+            "have no sudo and should not need it.\n"
+        ),
+        "Documents/meeting-2026-07-14.md": (
+            "Infra sync, 14 July\n"
+            "===================\n"
+            "Present: devuser, ta_miller, prof davis (partial)\n\n"
+            "- exam server load last semester peaked at 340 concurrent, we sized for 200\n"
+            "- agreed to move the results endpoint off the ERP box before December\n"
+            "- prof davis wants read-only access to the attendance API for his TAs\n"
+            "- ITS still have not scheduled the vault migration, chase in August\n"
+        ),
+        "projects/attendance-api/README.md": (
+            "# attendance-api\n\n"
+            "Flask service backing the attendance kiosks in the CS block.\n\n"
+            "Runs on erp-web behind nginx at /api/attendance. Config comes from\n"
+            "the environment; see the deployment notes in Documents/handover.md.\n\n"
+            "No tests yet. Sorry.\n"
+        ),
+        "projects/attendance-api/app.py": (
+            "from datetime import date\n\n"
+            "from flask import Flask, jsonify, request\n\n"
+            "app = Flask(__name__)\n\n\n"
+            "@app.get('/api/attendance/<course>')\n"
+            "def attendance(course):\n"
+            "    # TODO: this still trusts the course code from the caller\n"
+            "    rows = query_attendance(course, date.today())\n"
+            "    return jsonify(rows)\n\n\n"
+            "@app.post('/api/attendance/<course>')\n"
+            "def mark(course):\n"
+            "    payload = request.get_json()\n"
+            "    return jsonify(record(course, payload)), 201\n"
+        ),
+        "scratch/db-dump-notes.txt": (
+            "pg dump from erp-web, 12 June, before the schema change\n"
+            "restored fine on the staging copy\n"
+            "do not run this against db-01 directly, it locks the students table\n"
+        ),
+    },
+    "teaching_assistant": {
+        "labs/lab04-networks.md": (
+            "CS340 Lab 4 - Network Reconnaissance\n"
+            "====================================\n\n"
+            "Objectives: understand host discovery and service enumeration on a\n"
+            "network you are authorised to test.\n\n"
+            "Use the lab subnet only. Scanning departmental infrastructure is a\n"
+            "disciplinary matter, see the acceptable use policy.\n\n"
+            "Submission: writeup as PDF via the ERP portal by Friday 23:59.\n"
+        ),
+        "labs/lab05-privesc.md": (
+            "CS340 Lab 5 - Privilege Escalation\n"
+            "==================================\n\n"
+            "Covers SUID binaries, sudo misconfiguration and PATH hijacking on the\n"
+            "provided lab VM image. Do not attempt any of this on the jump host.\n"
+        ),
+        "grading/cs340_marks_provisional.csv": (
+            "roll,name,lab1,lab2,lab3,lab4,total\n"
+            "PES1UG22CS041,A Bhat,8,9,7,9,33\n"
+            "PES1UG22CS118,M Rao,7,7,8,6,28\n"
+            "PES1UG22CS207,S Nair,9,10,9,10,38\n"
+            "PES1UG22CS233,K Iyer,6,5,7,7,25\n"
+            "PES1UG22CS301,R Menon,10,9,10,9,38\n"
+        ),
+        "notes.txt": (
+            "deployments are mine since the handover in march\n"
+            "key is in .ssh, prof davis has a copy in his safe\n"
+            "if the nightly sync fails check erp-web is actually up first\n"
+        ),
+    },
+    "faculty": {
+        "courses/cs340/syllabus.md": (
+            "CS340 - Systems and Network Security\n"
+            "====================================\n\n"
+            "Unit 1  Threat models, attacker economics\n"
+            "Unit 2  Network reconnaissance and defence\n"
+            "Unit 3  Access control, privilege escalation\n"
+            "Unit 4  Deception technologies and honeypots\n"
+            "Unit 5  Incident response\n\n"
+            "Assessment: 40 percent labs, 60 percent end semester.\n"
+        ),
+        "courses/cs340/exam-plan.txt": (
+            "December end-sem\n"
+            "one question from unit 4 on deception, they will not expect it\n"
+            "lab component moderated by ta_miller\n"
+            "capacity request with ITS for 340 concurrent, still pending\n"
+        ),
+        "Documents/research-notes.md": (
+            "# Reading notes\n\n"
+            "Provos and Holz on virtual honeypots still the clearest treatment of\n"
+            "interaction levels. Worth setting as unit 4 reading.\n\n"
+            "The interesting failure mode is not detection of the decoy, it is the\n"
+            "operator forgetting the decoy is instrumented.\n"
+        ),
+    },
+    "student": {
+        "cs340/lab4/writeup.md": (
+            "# Lab 4 writeup\n\n"
+            "Scanned the lab subnet as instructed. Found three hosts responding.\n"
+            "Still need to finish the service enumeration section before Friday.\n"
+        ),
+        "cs340/lab4/scan-output.txt": (
+            "10.99.4.11  open: 22, 80\n"
+            "10.99.4.12  open: 22\n"
+            "10.99.4.19  open: 22, 3306\n"
+        ),
+        "assignment2.py": (
+            "# CS340 assignment 2 - simple port scanner\n"
+            "import socket\n\n\n"
+            "def probe(host, port, timeout=0.4):\n"
+            "    s = socket.socket()\n"
+            "    s.settimeout(timeout)\n"
+            "    try:\n"
+            "        s.connect((host, port))\n"
+            "        return True\n"
+            "    except OSError:\n"
+            "        return False\n"
+            "    finally:\n"
+            "        s.close()\n"
+        ),
+        "results.txt": "lab1 8\nlab2 7\nlab3 8\n",
+    },
+    "minimal": {
+        # The shared/leftover accounts. Sparse on purpose, but never empty --
+        # an account that has existed for months has *something* in it.
+        "notes.txt": (
+            "temporary account, ask devuser before using\n"
+            "was set up for the ITS audit in march, should have been removed\n"
+        ),
+        ".profile-backup": "# saved before the shell change, 2026-03-04\n",
+    },
+    "service": {
+        "README": (
+            "Service account for the ERP content sync. Do not log in as this\n"
+            "account; use sudo from your own account instead.\n"
+        ),
+    },
+}
+
+#: What the deploy script actually rsyncs. Referenced by /opt/deploy/sync-erp.sh.
+ERP_CONTENT: dict[str, str] = {
+    "README": (
+        "Staging content root for the ERP service.\n"
+        "Synced nightly from jump-01 by /opt/deploy/nightly-sync.sh.\n"
+    ),
+    "notices/2026-08-semester-registration.html": (
+        "<h2>Semester registration opens 1 September</h2>\n"
+        "<p>Students must clear pending dues before registering. Contact the\n"
+        "department office for exemptions.</p>\n"
+    ),
+    "notices/2026-07-exam-schedule.html": (
+        "<h2>End semester examination schedule</h2>\n"
+        "<p>The provisional timetable is available on the student portal.</p>\n"
+    ),
+    "templates/marksheet.html": (
+        "<html><body><h1>Statement of Marks</h1>\n"
+        "<!-- populated by the ERP results module -->\n"
+        "</body></html>\n"
+    ),
+    "config/services.yml": (
+        "erp:\n"
+        "  host: erp-web\n"
+        "  port: 8080\n"
+        "attendance:\n"
+        "  host: erp-web\n"
+        "  path: /api/attendance\n"
+        "results:\n"
+        "  host: db-01\n"
+        "  readonly: true\n"
+    ),
+}
+
+
 def _fake_fingerprint(rng: random.Random) -> str:
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     return "".join(rng.choice(alphabet) for _ in range(43))
@@ -754,6 +1141,8 @@ def main() -> int:
     renderer.render_identity()
     renderer.render_users()
     renderer.render_sshd()
+    renderer.render_homes()
+    renderer.render_environment()
     renderer.render_history()
     renderer.render_decoys()
     renderer.scatter_mtimes()
