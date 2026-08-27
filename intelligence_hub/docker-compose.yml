@@ -63,6 +63,14 @@ services:
     build: ./backend
     ports:
       - "8000:8000"
+    networks:
+      # Reachable from honeypot sidecars by name, without depending on a host
+      # port. The host's 8000 is not ours to assume — a Splunk instance holds
+      # it on this machine, and sidecars were silently posting telemetry into
+      # it via host.docker.internal.
+      default: {}
+      telemetry:
+        aliases: [intelligence-hub]
     env_file: .env
     depends_on:
       elasticsearch:
@@ -88,6 +96,11 @@ services:
       - ./frontend:/app
       - /app/node_modules
     command: npm run dev -- --host
+
+networks:
+  telemetry:
+    external: true
+    name: honeypot-telemetry
 
 volumes:
   es_data:
