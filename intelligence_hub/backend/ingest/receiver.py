@@ -150,7 +150,28 @@ async def ingest_log(request: Request):
 
 @router.post("/batch")
 async def ingest_batch(request: Request):
-    """Accepts multiple Cowrie log lines — one JSON object per line (NDJSON)."""
+    """Operator upload path: multiple Cowrie log lines as NDJSON.
+
+    This exists for the dashboard's Ingest Logs page, which lets an analyst
+    upload a Cowrie JSONL file by hand. A browser cannot hold the signing
+    secret, so this endpoint cannot require a signature the way /ingest/ does.
+
+    Honeypot sensors do NOT use this path. Sidecars stream single signed
+    events to /ingest/, where the signature is always verified — so the
+    zero-trust guarantee covers every event that arrives from a node.
+
+    Guarded by `allow_unsigned_batch`, which must be set false before the hub
+    is exposed anywhere; otherwise anyone who can reach it can inject events.
+    """
+    if not settings.allow_unsigned_batch:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Unsigned batch ingestion is disabled. Sensors should stream "
+                "signed events to POST /ingest/ instead."
+            ),
+        )
+
     body = await request.body()
     lines = [l.strip() for l in body.decode().splitlines() if l.strip()]
     results = []
