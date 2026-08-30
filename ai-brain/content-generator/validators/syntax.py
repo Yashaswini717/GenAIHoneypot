@@ -173,13 +173,40 @@ class SyntaxValidator(BaseValidator):
         if content.count("{") != content.count("}"):
             errors.append("Unbalanced curly braces")
 
-        # Check for semicolons on directives
+        # Check for semicolons on directives. A directive can legitimately span
+        # multiple lines (e.g. a wrapped log_format string or a multi-line
+        # gzip_types list), so only flag a statement if it never terminates
+        # with `;`, `{`, or `}` before being closed off by a blank line or EOF
+        # — not on every individual continuation line.
         lines = content.split('\n')
+        open_statement_line: int | None = None
         for i, line in enumerate(lines, 1):
-            line = line.strip()
-            if line and not line.startswith('#') and not line.endswith(('{', '}', ';')):
-                if line:  # Not empty
-                    warnings.append(f"Line {i} may be missing semicolon")
+            stripped = line.strip()
+            if not stripped:
+                if open_statement_line is not None:
+                    warnings.append(f"Line {open_statement_line} may be missing semicolon")
+                    open_statement_line = None
+                continue
+            if stripped.startswith('#'):
+                continue
+
+            # Ignore a trailing inline comment (e.g. "allow 1.2.3.0/24;  # vpn")
+            # when checking the terminator, so it doesn't mask a real ';'.
+            comment_idx = stripped.find(' #')
+            code_part = stripped[:comment_idx].rstrip() if comment_idx != -1 else stripped
+
+            if code_part.endswith('}'):
+                # A block close can't be part of a directive's own args —
+                # anything still open at this point genuinely never terminated.
+                if open_statement_line is not None:
+                    warnings.append(f"Line {open_statement_line} may be missing semicolon")
+                    open_statement_line = None
+            elif code_part.endswith((';', '{')):
+                open_statement_line = None
+            elif open_statement_line is None:
+                open_statement_line = i
+        if open_statement_line is not None:
+            warnings.append(f"Line {open_statement_line} may be missing semicolon")
 
         # Check for required directives
         if "server" not in content and "http" not in content:

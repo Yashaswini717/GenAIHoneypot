@@ -10,6 +10,7 @@ ABSOLUTE PROHIBITIONS:
 - Do NOT wrap output in code fences (``` or ~~~)
 - Do NOT add summaries, explanations, or commentary after the content
 - Do NOT narrate what the content is or does
+- When the file needs a credential, key, token, or password, it must LOOK realistic but be structurally impossible to be a real, working one — e.g. keep the recognizable prefix (AKIA, ghp_, sk_live_, AIza, etc.) but make the total length one character longer or shorter than that provider's real fixed format, so it fails that provider's own validation regardless of content. Do not produce a string that exactly matches a real provider's valid key format/length.
 
 OUTPUT FORMAT:
 - Output ONLY the raw file content, exactly as it would appear if copied from disk

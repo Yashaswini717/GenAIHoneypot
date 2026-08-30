@@ -415,7 +415,19 @@ class BaseGenerator(ABC, LoggerMixin):
                 temperature=temperature,
                 content_type=content_type,
             )
-            
+
+            # Replace anything matching a real-world secret format with a
+            # freshly code-generated value in the same shape, before this
+            # content is ever validated or returned. The LLM is free to
+            # invent credential-*looking* text, but nothing matching a
+            # known live-provider pattern (AWS, GitHub, Stripe, JWT, etc.)
+            # is allowed to survive into the output, deployed file, or API
+            # response using the LLM's own bytes — this happens
+            # unconditionally, not just on attempts that later fail
+            # validation, and preserves realism instead of leaving an
+            # obvious block of asterisks.
+            content = self.security_validator.regenerate_secrets(content)
+
             last_content = content
             
             # Validate content
