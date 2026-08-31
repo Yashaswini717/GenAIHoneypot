@@ -95,3 +95,17 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# --- Intelligence hub -------------------------------------------------
+# Merged in from feature/intelligence-hub. Both branches independently
+# created a root .gitignore, which is why the merge conflicted: git had no
+# common ancestor for the file and could not reconcile them itself.
+
+# Node / frontend
+.env.*
+*.pyc
+node_modules/
+package-lock.json
+Thumbs.db
+*.zip
+geoip/*.mmdb
