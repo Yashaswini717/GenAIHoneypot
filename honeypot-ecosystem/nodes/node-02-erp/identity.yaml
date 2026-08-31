@@ -1,0 +1,67 @@
+# node-02: the ERP portal an attacker reaches by pivoting from jump-01.
+#
+# Everything structural is inherited from shared/node-build. Only what makes
+# this host *this host* lives here.
+
+host:
+  name: erp-web
+  domain: cs.internal
+  kind: web
+  role: Student ERP portal (staging)
+  os_release: "22.04.4 LTS (Jammy Jellyfish)"
+  os_version_id: "22.04"
+  kernel: "5.15.0-118-generic"
+  arch: x86_64
+
+history:
+  # Deliberately not the same as jump-01. Two hosts in an estate with
+  # byte-identical uptime and login history were provisioned together by a
+  # script, and an attacker who compares them can see that.
+  days: 131
+  timezone: Asia/Kolkata
+  workday_start: 9
+  workday_end: 19
+
+users:
+  # `deploy` is the account the stolen key authorises. It must exist here and
+  # nowhere else, or the pivot lands on a host that was expecting it.
+  - name: deploy
+    uid: 1000
+    gecos: "ERP deployment"
+    login: true
+    password: "Deploy@2026"
+    sudo: false
+    shell: /bin/bash
+    profile: service
+    home_mode: "0755"
+
+  # erpadmin owns the application; deploy is in its group so the deploy
+  # account can read the config it is responsible for deploying.
+  - name: erpadmin
+    uid: 1001
+    gecos: "ERP application owner"
+    login: false
+    sudo: true
+    shell: /bin/bash
+    profile: developer
+
+  - name: ta_miller
+    uid: 1002
+    gecos: "S. Miller (TA)"
+    login: false
+    sudo: false
+    shell: /bin/bash
+    profile: teaching_assistant
+
+known_hosts: []
+
+services:
+  - name: nginx
+    unit: nginx.service
+    port: 80
+  - name: gunicorn
+    unit: erp-portal.service
+    port: 8080
+  - name: ssh
+    unit: ssh.service
+    port: 22

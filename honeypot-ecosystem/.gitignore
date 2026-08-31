@@ -1,0 +1,12 @@
+secrets/
+.env
+nodes/*/backend_key.pub
+nodes/*/decoy_deploy_key
+nodes/*/sshd_policy.conf
+nodes/*/honeytokens.json
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+!nodes/*/build/
