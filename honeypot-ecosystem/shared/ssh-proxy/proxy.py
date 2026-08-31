@@ -50,6 +50,7 @@ from cowrie_events import SessionEventFactory  # noqa: E402
 from credentials import CredentialStore  # noqa: E402
 from emitter import EventEmitter  # noqa: E402
 from hassh import HandshakeSniffer  # noqa: E402
+from peer_gateway import PeerGateway  # noqa: E402
 from recorder import CommandReconstructor, TranscriptWriter  # noqa: E402
 
 log = logging.getLogger("ssh-proxy")
@@ -459,14 +460,7 @@ async def main() -> None:
     hassh_ok = install_hassh_hook()
     host_keys = load_or_create_host_keys()
 
-    await asyncssh.create_server(
-        HoneypotServer,
-        config.listen_host,
-        config.listen_port,
-        server_host_keys=host_keys,
-        process_factory=handle_session,
-        encoding=None,
-        server_version=profile.SERVER_VERSION.replace("SSH-2.0-", ""),
+    algorithms = dict(
         kex_algs=list(profile.KEX_ALGS),
         encryption_algs=list(profile.ENCRYPTION_ALGS),
         mac_algs=list(profile.MAC_ALGS),
@@ -477,6 +471,29 @@ async def main() -> None:
         password_auth=profile.PASSWORD_AUTH,
         kbdint_auth=profile.KBDINT_AUTH,
     )
+
+    await asyncssh.create_server(
+        HoneypotServer,
+        config.listen_host,
+        config.listen_port,
+        server_host_keys=host_keys,
+        process_factory=handle_session,
+        encoding=None,
+        server_version=profile.SERVER_VERSION.replace("SSH-2.0-", ""),
+        **algorithms,
+    )
+
+    # Second front end, on the attacker-facing networks only. It answers the
+    # addresses node-01 resolves for erp-web and db-01, so a pivot is bridged
+    # and recorded by the same machinery instead of travelling host-to-host
+    # where nothing is watching. Same host keys and the same algorithm policy
+    # as the perimeter listener: two hosts in one estate that negotiate
+    # differently would be a tell on their own.
+    gateway = PeerGateway(emitter)
+    gateway.host_keys = host_keys
+    gateway.server_version = profile.SERVER_VERSION.replace("SSH-2.0-", "")
+    gateway.algorithms = algorithms
+    await gateway.start()
 
     log.info(
         "listening on %s:%d as %s | sensor=%s | hassh=%s",

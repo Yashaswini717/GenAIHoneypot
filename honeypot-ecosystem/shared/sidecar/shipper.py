@@ -51,6 +51,9 @@ from pathlib import Path
 
 import httpx
 
+from brain_courier import BrainCourier
+from watcher import EventWatcher
+
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -66,12 +69,21 @@ class ShipperConfig:
     state_path: Path = Path(os.environ.get("STATE_PATH", "/var/lib/sidecar/offset.json"))
     spool_dir: Path = Path(os.environ.get("SPOOL_DIR", "/var/lib/sidecar/pending"))
 
-    #: How often to check the spool file for new events. Events are sent
-    #: individually the moment they are seen, so this is poll latency, not a
-    #: batching window.
-    flush_interval: float = float(os.environ.get("FLUSH_INTERVAL", "1.0"))
+    #: Upper bound on how long we sit idle before re-checking. With inotify
+    #: this is not the event latency -- events wake us immediately -- it only
+    #: bounds how long a spooled batch waits before the next retry.
+    flush_interval: float = float(os.environ.get("FLUSH_INTERVAL", "5.0"))
     request_timeout: float = float(os.environ.get("REQUEST_TIMEOUT", "15"))
     max_backoff: float = float(os.environ.get("MAX_BACKOFF", "60"))
+
+    # -- the second branch of the fan-out ---------------------------------
+    #
+    # The same signed event that goes to the hub for analysis also goes to the
+    # brain for adaptation, so the decoys change while the attacker is still
+    # connected. The brain branch is queued and never blocks the hub branch.
+    brain_url: str = os.environ.get("BRAIN_URL", "http://ai-brain:8000")
+    broker_url: str = os.environ.get("BROKER_URL", "http://session-broker:8080")
+    brain_enabled: bool = os.environ.get("BRAIN_ENABLED", "true").lower() != "false"
 
 
 config = ShipperConfig()
@@ -182,11 +194,19 @@ class Shipper:
         self.position = ReadPosition(config.state_path)
         self.spool = Spool(config.spool_dir)
         self.client = httpx.AsyncClient(timeout=config.request_timeout)
+        self.watcher = EventWatcher(config.event_path)
+        self.courier = BrainCourier(
+            brain_url=config.brain_url,
+            broker_url=config.broker_url,
+            enabled=config.brain_enabled,
+        )
         self.delivered = 0
         self.failed = 0
 
     async def close(self) -> None:
         await self.client.aclose()
+        await self.courier.close()
+        self.watcher.close()
 
     async def deliver(self, body: bytes) -> bool:
         """POST one signed event to the zero-trust ingest path.
@@ -280,11 +300,11 @@ class Shipper:
 
     async def run(self) -> None:
         log.info(
-            "sidecar up: %s -> %s/ingest/ | streaming single signed events, "
-            "polling every %.1fs | signing %s",
+            "sidecar up: %s -> %s/ingest/ | %s | brain=%s | signing %s",
             config.event_path,
             config.hub_url,
-            config.flush_interval,
+            "inotify, immediate" if self.watcher.immediate else "polling fallback",
+            config.brain_url if config.brain_enabled else "disabled",
             "enabled" if config.hmac_secret != "dev" else "with the dev secret",
         )
         if config.hmac_secret == "dev":
@@ -300,14 +320,23 @@ class Shipper:
                 lines = await self.read_new_lines()
 
                 if not lines:
-                    await asyncio.sleep(config.flush_interval)
+                    # Blocks until the proxy appends, not until a timer fires.
+                    await self.watcher.wait(config.flush_interval)
                     continue
 
-                # Sequential and one at a time. Sequential because the hub
-                # upserts a session row on first sight, so session.connect has
-                # to land before the commands that belong to it; one at a time
-                # because only /ingest/ verifies the signature.
+                # The fan-out. Both branches start from the same signed event.
+                #
+                # Hub branch: sequential and one at a time. Sequential because
+                # the hub upserts a session row on first sight, so
+                # session.connect has to land before its commands; one at a
+                # time because only /ingest/ verifies the signature.
+                #
+                # Brain branch: queued and non-blocking. Intent is a property
+                # of a command sequence rather than of one event, and a slow
+                # or absent brain must never delay, reorder or drop what
+                # reaches the hub.
                 for event in lines:
+                    self.courier.offer(_parse(event))
                     if not await self.deliver(event):
                         self.spool.add(event)
                         self.failed += 1
@@ -325,11 +354,21 @@ class Shipper:
                 await asyncio.sleep(5)
 
 
+def _parse(body: bytes) -> dict:
+    try:
+        return json.loads(body)
+    except Exception:
+        return {}
+
+
 async def main() -> None:
     shipper = Shipper()
+    courier_task = asyncio.create_task(shipper.courier.run())
     try:
         await shipper.run()
     finally:
+        courier_task.cancel()
+        await asyncio.gather(courier_task, return_exceptions=True)
         await shipper.close()
 
 

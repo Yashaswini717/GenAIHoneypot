@@ -71,12 +71,38 @@ class CredentialStore:
     """The fixed set of accepted logins, plus realistic auth latency."""
 
     def __init__(self, credentials: dict[str, str] | None = None) -> None:
-        self._credentials = dict(credentials or DEFAULT_CREDENTIALS)
+        # An explicit empty mapping means 'accept nothing', which is a
+        # valid state for the pivot gateway; only None means 'use defaults'.
+        self._credentials = dict(DEFAULT_CREDENTIALS if credentials is None else credentials)
         log.info(
             "credential store loaded: %d accounts (%s)",
             len(self._credentials),
             ", ".join(sorted(self._credentials)),
         )
+
+    @classmethod
+    def from_path(cls, path: Path) -> "CredentialStore":
+        """Load a specific credential file.
+
+        The pivot gateway uses this for the accounts that exist on node-02 and
+        node-03. They are kept in a separate file from the entry node's on
+        purpose: an attacker who could authenticate as `deploy` at the
+        perimeter would never need to find the planted key, which is the whole
+        point of the chain.
+        """
+        if not path.is_file():
+            log.warning("credential file %s not found; no peer logins accepted", path)
+            return cls({})
+        try:
+            import yaml
+
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            if not isinstance(loaded, dict):
+                raise ValueError("expected a username: password mapping")
+            return cls({str(u): str(p) for u, p in loaded.items()})
+        except Exception:
+            log.warning("could not parse %s; no peer logins accepted", path, exc_info=True)
+            return cls({})
 
     @classmethod
     def from_env(cls) -> "CredentialStore":

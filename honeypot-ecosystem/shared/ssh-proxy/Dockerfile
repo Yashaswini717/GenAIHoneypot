@@ -2,6 +2,13 @@
 # no HMAC key (that is the sidecar's), no Docker socket (that is the broker's).
 FROM python:3.11-slim
 
+# iproute2 is required, not optional: the broker execs `ip addr add` in here
+# to give the proxy the .21/.31 addresses on each attacker network. Without it
+# the exec fails, the addresses are never claimed, and every pivot dies with
+# "No route to host" -- which is exactly what happened, silently, because the
+# claim was fire-and-forget.
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2     && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY shared/ssh-proxy/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

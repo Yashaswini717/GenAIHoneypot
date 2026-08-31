@@ -48,6 +48,29 @@ class ProxyConfig:
     #: Names this sensor in every event. The hub groups sessions by it.
     sensor_id: str = _env("SENSOR_ID", "node-01-jump")
 
+    # -- pivot gateway -----------------------------------------------------
+    #
+    # A second listener, on the attacker-facing networks only, answering the
+    # addresses node-01 resolves for erp-web and db-01. Those addresses are
+    # secondary IPs on this container, so a pivot lands here and is bridged
+    # and recorded rather than travelling host-to-host unobserved.
+    #
+    # Never published to the host: reachable only from inside an attacker's
+    # own network.
+    peer_listen_port: int = _env_int("PEER_LISTEN_PORT", 22)
+
+    #: Public half of the key planted on node-01. Authorises `deploy` and
+    #: nothing else, so stealing it buys exactly the next hop we intend.
+    decoy_pubkey_path: Path = Path(
+        _env("DECOY_PUBKEY_PATH", "/run/secrets/decoy_deploy_key.pub")
+    )
+
+    #: Accounts that exist on the pivot targets, kept separate from the entry
+    #: node's so a perimeter login can never reach them.
+    peer_credentials_path: Path = Path(
+        _env("PEER_CREDENTIALS_PATH", "/run/secrets/peer_credentials.yaml")
+    )
+
     # -- host keys ---------------------------------------------------------
     #: Persisted across restarts. Regenerating host keys changes the
     #: fingerprint every reboot, which no real server does and which every

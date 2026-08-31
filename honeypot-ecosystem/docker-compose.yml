@@ -63,6 +63,10 @@ services:
       # Generated from nodes/*/identity.yaml so the login password and
       # the password sudo accepts on the node are the same string.
       HONEYPOT_CREDENTIALS_PATH: /run/secrets/credentials.yaml
+      # Accounts that exist only on the pivot targets, plus the public half of
+      # the key planted on node-01 so `ssh -i` on it actually works.
+      PEER_CREDENTIALS_PATH: /run/secrets/peer_credentials.yaml
+      DECOY_PUBKEY_PATH: /run/secrets/decoy_deploy_key.pub
       EVENT_PATH: /var/spool/honeypot/events.ndjson
       TRANSCRIPT_DIR: /var/spool/honeypot/transcripts
       HOST_KEY_DIR: /var/lib/honeypot/hostkeys
@@ -72,6 +76,8 @@ services:
       - hostkeys:/var/lib/honeypot/hostkeys
       - ./secrets/backend_key:/run/secrets/backend_key:ro
       - ./secrets/credentials.yaml:/run/secrets/credentials.yaml:ro
+      - ./secrets/peer_credentials.yaml:/run/secrets/peer_credentials.yaml:ro
+      - ./secrets/decoy_deploy_key.pub:/run/secrets/decoy_deploy_key.pub:ro
     # deception is required: bridging a session means connecting to the node.
     networks:
       edge: {}
@@ -81,6 +87,17 @@ services:
     depends_on: [session-broker]
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
+    # NET_ADMIN, and only this. The proxy adds the .21/.31 addresses to its
+    # own interface on each attacker network, so erp-web and db-01 resolve to
+    # genuinely distinct IPs that it answers -- which is what puts the
+    # recorder in the path for pivots instead of letting node-to-node SSH
+    # travel unobserved.
+    #
+    # Scoped to this container's network namespace; it is not a host escape,
+    # and the proxy holds no HMAC key and no Docker socket. The alternative,
+    # pointing both hostnames at one address, fails on realism: two
+    # departmental hosts sharing an IP is one `getent hosts` from discovery.
+    cap_add: ["NET_ADMIN"]
 
   session-broker:
     build:
@@ -92,6 +109,8 @@ services:
     environment:
       NODE_IMAGE: honeypot/node-01-jump:current
       NODE_NETWORK: cs.internal
+      # The broker attaches this container to each attacker private network.
+      PROXY_CONTAINER: gw-01
       NODE_HOSTNAME: jump-01
       NODE_DOMAIN: cs.internal
       SESSION_IDLE_TTL: "${SESSION_IDLE_TTL:-21600}"
@@ -109,6 +128,27 @@ services:
     networks: [control]
     # No published ports: reachable only from the control network.
 
+  # Yashaswini's module, run here so the adaptive half of the cycle can
+  # actually close. Intent classification is rules plus a RandomForest, so it
+  # works without an LLM key; only content *generation* needs one, and the
+  # courier falls back to local decoy bundles for that.
+  ai-brain:
+    build:
+      context: ../ai-brain/content-generator
+      dockerfile: Dockerfile
+    image: honeypot/ai-brain:current
+    container_name: ai-brain
+    restart: unless-stopped
+    environment:
+      API_PORT: 8000
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      # No key configured. The brain still classifies; generation degrades to
+      # the sidecar's offline bundles rather than failing the loop.
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    networks: [control]
+    # Not on deception and not on edge: an attacker must never be able to
+    # reach the component that decides what to show them.
+
   sidecar:
     build:
       context: .
@@ -117,26 +157,27 @@ services:
     container_name: hp-sidecar
     restart: unless-stopped
     environment:
-      HUB_URL: "${HUB_URL:-http://host.docker.internal:8000}"
+      HUB_URL: "${HUB_URL:-http://intelligence-hub:8000}"
       HMAC_SECRET: "${HMAC_SECRET:?set HMAC_SECRET - run tools/bootstrap.py}"
+      BRAIN_URL: http://ai-brain:8000
+      BROKER_URL: http://session-broker:8080
+      BRAIN_ENABLED: "${BRAIN_ENABLED:-true}"
       EVENT_PATH: /var/spool/honeypot/events.ndjson
       STATE_PATH: /var/lib/sidecar/offset.json
       SPOOL_DIR: /var/lib/sidecar/pending
-      FLUSH_INTERVAL: "${FLUSH_INTERVAL:-1.0}"
+      FLUSH_INTERVAL: "${FLUSH_INTERVAL:-5.0}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     volumes:
       # Read-only: the sidecar consumes telemetry, it never produces or
       # rewrites it.
       - telemetry:/var/spool/honeypot:ro
       - sidecar-state:/var/lib/sidecar
-    # control reaches the telemetry volume's producer; uplink reaches the hub.
-    # control is internal:true, so without a second, non-internal network the
-    # sidecar has no route out and every batch spools forever -- the one
-    # service that must egress was sealed in.
+    # control reaches the brain and the broker; uplink and telemetry reach
+    # the hub. Never deception -- the sidecar holds the signing key.
     networks: [control, uplink, telemetry]
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    depends_on: [ssh-proxy]
+    depends_on: [ssh-proxy, ai-brain]
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
 
