@@ -1,0 +1,64 @@
+# {{ project_name }} Environment Configuration
+# IMPORTANT: Do not commit this file to version control!
+
+# Application
+APP_NAME="{{ app_name }}"
+APP_ENV={{ environment }}
+DEBUG={{ debug }}
+SECRET_KEY={{ secret_key }}  # HONEYTOKEN
+
+# Database
+DATABASE_URL={{ database_url }}
+DB_HOST={{ db_host }}
+DB_PORT={{ db_port }}
+DB_NAME={{ db_name }}
+DB_USER={{ db_user }}
+DB_PASSWORD={{ db_password }}  # HONEYTOKEN
+
+{% if redis_enabled %}
+# Redis
+REDIS_URL={{ redis_url }}
+REDIS_HOST={{ redis_host }}
+REDIS_PORT={{ redis_port }}
+REDIS_PASSWORD={{ redis_password }}  # HONEYTOKEN
+{% endif %}
+
+{% if aws_enabled %}
+# AWS Configuration
+AWS_ACCESS_KEY_ID={{ aws_access_key }}  # HONEYTOKEN
+AWS_SECRET_ACCESS_KEY={{ aws_secret_key }}  # HONEYTOKEN
+AWS_DEFAULT_REGION={{ aws_region }}
+AWS_S3_BUCKET={{ s3_bucket }}
+{% endif %}
+
+{% if api_keys %}
+# API Keys
+{% for key in api_keys %}
+{{ key.name }}={{ key.value }}  # HONEYTOKEN
+{% endfor %}
+{% endif %}
+
+# Email (SMTP)
+{% if email_enabled %}
+MAIL_SERVER={{ mail_server }}
+MAIL_PORT={{ mail_port }}
+MAIL_USERNAME={{ mail_username }}
+MAIL_PASSWORD={{ mail_password }}  # HONEYTOKEN
+MAIL_USE_TLS={{ mail_use_tls }}
+{% endif %}
+
+# Logging
+LOG_LEVEL={{ log_level }}
+LOG_FILE={{ log_file }}
+
+# Security
+{% if jwt_enabled %}
+JWT_SECRET_KEY={{ jwt_secret }}  # HONEYTOKEN
+JWT_EXPIRATION={{ jwt_expiration }}
+{% endif %}
+
+# External Services
+{% for service in external_services %}
+{{ service.name | upper }}_URL={{ service.url }}
+{{ service.name | upper }}_API_KEY={{ service.api_key }}  # HONEYTOKEN
+{% endfor %}

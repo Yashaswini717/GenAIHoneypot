@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""
+Database management script for {{ project_name }}.
+Handles database operations including backups, migrations, and cleanup.
+"""
+import os
+import sys
+import argparse
+from datetime import datetime, timedelta
+import {{ db_library }}
+
+# Database configuration
+DB_HOST = os.getenv('DB_HOST', '{{ db_host }}')
+DB_PORT = int(os.getenv('DB_PORT', {{ db_port }}))
+DB_NAME = os.getenv('DB_NAME', '{{ db_name }}')
+DB_USER = os.getenv('DB_USER', '{{ db_user }}')
+DB_PASSWORD = os.getenv('DB_PASSWORD', '{{ db_password }}')  # HONEYTOKEN
+
+BACKUP_DIR = '{{ backup_dir }}'
+RETENTION_DAYS = {{ retention_days }}
+
+def get_connection():
+    """Establish database connection."""
+    try:
+        {% if db_library == 'psycopg2' %}
+        conn = {{ db_library }}.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD
+        )
+        {% elif db_library == 'pymysql' %}
+        conn = {{ db_library }}.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            charset='utf8mb4'
+        )
+        {% endif %}
+        return conn
+    except Exception as e:
+        print(f"Error connecting to database: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def backup_database(output_file=None):
+    """Create database backup."""
+    if not output_file:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_file = os.path.join(BACKUP_DIR, f'{DB_NAME}_backup_{timestamp}.sql')
+    
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    
+    {% if db_type == 'postgresql' %}
+    cmd = f"pg_dump -h {DB_HOST} -p {DB_PORT} -U {DB_USER} -F c -f {output_file} {DB_NAME}"
+    {% elif db_type == 'mysql' %}
+    cmd = f"mysqldump -h {DB_HOST} -P {DB_PORT} -u {DB_USER} -p{DB_PASSWORD} {DB_NAME} > {output_file}"
+    {% endif %}
+    
+    os.environ['PGPASSWORD'] = DB_PASSWORD
+    result = os.system(cmd)
+    
+    if result == 0:
+        print(f"Backup successful: {output_file}")
+        return output_file
+    else:
+        print(f"Backup failed with exit code {result}", file=sys.stderr)
+        sys.exit(1)
+
+def cleanup_old_backups():
+    """Remove backups older than retention period."""
+    if not os.path.exists(BACKUP_DIR):
+        return
+    
+    cutoff_date = datetime.now() - timedelta(days=RETENTION_DAYS)
+    removed_count = 0
+    
+    for filename in os.listdir(BACKUP_DIR):
+        filepath = os.path.join(BACKUP_DIR, filename)
+        if os.path.isfile(filepath):
+            mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+            if mtime < cutoff_date:
+                os.remove(filepath)
+                removed_count += 1
+                print(f"Removed old backup: {filename}")
+    
+    print(f"Cleanup complete. Removed {removed_count} old backup(s)")
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description='Database management utility')
+    parser.add_argument('action', choices=['backup', 'cleanup'], 
+                       help='Action to perform')
+    parser.add_argument('--output', help='Output file for backup')
+    
+    args = parser.parse_args()
+    
+    if args.action == 'backup':
+        backup_database(args.output)
+    elif args.action == 'cleanup':
+        cleanup_old_backups()
+
+if __name__ == '__main__':
+    main()

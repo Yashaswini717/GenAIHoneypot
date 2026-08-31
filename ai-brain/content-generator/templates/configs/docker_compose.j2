@@ -1,0 +1,91 @@
+# {{ project_name }} Docker Compose Configuration
+# Generated: {{ generated_date }}
+
+version: '{{ compose_version }}'
+
+services:
+  {% for service in services %}
+  {{ service.name }}:
+    {% if service.build %}
+    build:
+      context: {{ service.build.context }}
+      dockerfile: {{ service.build.dockerfile }}
+    {% else %}
+    image: {{ service.image }}
+    {% endif %}
+    container_name: {{ service.container_name }}
+    {% if service.restart %}
+    restart: {{ service.restart }}
+    {% endif %}
+    {% if service.ports %}
+    ports:
+      {% for port in service.ports %}
+      - "{{ port }}"
+      {% endfor %}
+    {% endif %}
+    {% if service.environment %}
+    environment:
+      {% for env in service.environment %}
+      - {{ env.key }}={{ env.value }}
+      {% endfor %}
+    {% endif %}
+    {% if service.volumes %}
+    volumes:
+      {% for volume in service.volumes %}
+      - {{ volume }}
+      {% endfor %}
+    {% endif %}
+    {% if service.depends_on %}
+    depends_on:
+      {% for dep in service.depends_on %}
+      - {{ dep }}
+      {% endfor %}
+    {% endif %}
+    {% if service.networks %}
+    networks:
+      {% for network in service.networks %}
+      - {{ network }}
+      {% endfor %}
+    {% endif %}
+    {% if service.command %}
+    command: {{ service.command }}
+    {% endif %}
+    {% if service.healthcheck %}
+    healthcheck:
+      test: {{ service.healthcheck.test }}
+      interval: {{ service.healthcheck.interval }}
+      timeout: {{ service.healthcheck.timeout }}
+      retries: {{ service.healthcheck.retries }}
+    {% endif %}
+
+  {% endfor %}
+
+{% if networks %}
+networks:
+  {% for network in networks %}
+  {{ network.name }}:
+    driver: {{ network.driver }}
+    {% if network.options %}
+    driver_opts:
+      {% for key, value in network.options.items() %}
+      {{ key }}: {{ value }}
+      {% endfor %}
+    {% endif %}
+  {% endfor %}
+{% endif %}
+
+{% if volumes %}
+volumes:
+  {% for volume in volumes %}
+  {{ volume.name }}:
+    {% if volume.driver %}
+    driver: {{ volume.driver }}
+    {% endif %}
+    {% if volume.driver_opts %}
+    driver_opts:
+      {% for key, value in volume.driver_opts.items() %}
+      {{ key }}: {{ value }}
+      {% endfor %}
+    {% endif %}
+  {% endfor %}
+{% endif %}

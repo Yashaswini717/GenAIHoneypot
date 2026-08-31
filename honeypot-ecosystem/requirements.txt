@@ -1,0 +1,26 @@
+# Host-side tooling only.
+#
+# The services themselves do NOT use this file — each has its own pinned
+# requirements.txt and installs them inside its image:
+#
+#   shared/ssh-proxy/requirements.txt        asyncssh, httpx, pyyaml
+#   shared/sidecar/requirements.txt          httpx, inotify_simple
+#   shared/session-broker/requirements.txt   fastapi, uvicorn, docker, pydantic
+#
+# What you need on your machine is only enough to run tools/ and tests/.
+# Install with:
+#
+#   python -m pip install -r requirements.txt
+
+# tools/bootstrap.py reads every nodes/*/identity.yaml
+pyyaml==6.0.1
+
+# tools/bootstrap.py imports shared/ssh-proxy/openssh_profile.py, which checks
+# at generation time that the installed AsyncSSH can actually deliver the SSH
+# policy it is about to write into the node's sshd_config. Pinned to the same
+# version the proxy image uses — a mismatch here would validate the policy
+# against a different library than the one that has to honour it.
+asyncssh==2.24.0
+
+# tests/
+pytest==8.2.0

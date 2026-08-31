@@ -1,0 +1,47 @@
+# node-03: the records database. The terminus of the pivot chain, and the
+# thing the whole estate exists to appear to protect.
+
+host:
+  name: db-01
+  domain: cs.internal
+  kind: db
+  role: Student records database
+  os_release: "22.04.4 LTS (Jammy Jellyfish)"
+  os_version_id: "22.04"
+  kernel: "5.15.0-118-generic"
+  arch: x86_64
+
+history:
+  days: 168
+  timezone: Asia/Kolkata
+  workday_start: 9
+  workday_end: 19
+
+users:
+  - name: dbadmin
+    uid: 1000
+    gecos: "Database administrator"
+    login: true
+    password: "Db@dmin2026"
+    sudo: true
+    shell: /bin/bash
+    profile: developer
+    home_mode: "0755"
+
+  - name: erpsync
+    uid: 1001
+    gecos: "ERP replication account"
+    login: false
+    sudo: false
+    shell: /usr/sbin/nologin
+    profile: service
+
+known_hosts: []
+
+services:
+  - name: mysql
+    unit: mariadb.service
+    port: 3306
+  - name: ssh
+    unit: ssh.service
+    port: 22

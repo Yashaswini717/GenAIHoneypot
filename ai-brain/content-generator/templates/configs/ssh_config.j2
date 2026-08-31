@@ -1,0 +1,35 @@
+# SSH Config for {{ username }}
+# Generated: {{ generated_date }}
+
+# Global settings
+Host *
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+    StrictHostKeyChecking ask
+    UserKnownHostsFile ~/.ssh/known_hosts
+    IdentitiesOnly yes
+    {% if use_keychain %}
+    UseKeychain yes
+    AddKeysToAgent yes
+    {% endif %}
+
+{% for host in hosts %}
+# {{ host.comment }}
+Host {{ host.name }}
+    HostName {{ host.hostname }}
+    User {{ host.user }}
+    Port {{ host.port }}
+    {% if host.identity_file %}
+    IdentityFile {{ host.identity_file }}
+    {% endif %}
+    {% if host.proxy_jump %}
+    ProxyJump {{ host.proxy_jump }}
+    {% endif %}
+    {% if host.forward_agent %}
+    ForwardAgent yes
+    {% endif %}
+    {% for option in host.options %}
+    {{ option }}
+    {% endfor %}
+
+{% endfor %}

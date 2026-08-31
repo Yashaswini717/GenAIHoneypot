@@ -1,0 +1,16 @@
+# TODO List - {{ project_name }}
+# Updated: {{ updated_date }}
+
+{% for category in categories %}
+## {{ category.name }}
+
+{% for item in category.items %}
+- [{% if item.done %}x{% else %} {% endif %}] {{ item.title }}{% if item.priority %} ({{ item.priority }}){% endif %}
+  {% if item.notes %}{{ item.notes }}{% endif %}
+{% endfor %}
+
+{% endfor %}
+
+## Notes
+
+{{ additional_notes }}

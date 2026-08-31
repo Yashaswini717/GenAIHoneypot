@@ -1,0 +1,24 @@
+# Linux containers are built from this tree on Windows workstations, and a
+# CRLF shebang is fatal: the kernel looks for an interpreter named "/bin/bash\r"
+# and the container dies with "No such file or directory" and exit 127 — an
+# error that points at the script rather than at its line endings.
+#
+# CRLF in sshd_policy.conf is subtler and worse: it puts a stray \r into the
+# algorithm lists sshd parses, so the node's advertised SSH policy could
+# silently stop matching the proxy's.
+#
+# Force LF for everything that a Linux process has to read.
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.py        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.conf      text eol=lf
+Dockerfile  text eol=lf
+*.ndjson    text eol=lf
+
+*.png       binary
+*.pdf       binary
+*.joblib    binary
+*.pkl       binary

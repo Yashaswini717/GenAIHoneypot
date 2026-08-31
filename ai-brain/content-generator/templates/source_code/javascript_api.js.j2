@@ -1,0 +1,99 @@
+/**
+ * {{ service_name }} - {{ description }}
+ * API service for {{ app_name }}
+ */
+
+const express = require('express');
+const axios = require('axios');
+const morgan = require('morgan');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || {{ port }};
+
+// Configuration
+const API_BASE_URL = process.env.API_BASE_URL || '{{ api_base_url }}';
+const API_KEY = process.env.API_KEY || '{{ api_key }}';  // HONEYTOKEN
+const DB_CONNECTION_STRING = process.env.DATABASE_URL || '{{ db_url }}';
+
+// Middleware
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(morgan('combined'));
+
+// CORS
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    next();
+});
+
+// API Client
+const apiClient = axios.create({
+    baseURL: API_BASE_URL,
+    headers: {
+        'Authorization': `Bearer ${API_KEY}`,
+        'Content-Type': 'application/json'
+    },
+    timeout: 10000
+});
+
+// Routes
+app.get('/', (req, res) => {
+    res.json({ 
+        service: '{{ service_name }}',
+        version: '{{ version }}',
+        status: 'healthy'
+    });
+});
+
+{% for route in routes %}
+app.{{ route.method }}('{{ route.path }}', async (req, res) => {
+    try {
+        {% if route.method == 'get' %}
+        const response = await apiClient.get('{{ route.upstream_path }}', {
+            params: req.query
+        });
+        {% elif route.method == 'post' %}
+        const response = await apiClient.post('{{ route.upstream_path }}', req.body);
+        {% elif route.method == 'put' %}
+        const response = await apiClient.put('{{ route.upstream_path }}', req.body);
+        {% elif route.method == 'delete' %}
+        const response = await apiClient.delete('{{ route.upstream_path }}');
+        {% endif %}
+        
+        res.json(response.data);
+    } catch (error) {
+        console.error(`Error in {{ route.path }}:`, error.message);
+        res.status(error.response?.status || 500).json({
+            error: error.message,
+            details: error.response?.data
+        });
+    }
+});
+
+{% endfor %}
+
+// Health check
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+});
+
+// Start server
+app.listen(PORT, () => {
+    console.log(`{{ service_name }} listening on port ${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+
+module.exports = app;
