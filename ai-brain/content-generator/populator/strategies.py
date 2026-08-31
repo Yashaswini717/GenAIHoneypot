@@ -100,6 +100,9 @@ class PopulationStrategy(BasePopulator):
 
     async def _populate_developer(self, honeypot_id: str, context: dict[str, Any]) -> PopulationResult:
         """Populate developer workstation profile."""
+        if context.get("action") == "serve_minimal_banner":
+            return await self._populate_developer_minimal(honeypot_id, context)
+
         files = []
         
         # Source code
@@ -162,8 +165,47 @@ region = us-east-1
     git_protocol: ssh
 """
         files.append({"path": ".config/gh/hosts.yml", "content": gh_hosts_content, "permissions": 0o600})
-        
+
         # Deploy files
+        return await self.filesystem_populator.populate(honeypot_id, {"files": files})
+
+    async def _populate_developer_minimal(self, honeypot_id: str, context: dict[str, Any]) -> PopulationResult:
+        """
+        Minimal-footprint variant of the developer workstation profile.
+
+        Deliberately a much smaller surface than `_populate_developer` (3
+        files instead of 7, one honeytoken pair instead of three) — the
+        strategy this represents is giving a cautious attacker almost
+        nothing to explore, rather than an elaborate environment inviting
+        deeper poking around. Exists so `serve_minimal_banner` produces
+        genuinely different deployed content from `populate_developer_workstation`,
+        not just a different label pointing at the same files.
+        """
+        files = []
+
+        code = await self.source_code_gen.generate({
+            "language": "python",
+            "script_type": "cli",
+            "purpose": "internal utility script",
+        })
+        files.append({"path": "scripts/util.py", "content": code.content, "permissions": 0o644})
+
+        bashrc = await self.config_gen.generate({"config_type": "bashrc", "persona": "developer"})
+        files.append({"path": ".bashrc", "content": bashrc.content, "permissions": 0o644})
+
+        aws_access_key_value = await self._generate_and_persist_honeytoken(
+            "aws_access_key", honeypot_id, ".aws/credentials"
+        )
+        aws_secret_key_value = await self._generate_and_persist_honeytoken(
+            "aws_secret_key", honeypot_id, ".aws/credentials"
+        )
+        aws_creds_content = f"""[default]
+aws_access_key_id = {aws_access_key_value}
+aws_secret_access_key = {aws_secret_key_value}
+region = us-east-1
+"""
+        files.append({"path": ".aws/credentials", "content": aws_creds_content, "permissions": 0o600})
+
         return await self.filesystem_populator.populate(honeypot_id, {"files": files})
 
     async def _populate_production(self, honeypot_id: str, context: dict[str, Any]) -> PopulationResult:
@@ -212,7 +254,30 @@ DATABASE_URL=postgresql://app:prodpassword@db.internal:5432/app
 REDIS_URL=redis://cache.internal:6379/0
 """
         files.append({"path": "app/.env.production", "content": env_prod_content, "permissions": 0o600})
-        
+
+        # simulate_cron_jobs specifically: add real persistence-mechanism
+        # content (a crontab + the script it runs) that's otherwise absent
+        # from this profile, so it's genuinely distinct from
+        # populate_production_server rather than the same files under a
+        # different action label.
+        if context.get("action") == "simulate_cron_jobs":
+            backup_script = await self.source_code_gen.generate({
+                "language": "shell",
+                "script_type": "backup",
+                "purpose": "nightly backup and log rotation",
+            })
+            files.append({"path": "opt/scripts/nightly_backup.sh", "content": backup_script.content, "permissions": 0o755})
+
+            crontab_content = (
+                "# /etc/crontab: system-wide crontab\n"
+                "SHELL=/bin/bash\n"
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\n"
+                "0 3 * * * root /opt/scripts/nightly_backup.sh >> /var/log/backup.log 2>&1\n"
+                "*/15 * * * * root /opt/scripts/healthcheck.sh\n"
+                "0 0 1 * * root /usr/bin/certbot renew --quiet\n"
+            )
+            files.append({"path": "etc/crontab", "content": crontab_content, "permissions": 0o644})
+
         return await self.filesystem_populator.populate(honeypot_id, {"files": files})
 
     async def _populate_database(self, honeypot_id: str, context: dict[str, Any]) -> PopulationResult:
@@ -246,7 +311,30 @@ localhost:5432:*:postgres:{db_password}
 db.internal:5432:production:app_user:{db_password}
 """
         files.append({"path": ".pgpass", "content": pgpass_content, "permissions": 0o600})
-        
+
+        # serve_fake_sensitive_files specifically: add an explicitly
+        # "juicy" file that's otherwise absent from this profile, so it's
+        # genuinely distinct from populate_database_server rather than
+        # the same files under a different action label. Built entirely
+        # from honeytoken-generated PII (SSA-reserved SSN ranges,
+        # invalid-Luhn card numbers — see generators/honeytokens.py) so
+        # every value in it is both realistic-looking and tracked.
+        if context.get("action") == "serve_fake_sensitive_files":
+            rows = ["customer_id,name,ssn,credit_card,email"]
+            for i in range(5):
+                ssn = await self._generate_and_persist_honeytoken(
+                    "ssn", honeypot_id, "exports/customer_export.csv"
+                )
+                credit_card = await self._generate_and_persist_honeytoken(
+                    "credit_card", honeypot_id, "exports/customer_export.csv"
+                )
+                rows.append(f"{1000 + i},Customer {i + 1},{ssn},{credit_card},customer{i + 1}@example.com")
+            files.append({
+                "path": "exports/customer_export.csv",
+                "content": "\n".join(rows) + "\n",
+                "permissions": 0o644,
+            })
+
         return await self.filesystem_populator.populate(honeypot_id, {"files": files})
 
     async def _populate_web_server(self, honeypot_id: str, context: dict[str, Any]) -> PopulationResult:

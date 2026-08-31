@@ -73,6 +73,18 @@ class IntentClassificationResponse(BaseModel):
         default=0,
         description="How many times this (intent, action) arm has been selected so far",
     )
+    deployment_triggered: bool = Field(
+        default=False,
+        description="Whether the chosen action's decoy profile was scheduled for real "
+        "generation/deployment via the population pipeline. Only happens when the caller "
+        "provides metadata.honeypot_id; runs as a background task, not synchronously, "
+        "since a full population can take several minutes.",
+    )
+    deployment_profile: Optional[str] = Field(
+        default=None,
+        description="The populate profile (developer_workstation/production_server/"
+        "database_server/web_server) the chosen action mapped to, if deployment was triggered.",
+    )
 
     @field_validator("intent")
     @classmethod

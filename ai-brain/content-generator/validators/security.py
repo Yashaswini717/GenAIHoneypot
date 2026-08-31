@@ -4,6 +4,8 @@ import string
 import zlib
 from typing import Any
 
+from core.utils import calculate_entropy
+
 from .base import BaseValidator, ValidationResult
 
 _BASE62_ALPHABET = string.digits + string.ascii_uppercase + string.ascii_lowercase
@@ -38,7 +40,9 @@ class SecurityValidator(BaseValidator):
         # detection, (2) the actual 40-char value. Replacement logic must
         # only touch group 2 — masking the whole match would destroy the
         # key name itself and corrupt the file's structure.
-        "aws_secret_key": re.compile(r'(aws_secret.*[=:]\s*)([A-Za-z0-9/+=]{40})', re.IGNORECASE),
+        "aws_secret_key": re.compile(
+            r'(aws_secret.*[=:]\s*)([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])', re.IGNORECASE
+        ),
         "github_token": re.compile(r'ghp_[A-Za-z0-9]{36}'),
         "github_oauth": re.compile(r'gho_[A-Za-z0-9]{36}'),
         "slack_token": re.compile(r'xox[baprs]-[0-9]{10,12}-[0-9]{10,12}-[A-Za-z0-9]{24,}'),
@@ -49,7 +53,41 @@ class SecurityValidator(BaseValidator):
         "stripe_key": re.compile(r'sk_live_[0-9a-zA-Z]{24,}'),
         "twilio_api": re.compile(r'(?<![0-9a-fA-F])SK[0-9a-fA-F]{32}(?![0-9a-fA-F])'),
         "jwt": re.compile(r'eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*'),
+        # npm publish tokens: documented fixed format, npm_ + 36 chars = 40 total.
+        "npm_token": re.compile(r'(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9])'),
+        # Azure Storage account keys: always exactly 88 base64 characters,
+        # ending in '==' padding (64 raw bytes base64-encoded) — a
+        # documented, fixed Microsoft format. Two groups like aws_secret_key:
+        # keep the "AccountKey=" context, only touch the value.
+        "azure_storage_key": re.compile(r'(AccountKey=)([A-Za-z0-9+/]{86}==)'),
+        # Heroku API keys are standard UUID v4s — documented, and UUID v4
+        # has a real structural rule we can deliberately violate (the
+        # version nibble must be '4').
+        "heroku_api_key": re.compile(
+            r'(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?![0-9a-f])',
+            re.IGNORECASE,
+        ),
+        # SendGrid API keys: documented fixed format SG.<22 chars>.<43 chars>.
+        "sendgrid_key": re.compile(r'SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}'),
     }
+
+    # Generic fallback for providers not named above: a variable whose
+    # NAME suggests a credential (contains "key"/"secret"/"token"/
+    # "password"/"credential"/"auth"), assigned a long, high-entropy
+    # value. Deliberately broader and less precise than the exact-format
+    # patterns — this exists to catch *unknown* formats (Cloudflare,
+    # Mailgun, DigitalOcean, whatever wasn't specifically named), at the
+    # cost of being a heuristic rather than a certainty. Entropy is
+    # checked at match time (see `_mask_generic_credential`) to avoid
+    # flagging low-randomness values like "localhost" or "production".
+    _GENERIC_CREDENTIAL_PATTERN = re.compile(
+        r'(?im)^([ \t]*[A-Za-z_][A-Za-z0-9_]*'
+        r'(?:key|secret|token|password|passwd|pwd|credential|auth)'
+        r'[A-Za-z0-9_]*\s*[=:]\s*["\']?)'
+        r'([A-Za-z0-9+/_.\-]{20,})'
+        r'(["\']?\s*)$'
+    )
+    _GENERIC_ENTROPY_THRESHOLD = 3.5
 
     # Patterns for common credentials in config files
     CREDENTIAL_PATTERNS = {
@@ -133,6 +171,20 @@ class SecurityValidator(BaseValidator):
                         # Real passwords are usually complex
                         if len(password) > 15 and re.search(r'[A-Z]', password) and re.search(r'[0-9]', password):
                             warnings.append(f"Potentially real password in {cred_type}")
+
+        # Generic fallback: a credential-named variable holding a long,
+        # high-entropy value in a format none of the specific patterns
+        # above recognize. Heuristic, not certain — warning, not an
+        # error, since it can't distinguish "an unrecognized real
+        # provider's key" from "just a realistic-looking random string
+        # the generator made up on its own."
+        for match in self._GENERIC_CREDENTIAL_PATTERN.finditer(content):
+            value = match.group(2)
+            if calculate_entropy(value) < self._GENERIC_ENTROPY_THRESHOLD:
+                continue
+            if any(pattern.search(value) for pattern in self.SECRET_PATTERNS.values()):
+                continue  # already covered, more precisely, above
+            warnings.append(f"High-entropy value in a credential-named variable at position {match.start()}")
 
         # Check for IP addresses that might be real public IPs
         public_ip_pattern = re.compile(r'\b(?!10\.|172\.16\.|192\.168\.)(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b')
@@ -225,6 +277,7 @@ class SecurityValidator(BaseValidator):
         "aws_access_key": ("AKIA", string.ascii_uppercase + string.digits, 20),
         "google_api": ("AIza", string.ascii_letters + string.digits + "-_", 39),
         "twilio_api": ("SK", "0123456789abcdefABCDEF", 34),
+        "npm_token": ("npm_", string.ascii_letters + string.digits, 40),
     }
 
     def regenerate_secrets(self, content: str) -> str:
@@ -255,8 +308,12 @@ class SecurityValidator(BaseValidator):
           `mask_secrets`'s asterisk replacement as an additional layer —
           safe, just less polished on the rare occasion one of those
           specific patterns fires.
+        Runs the generic high-entropy fallback FIRST, so any value already
+        recognized by one of the specific patterns above is left for that
+        more precise, format-aware handling instead of being blunt-masked
+        here too.
         """
-        result = content
+        result = self._GENERIC_CREDENTIAL_PATTERN.sub(self._mask_generic_credential, content)
         for secret_type, pattern in self.SECRET_PATTERNS.items():
             if secret_type == "jwt":
                 result = pattern.sub(self._regenerate_jwt, result)
@@ -267,6 +324,14 @@ class SecurityValidator(BaseValidator):
                 )
             elif secret_type == "stripe_key":
                 result = pattern.sub(lambda m: self._regenerate_stripe_key(), result)
+            elif secret_type == "azure_storage_key":
+                result = pattern.sub(self._regenerate_azure_key, result)
+            elif secret_type == "heroku_api_key":
+                result = pattern.sub(self._regenerate_heroku_key, result)
+            elif secret_type == "sendgrid_key":
+                result = pattern.sub(lambda m: self._regenerate_sendgrid_key(), result)
+            elif secret_type == "aws_secret_key":
+                result = pattern.sub(self._regenerate_aws_secret_key, result)
             elif secret_type in self._REGENERATE_SHAPES:
                 prefix, alphabet, real_length = self._REGENERATE_SHAPES[secret_type]
                 wrong_length = real_length + 1 - len(prefix)
@@ -278,6 +343,28 @@ class SecurityValidator(BaseValidator):
             else:
                 result = pattern.sub(self._mask_match, result)
         return result
+
+    def _mask_generic_credential(self, m: "re.Match[str]") -> str:
+        """
+        Replacement for `_GENERIC_CREDENTIAL_PATTERN`. Two checks before
+        touching anything, to keep false positives down:
+
+        1. Entropy — skip predictable values like "localhost" or
+           "production" that happen to sit in a credential-named
+           variable but aren't actually secret-shaped.
+        2. Already covered by a specific pattern above — if so, leave it
+           for that pass to handle with its more precise, provider-aware
+           logic instead of blunt-masking it here.
+        """
+        prefix, value, suffix = m.group(1), m.group(2), m.group(3)
+
+        if calculate_entropy(value) < self._GENERIC_ENTROPY_THRESHOLD:
+            return m.group(0)
+
+        if any(pattern.search(value) for pattern in self.SECRET_PATTERNS.values()):
+            return m.group(0)
+
+        return prefix + 'X' * len(value) + suffix
 
     @staticmethod
     def _github_checksum_valid(token: str) -> bool:
@@ -321,6 +408,21 @@ class SecurityValidator(BaseValidator):
         return prefix + entropy + ''.join(corrupted)
 
     @staticmethod
+    def _regenerate_aws_secret_key(match: "re.Match[str]") -> str:
+        """
+        AWS Secret Access Keys are documented as always exactly 40
+        characters. Deliberately generate 41, same technique as
+        aws_access_key/google_api/twilio_api — and critically, NOT built
+        from the same character class the whole-match 'X'-fill masking
+        would use, since a same-length/charset mask would still match
+        this pattern's own {40} requirement and get re-flagged as a false
+        positive on our own already-safe output (exactly what happened
+        before this fix existed).
+        """
+        alphabet = string.ascii_letters + string.digits + "/+="
+        return match.group(1) + ''.join(random.choices(alphabet, k=41))
+
+    @staticmethod
     def _regenerate_stripe_key() -> str:
         """
         Stripe officially documents `sk_test_` as its test-mode key
@@ -330,6 +432,47 @@ class SecurityValidator(BaseValidator):
         """
         alphabet = string.ascii_letters + string.digits
         return "sk_test_" + ''.join(random.choices(alphabet, k=24))
+
+    @staticmethod
+    def _regenerate_azure_key(match: "re.Match[str]") -> str:
+        """
+        Azure Storage account keys are always exactly 88 base64 characters
+        (64 raw bytes) ending in '==' padding — a documented Microsoft
+        format. Deliberately generate 87 instead of 88, which breaks both
+        the fixed length AND the base64 padding requirement (a base64
+        string's length must be a multiple of 4) at once.
+        """
+        alphabet = string.ascii_letters + string.digits + "+/"
+        return match.group(1) + ''.join(random.choices(alphabet, k=85)) + "=="
+
+    @staticmethod
+    def _regenerate_heroku_key(match: "re.Match[str]") -> str:
+        """
+        Heroku API keys are standard UUID v4s. RFC 4122 requires the
+        version nibble to be '4' and the variant nibble to be one of
+        8/9/a/b — we deliberately set the version nibble to something
+        else, so the result fails UUID v4 validation by construction, not
+        just by having the wrong random bytes.
+        """
+        hex_chars = "0123456789abcdef"
+        p1 = ''.join(random.choices(hex_chars, k=8))
+        p2 = ''.join(random.choices(hex_chars, k=4))
+        bad_version = random.choice("0123567890abcdef".replace("4", ""))
+        p3 = bad_version + ''.join(random.choices(hex_chars, k=3))
+        p4 = random.choice("89ab") + ''.join(random.choices(hex_chars, k=3))
+        p5 = ''.join(random.choices(hex_chars, k=12))
+        return f"{p1}-{p2}-{p3}-{p4}-{p5}"
+
+    @staticmethod
+    def _regenerate_sendgrid_key() -> str:
+        """
+        SendGrid's documented format: SG.<22 chars>.<43 chars>. Generate
+        the second segment one character short of its real fixed length.
+        """
+        alphabet = string.ascii_letters + string.digits + "_-"
+        part1 = ''.join(random.choices(alphabet, k=22))
+        part2 = ''.join(random.choices(alphabet, k=42))  # 42, not the real 43
+        return f"SG.{part1}.{part2}"
 
     @staticmethod
     def _regenerate_jwt(match: "re.Match[str]") -> str:

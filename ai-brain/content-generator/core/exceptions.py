@@ -37,6 +37,18 @@ class LLMInvalidResponseError(LLMError):
     pass
 
 
+class LLMEmptyResponseError(LLMInvalidResponseError):
+    """
+    Raised specifically when the provider returns zero choices — usually
+    a transient upstream hiccup (momentary overload, mid-batch blip),
+    not a permanent problem like a bad model name or malformed request.
+    Kept distinct from the generic LLMInvalidResponseError so it can be
+    retried without also retrying genuinely permanent failures.
+    """
+
+    pass
+
+
 class LLMAuthenticationError(LLMError):
     """Raised when LLM authentication fails."""
 

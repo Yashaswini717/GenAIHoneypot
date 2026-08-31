@@ -60,9 +60,12 @@ assert set(ACTION_CATALOG) == set(INTENT_CLASSES), "ACTION_CATALOG must cover ev
 
 # Maps each action label to an existing populate profile, so a chosen action
 # can be executed immediately via the current populator without inventing a
-# new content-generation path. Several actions intentionally share a profile
-# — the label captures *why* the profile was chosen (the narrative framing
-# used for logging/observability), not a distinct generator.
+# new content-generation path. A few actions share a base profile but are
+# given genuinely distinct generated content within it (see the
+# `context.get("action")` branches in populator/strategies.py) — every
+# action within a given intent's own candidate list produces different
+# deployed content, since that's the only comparison the bandit actually
+# makes.
 ACTION_TO_PROFILE: Final[dict[str, str]] = {
     "show_fake_endpoints": "web_server",
     "populate_developer_workstation": "developer_workstation",

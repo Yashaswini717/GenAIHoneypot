@@ -9,6 +9,7 @@ from config.settings import LLMProvider, settings
 from core.exceptions import (
     LLMAuthenticationError,
     LLMConnectionError,
+    LLMEmptyResponseError,
     LLMInvalidResponseError,
     LLMRateLimitError,
     LLMTimeoutError,
@@ -159,7 +160,7 @@ class LLMClient(LoggerMixin):
                 )
                 return result
 
-            except (LLMTimeoutError, LLMConnectionError, LLMRateLimitError) as e:
+            except (LLMTimeoutError, LLMConnectionError, LLMRateLimitError, LLMEmptyResponseError) as e:
                 if attempt < self.max_retries - 1:
                     wait_time = self.retry_delay * (2 ** attempt)  # Exponential backoff
                     self.logger.warning(
@@ -202,7 +203,7 @@ class LLMClient(LoggerMixin):
             )
 
             if not response.choices:
-                raise LLMInvalidResponseError("No choices in response")
+                raise LLMEmptyResponseError("No choices in response")
 
             content = response.choices[0].message.content
             if not content:
@@ -212,6 +213,11 @@ class LLMClient(LoggerMixin):
 
         except asyncio.TimeoutError as e:
             raise LLMTimeoutError(f"Request timed out after {self.timeout}s") from e
+        except LLMEmptyResponseError:
+            # let this propagate as-is — the broad `except Exception` below
+            # would otherwise re-wrap it into a generic LLMInvalidResponseError,
+            # which silently defeats the retry logic in generate()
+            raise
         except Exception as e:
             error_msg = str(e).lower()
             if "rate limit" in error_msg or "429" in error_msg:
