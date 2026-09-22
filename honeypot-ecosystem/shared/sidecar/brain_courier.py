@@ -65,6 +65,33 @@ CLASSIFY_EVERY = 2
 #: the brain from a paste-bomb turning into a request flood.
 MIN_CLASSIFY_INTERVAL = 1.5
 
+#: How many recent commands describe what the attacker is doing *now*.
+#:
+#: This was 40, on the reasoning that intent is a property of a sequence rather
+#: than of one command. The reasoning is right; the number was not. Forty is
+#: the whole session for any realistic session, so the window never slid --
+#: and since every session opens with reconnaissance, reconnaissance outvoted
+#: everything that came after it, permanently. Every classification this
+#: system had ever made was `reconnaissance`: four of five intent classes and
+#: twelve of fifteen decoy actions had never once been reached.
+#:
+#: It also quietly disabled the bandit's progression reward, which is defined
+#: as intent moving along the kill chain. Intent never moved, so
+#: REWARD_ESCALATED and REWARD_SESSION_DEESCALATED could not fire and every
+#: decision resolved at the same middling 0.4 -- leaving the arms to be
+#: compared on a signal that barely varied.
+#:
+#: Measured against a labelled fourteen-command attack (recon -> privesc ->
+#: persistence -> lateral -> exfil), correct classifications by window size:
+#:
+#:     2 -> 11/13    3 -> 9/13    5 -> 7/13    8 -> 4/13    40 -> 4/13
+#:
+#: Monotonic, so smaller tracks the attacker better. Three rather than two
+#: because one or two commands is a keystroke, not a sequence, and the extra
+#: command costs two classifications to buy stability against a single
+#: ambiguous line.
+CLASSIFY_WINDOW = 3
+
 #: Sessions we stop tracking after this long idle, so a long-running sidecar
 #: does not accumulate state for every attacker it has ever seen.
 SESSION_TTL = 3600
@@ -276,10 +303,11 @@ class BrainCourier:
     async def _classify(self, state: SessionState) -> dict[str, Any] | None:
         """Ask the brain what this attacker is doing and what to show them."""
         payload = {
-            # The full sequence, not just the new commands: intent is a
-            # property of the whole session's shape.
-            "commands": state.commands[-40:],
-            "event_timestamps": [t for t in state.timestamps[-40:] if t],
+            # A sliding window, not the whole session. Intent is a property of
+            # a sequence, but of the *recent* one -- what they are doing now,
+            # not everything they have ever done. See CLASSIFY_WINDOW.
+            "commands": state.commands[-CLASSIFY_WINDOW:],
+            "event_timestamps": [t for t in state.timestamps[-CLASSIFY_WINDOW:] if t],
             "source_ip": state.src_ip,
             "session_id": state.session_id,
             "metadata": {"honeypot_id": state.honeypot_id},

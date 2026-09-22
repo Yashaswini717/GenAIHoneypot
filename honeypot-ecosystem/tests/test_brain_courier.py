@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shared" / "sidecar
 from brain_courier import (  # noqa: E402
     ALL_TOKEN_VALUES,
     BUNDLE_TOKENS,
+    CLASSIFY_WINDOW,
     DECOY_BUNDLES,
     BrainCourier,
     SessionState,
@@ -106,6 +107,9 @@ class Recorder:
 
     def plants(self) -> list[dict]:
         return [b for p, b in self.calls if p.endswith("/session/decoys")]
+
+    def classifies(self) -> list[dict]:
+        return [b for p, b in self.calls if p.endswith("/intent-classify")]
 
 
 def build_courier(recorder: Recorder) -> BrainCourier:
@@ -427,6 +431,78 @@ def test_planting_registers_that_bundle_up_front():
     expected = {v for _, v in BUNDLE_TOKENS["plant_honeytoken_credentials"]}
     assert expected <= registered, f"missing {expected - registered}"
     assert all(r["honeypot_id"].endswith("10.0.0.5") for r in rec.registrations())
+
+
+# --------------------------------------------------------------------------
+# what the classifier is actually shown
+# --------------------------------------------------------------------------
+
+
+def test_classification_sees_a_sliding_window_not_the_whole_session():
+    """The window has to slide, or intent can never leave reconnaissance.
+
+    Sending the accumulated history meant the opening recon commands outvoted
+    everything that followed for the rest of the session. Every classification
+    this system ever made was `reconnaissance`, which also silenced the
+    bandit's progression reward, since that is defined as intent moving.
+    """
+    rec = Recorder()
+    courier = build_courier(rec)
+
+    # Driven directly rather than through _handle: MIN_CLASSIFY_INTERVAL rate
+    # limits back-to-back commands, so a scripted session only classifies once
+    # and would not show the window moving.
+    seq = [f"cmd-{i}" for i in range(1, 13)]
+    state = SessionState(session_id="w1", src_ip="10.0.0.5", sensor="node-01-jump")
+
+    async def run() -> None:
+        for c in seq:
+            state.commands.append(c)
+            state.timestamps.append("2026-09-09T03:14:00.000000Z")
+            await courier._classify(state)
+        await courier.client.aclose()
+
+    asyncio.run(run())
+
+    sent = rec.classifies()
+    assert len(sent) == len(seq), "every step should have been classified"
+
+    for payload in sent:
+        assert len(payload["commands"]) <= CLASSIFY_WINDOW, (
+            f"sent {len(payload['commands'])} commands; the window is {CLASSIFY_WINDOW}"
+        )
+
+    # It must be the RECENT commands. A window pinned to the start of the
+    # session would bound the payload while changing nothing about the bug.
+    for i, payload in enumerate(sent, start=1):
+        expected = seq[max(0, i - CLASSIFY_WINDOW):i]
+        assert payload["commands"] == expected, (
+            f"after {i} commands expected {expected}, got {payload['commands']}"
+        )
+
+
+def test_the_window_is_narrow_enough_to_track_a_changing_attacker():
+    """Guards the constant itself.
+
+    Measured against a labelled attack, correct classifications by window size
+    were 2->11/13, 3->9/13, 5->7/13, 8->4/13, 40->4/13. Widening this silently
+    undoes the fix without breaking anything else.
+    """
+    assert 2 <= CLASSIFY_WINDOW <= 4, (
+        f"CLASSIFY_WINDOW={CLASSIFY_WINDOW} is too wide to follow an attacker "
+        "through the kill chain"
+    )
+
+
+def test_timestamps_use_the_same_window_as_commands():
+    """Mismatched windows would hand the classifier misaligned features."""
+    rec = Recorder()
+    courier = build_courier(rec)
+
+    drive(courier, [command("w2", f"cmd-{i}") for i in range(1, 9)])
+
+    for payload in rec.classifies():
+        assert len(payload["event_timestamps"]) <= CLASSIFY_WINDOW
 
 
 # --------------------------------------------------------------------------
