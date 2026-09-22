@@ -1,4 +1,3 @@
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -11,7 +10,7 @@ from config.settings import settings
 from core.exceptions import DatabaseError
 from core.utils import generate_unique_id
 
-from .models import Base, HoneytokenCreate, HoneytokenDB, HoneytokenResponse
+from .models import Base, HoneytokenCreate, HoneytokenDB, HoneytokenResponse, utcnow_naive
 
 
 class HoneytokenStore(LoggerMixin):
@@ -84,6 +83,58 @@ class HoneytokenStore(LoggerMixin):
             self.logger.error("honeytoken_creation_failed", error=str(e))
             raise DatabaseError(f"Failed to create honeytoken: {e}") from e
 
+    def register_honeytoken(self, honeytoken: HoneytokenCreate) -> HoneytokenResponse:
+        """Create a honeytoken, or return the existing row for the same value.
+
+        Idempotent on `token_value`, and that is a correctness requirement
+        rather than a convenience. `check_honeytoken` looks a value up with
+        `scalar_one_or_none()`, which *raises* on a duplicate — so a second row
+        carrying the same value would not merely be untidy, it would break the
+        tripwire for that value permanently.
+
+        Duplicates are the normal case, not the exotic one: the sidecar
+        registers a bundle's tokens every time it plants it, the same database
+        password appears in more than one bundle, and a returning attacker gets
+        the same environment again. All of those must converge on one row.
+        """
+        try:
+            with self.SessionLocal() as session:
+                stmt = select(HoneytokenDB).where(
+                    HoneytokenDB.token_value == honeytoken.token_value
+                )
+                existing = session.execute(stmt).scalars().first()
+                if existing is not None:
+                    # Re-arm a token that had been deactivated; leave
+                    # access_count and accessed_at alone so evidence survives.
+                    if not existing.is_active:
+                        existing.is_active = True
+                        session.commit()
+                        session.refresh(existing)
+                    return HoneytokenResponse.model_validate(existing)
+
+                db_token = HoneytokenDB(
+                    token_id=generate_unique_id(),
+                    token_type=honeytoken.token_type,
+                    token_value=honeytoken.token_value,
+                    honeypot_id=honeytoken.honeypot_id,
+                    file_path=honeytoken.file_path,
+                    token_metadata=honeytoken.token_metadata,
+                )
+                session.add(db_token)
+                session.commit()
+                session.refresh(db_token)
+
+                self.logger.info(
+                    "honeytoken_registered",
+                    token_id=db_token.token_id,
+                    token_type=db_token.token_type,
+                    honeypot_id=db_token.honeypot_id,
+                )
+                return HoneytokenResponse.model_validate(db_token)
+        except Exception as e:
+            self.logger.error("honeytoken_registration_failed", error=str(e))
+            raise DatabaseError(f"Failed to register honeytoken: {e}") from e
+
     def get_honeytoken(self, token_id: str) -> Optional[HoneytokenResponse]:
         """
         Get honeytoken by ID.
@@ -125,8 +176,17 @@ class HoneytokenStore(LoggerMixin):
                 result = session.execute(stmt).scalar_one_or_none()
                 
                 if result:
-                    # Log access
-                    result.accessed_at = datetime.now()
+                    # Log access.
+                    #
+                    # This was datetime.now() — local time — while every other
+                    # timestamp in this schema comes from the database's own
+                    # func.now(), which is UTC. RewardCalculator compares this
+                    # field against a decision's selected_at, so on a non-UTC
+                    # host the strongest signal the bandit has was mis-ordered
+                    # by the size of the offset: ahead of UTC (as here, +5:30)
+                    # an access from hours ago still satisfies the comparison
+                    # and pays reward 1.0 to an arm that earned nothing.
+                    result.accessed_at = utcnow_naive()
                     result.access_count += 1
                     session.commit()
                     
