@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -913,68 +914,88 @@ assert len(DECOY_BUNDLES) == 15, (
 # Note Tr3llis!84m appears under two different actions. That is exactly why
 # registration has to be idempotent by value.
 
-BUNDLE_TOKENS: dict[str, list[tuple[str, str]]] = {
-    "plant_honeytoken_credentials": [
-        ("aws_access_key", "AKIA4YTQ2VN6XZDR3PLM"),
-        ("aws_secret_key", "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"),
-        ("aws_access_key", "AKIA7BXK4WPQ5NZTM2RJ"),
-        ("aws_secret_key", "Rz3MvKp8QwLd6TgYhN1cXsE2bJfU9AoPiVmZtQrD"),
-    ],
-    "expose_fake_authorized_keys": [
-        ("ssh_public_key", "GnJcVoP1TaXqZmB8wKdEyNrFhQ2uCiLoAvMsXzPbTgJkRnDeWyUqHfMcZaVtBoNx"),
-    ],
-    "plant_ssh_honeytoken": [
-        ("ssh_private_key", "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gt"),
-    ],
-    "plant_tracked_honeytoken_archive": [
-        ("password_hash", "$2y$10$K7vN2xQpZmB8wKdEyNrFhO"),
-        ("password_hash", "$2y$10$T9aXqZmB4wKdEyNrFhQ2uC"),
-    ],
-    "populate_developer_workstation": [
-        ("gitlab_token", "gl-8QxTv2NmKdRw7ZpLcYh"),
-        ("database_password", "Tr3llis!84m"),
-        ("jwt", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlcnBfYWRtaW4ifQ"),
-    ],
-    "populate_production_server": [
-        ("vault_token", "hvs.CAESIJx7Kd0pQzXn2WvBcE9RmY4uHgL1sJfA6ToPiNxZeV"),
-    ],
-    "populate_database_server": [
-        ("database_password", "R3adOnly!2026"),
-        ("database_password", "Tr3llis!84m"),
-    ],
+#: How each kind of credential is recognised inside a bundle's own content.
+#:
+#: The values are NOT repeated here. They used to be -- copied out of the
+#: bundles above into a parallel table -- which meant the same secret appeared
+#: twice in this file and could drift out of sync if a decoy were edited. It
+#: also doubled what a secret scanner finds, and a repository whose product is
+#: convincing fake credentials trips those constantly.
+#:
+#: Locators instead: each pattern captures the value where it already lives.
+TOKEN_PATTERNS: dict[str, re.Pattern[str]] = {
+    "aws_access_key":    re.compile(r"aws_access_key_id\s*=\s*(\S+)"),
+    "aws_secret_key":    re.compile(r"aws_secret_access_key\s*=\s*(\S+)"),
+    "ssh_public_key":    re.compile(r"ssh-rsa\s+(\S{40,})"),
+    "ssh_private_key":   re.compile(r"^([A-Za-z0-9+/]{60,}=*)$", re.M),
+    "password_hash":     re.compile(r"(\$2[aby]\$\d{2}\$[A-Za-z0-9./]{10,})"),
+    "gitlab_token":      re.compile(r"\b(gl-[A-Za-z0-9_\-]{10,})"),
+    "vault_token":       re.compile(r"\b(hvs\.[A-Za-z0-9_\-]{10,})"),
+    "jwt":               re.compile(r"\b(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)"),
+    "database_password": re.compile(r"(?:DB_PASSWORD|password)\s*=?\s+?=?\s*(\S+)"),
 }
+
+#: What each bundle is expected to yield, and how many of each.
+#:
+#: The counts are the guard. A pattern that stops matching -- because a decoy
+#: was reworded, or a new one was added without a locator -- fails loudly at
+#: import instead of quietly leaving that credential with no tripwire behind
+#: it, which is the failure mode this whole mechanism exists to prevent.
+BUNDLE_TOKEN_SPEC: dict[str, dict[str, int]] = {
+    "plant_honeytoken_credentials":     {"aws_access_key": 2, "aws_secret_key": 2},
+    "expose_fake_authorized_keys":      {"ssh_public_key": 1},
+    "plant_ssh_honeytoken":             {"ssh_private_key": 1},
+    "plant_tracked_honeytoken_archive": {"password_hash": 2},
+    "populate_developer_workstation":   {"gitlab_token": 1, "database_password": 1, "jwt": 1},
+    "populate_production_server":       {"vault_token": 1},
+    "populate_database_server":         {"database_password": 2},
+}
+
+#: Minimum length for a value to be used as a tripwire. Short strings match
+#: innocuous commands; `password = 1234` would fire on half of everything.
+_MIN_TOKEN_LEN = 10
+
+
+def _extract_tokens() -> dict[str, list[tuple[str, str]]]:
+    """Pull each bundle's credentials out of the content it already carries."""
+    found: dict[str, list[tuple[str, str]]] = {}
+    for action, expected in BUNDLE_TOKEN_SPEC.items():
+        bundle = DECOY_BUNDLES.get(action)
+        assert bundle is not None, f"BUNDLE_TOKEN_SPEC names an unknown action: {action}"
+        body = "\n".join(content for _, content, _ in bundle)
+
+        entries: list[tuple[str, str]] = []
+        for token_type, count in expected.items():
+            pattern = TOKEN_PATTERNS[token_type]
+            values = [v for v in pattern.findall(body) if len(v) >= _MIN_TOKEN_LEN]
+            # De-duplicate while preserving order: the same password legitimately
+            # appears in two places inside one bundle.
+            seen, unique = set(), []
+            for v in values:
+                if v not in seen:
+                    seen.add(v)
+                    unique.append(v)
+            assert len(unique) >= count, (
+                f"{action}: expected {count} {token_type} value(s), found "
+                f"{len(unique)}. The decoy was edited without updating its "
+                f"locator, and that credential would have had no tripwire."
+            )
+            entries.extend((token_type, v) for v in unique[:count])
+        found[action] = entries
+    return found
+
+
+BUNDLE_TOKENS: dict[str, list[tuple[str, str]]] = _extract_tokens()
 
 
 #: Every distinct decoy credential, scanned against each reconstructed command.
 #: Flattened once at import rather than per command -- this runs on every
-#: command from every attacker.
+#: command from every attacker. Keyed by value so a password appearing in two
+#: bundles is scanned for once.
 ALL_TOKEN_VALUES: tuple[tuple[str, str], ...] = tuple(
-    {value: (token_type, value) for tokens in BUNDLE_TOKENS.values() for token_type, value in tokens}.values()
+    {
+        value: (token_type, value)
+        for tokens in BUNDLE_TOKENS.values()
+        for token_type, value in tokens
+    }.values()
 )
-
-
-def _verify_tokens() -> None:
-    """Fail at import if a declared tripwire is not actually in its bundle.
-
-    The values below are duplicated from the bundle bodies above, so they can
-    drift -- someone edits a decoy's content and the tripwire silently stops
-    matching anything, which is precisely the class of failure this whole
-    change exists to remove. A substring check costs nothing and makes drift
-    impossible to merge.
-    """
-    for action, tokens in BUNDLE_TOKENS.items():
-        bundle = DECOY_BUNDLES.get(action)
-        assert bundle is not None, f"BUNDLE_TOKENS names an action with no bundle: {action}"
-        body = "\n".join(content for _, content, _ in bundle)
-        for token_type, value in tokens:
-            assert len(value) >= 10, (
-                f"tripwire {token_type} for {action} is only {len(value)} chars; "
-                "short values match innocuous commands"
-            )
-            assert value in body, (
-                f"tripwire {token_type} for {action} is not present in that bundle's "
-                "content -- the decoy was edited without updating BUNDLE_TOKENS"
-            )
-
-
-_verify_tokens()

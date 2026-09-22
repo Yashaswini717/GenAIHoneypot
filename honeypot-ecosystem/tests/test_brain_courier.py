@@ -17,6 +17,7 @@ Run with:  pytest honeypot-ecosystem/tests/ -v
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import json
 import sys
 from pathlib import Path
@@ -28,11 +29,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shared" / "sidecar
 
 from brain_courier import (  # noqa: E402
     ALL_TOKEN_VALUES,
+    BUNDLE_TOKEN_SPEC,
     BUNDLE_TOKENS,
     CLASSIFY_WINDOW,
     DECOY_BUNDLES,
     BrainCourier,
     SessionState,
+    _extract_tokens,
 )
 
 
@@ -305,13 +308,67 @@ def test_expiry_leaves_live_sessions_alone():
 # --------------------------------------------------------------------------
 
 
-def test_declared_tripwires_exist_in_their_bundles():
-    """Guards against a decoy being edited without updating BUNDLE_TOKENS."""
-    for action, tokens in BUNDLE_TOKENS.items():
-        body = "\n".join(content for _, content, _ in DECOY_BUNDLES[action])
-        for token_type, value in tokens:
-            assert value in body, f"{token_type} for {action} is not in the bundle"
-            assert len(value) >= 10, f"{token_type} for {action} is too short to match safely"
+def test_tripwire_values_are_not_duplicated_in_source():
+    """The values live in the bundles and nowhere else.
+
+    They used to be copied into a parallel table, which meant the same secret
+    appeared twice in the file and the two copies could drift apart. It also
+    doubled what a secret scanner finds — and GitHub push protection does block
+    this repository, because convincing fake credentials are the product.
+    """
+    source = (Path(__file__).resolve().parents[1]
+              / "shared" / "sidecar" / "brain_courier.py").read_text()
+
+    # Everything from TOKEN_PATTERNS onward is locators and extraction logic.
+    # A credential appearing in that region means someone has gone back to
+    # declaring values by hand alongside the bundles that already contain them.
+    #
+    # Counting occurrences file-wide would be the wrong test: one password
+    # legitimately appears in two different bundles — which is precisely why
+    # registration has to be idempotent — and several appear in prose
+    # explaining the mechanism.
+    marker = "TOKEN_PATTERNS: dict[str, re.Pattern[str]]"
+    assert marker in source, "locator table not found; did it get renamed?"
+    locator_region = source[source.index(marker):]
+
+    for token_type, value in ALL_TOKEN_VALUES:
+        assert value not in locator_region, (
+            f"{token_type} value is written out in the locator region of "
+            "brain_courier.py; it should be extracted from its bundle, not copied"
+        )
+
+
+def test_every_bundle_yields_the_credentials_it_is_meant_to():
+    """Extraction must find what each bundle promises.
+
+    A locator that stops matching leaves that credential with no tripwire
+    behind it, and nothing would raise — the decoy still plants perfectly, it
+    just stops being watched.
+    """
+    for action, expected in BUNDLE_TOKEN_SPEC.items():
+        got = Counter(t for t, _ in BUNDLE_TOKENS[action])
+        for token_type, count in expected.items():
+            assert got[token_type] == count, (
+                f"{action}: expected {count} {token_type}, extracted {got[token_type]}"
+            )
+
+
+def test_a_reworded_decoy_fails_loudly_at_import():
+    """Drift must break the build, not the tripwire."""
+    original = DECOY_BUNDLES["populate_production_server"]
+    DECOY_BUNDLES["populate_production_server"] = [
+        (p, c.replace("VAULT_TOKEN=hvs.", "VAULT=xx."), m) for p, c, m in original
+    ]
+    try:
+        with pytest.raises(AssertionError, match="vault_token"):
+            _extract_tokens()
+    finally:
+        DECOY_BUNDLES["populate_production_server"] = original
+
+
+def test_extracted_values_are_long_enough_to_match_safely():
+    for token_type, value in ALL_TOKEN_VALUES:
+        assert len(value) >= 10, f"{token_type} is {len(value)} chars; too short"
 
 
 def test_using_a_planted_credential_trips_and_scores_it():
