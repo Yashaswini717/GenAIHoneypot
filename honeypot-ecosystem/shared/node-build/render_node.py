@@ -1129,7 +1129,6 @@ _SYSLOG_LINES = [
     "rsyslogd[{pid}]: rsyslogd was HUPed",
     "systemd-logind[{pid}]: New session {pid} of user ta_miller.",
     "kernel: [UFW BLOCK] IN=eth0 OUT= SRC=45.155.205.233 DST=10.60.0.11 PROTO=TCP DPT=23",
-    "node_exporter[{pid}]: level=info msg=\"Listening on\" address=:9100",
 ]
 
 _HISTORY = {

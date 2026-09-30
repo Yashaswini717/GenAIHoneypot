@@ -156,8 +156,8 @@ services:
     unit: cron.service
   - name: rsyslog
     unit: rsyslog.service
-  - name: node_exporter
-    unit: node_exporter.service
+  - name: prometheus-node-exporter
+    unit: prometheus-node-exporter.service
     port: 9100
 
 # The decoy chain. Medium depth by design: nothing on the surface, a hint that
