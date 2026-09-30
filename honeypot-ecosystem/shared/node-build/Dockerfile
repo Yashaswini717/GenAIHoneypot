@@ -91,6 +91,18 @@ COPY nodes/${NODE}/ /tmp/build/
 RUN python3 /tmp/build/render_node.py --identity /tmp/build/identity.yaml --root / \
     && rm -rf /tmp/build
 
+# rsyslogd drops privileges to the syslog user before it opens its log
+# files, so a seeded log left at root:root 0640 silently discards every
+# live line -- the box stops logging the instant it boots, and the only
+# symptom is a syslog whose newest entry predates the current uptime.
+# Asserted here because it is invisible at build time and expensive to
+# notice later. nginx deliberately excluded: its master stays root and
+# hands open descriptors to its www-data workers, so root:root is fine
+# there.
+RUN for f in /var/log/syslog /var/log/auth.log; do owner="$(stat -c '%U:%G' "$f")"; [ "$owner" = 'syslog:adm' ] || { echo "FATAL: $f is $owner, expected syslog:adm" >&2; exit 1; }; done \
+    && su -s /bin/sh syslog -c 'printf "" >> /var/log/syslog' \
+    && echo 'rsyslog can append to its seeded logs'
+
 # --------------------------------------------------------------------------
 # Init and the uname shim
 # --------------------------------------------------------------------------

@@ -85,6 +85,22 @@ class NodeRenderer:
             self.set_time(destination, when)
         return destination
 
+    def own(self, target: str, owner: str) -> None:
+        """chown a rendered file, for the daemons that cannot write as root.
+
+        rsyslogd drops privileges to the `syslog` user and only then opens its
+        log files, so a seeded log left at root:root 0640 locks it out and
+        every live line is silently discarded -- no error, no fallback, the
+        box simply stops logging the moment it boots.
+
+        Note that nginx does not need this: its master stays root, opens the
+        log files itself, and hands the descriptors to workers that have
+        already dropped to www-data. Same-looking ownership, different
+        outcome, which is why this is applied per daemon rather than to
+        everything under /var/log.
+        """
+        self.run("chown", owner, str(self.path(target)))
+
     def set_time(self, target: Path, when: datetime) -> None:
         stamp = when.timestamp()
         os.utime(target, (stamp, stamp))
@@ -418,6 +434,9 @@ class NodeRenderer:
             f"{when.strftime('%b %e %H:%M:%S')} {self.hostname} {text}\n" for when, text in lines
         )
         self.write("/var/log/auth.log", rendered, mode=0o640, when=self.now - timedelta(minutes=12))
+        # syslog:adm is what a real Ubuntu install has here, and rsyslogd must
+        # be able to append or the node stops recording logins at boot.
+        self.own("/var/log/auth.log", "syslog:adm")
 
     def _render_syslog(self) -> None:
         lines: list[tuple[datetime, str]] = []
@@ -446,6 +465,7 @@ class NodeRenderer:
             f"{when.strftime('%b %e %H:%M:%S')} {self.hostname} {text}\n" for when, text in lines
         )
         self.write("/var/log/syslog", rendered, mode=0o640, when=self.now - timedelta(minutes=3))
+        self.own("/var/log/syslog", "syslog:adm")
 
     def _render_shell_histories(self) -> None:
         """Per-user shell history that reads like work, not like a script.
