@@ -45,11 +45,18 @@ def _env_float(name: str, default: float) -> float:
 
 #: Fraction of attackers held back as the control arm, in [0, 1].
 #:
-#: 0.5 is the most statistical power per attacker seen, which matters when
-#: traffic is the scarce resource. Lower it to bias toward the adaptive arm
-#: once the comparison is already significant and the honeypot is wanted at
-#: its best; 0.0 disables the experiment and gives everyone adaptation.
-CONTROL_RATIO = _env_float("EXPERIMENT_CONTROL_RATIO", 0.5)
+#: 0.15, not the 0.5 that would extract the most statistical power from each
+#: attacker seen. The control arm costs real traffic: every attacker in it is
+#: one the adaptive path never got to work on, and the adaptive path is the
+#: point of the system. So the split is deliberately lopsided -- the baseline
+#: exists to keep "holds attackers longer than a static honeypot" defensible,
+#: not to be measured as precisely as possible.
+#:
+#: 0.0 disables the experiment and gives everyone adaptation. Raising it costs
+#: adaptive coverage; lowering it only ever moves attackers from control to
+#: adaptive, and any visit straddling the change is excluded by the hub's
+#: mixed-arm guard rather than counted under the wrong treatment.
+CONTROL_RATIO = _env_float("EXPERIMENT_CONTROL_RATIO", 0.15)
 
 #: Changing this reshuffles every assignment.
 #:

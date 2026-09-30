@@ -67,7 +67,7 @@ services:
       # and give everyone adaptation. Do NOT change the salt mid-experiment:
       # it reshuffles every assignment, and attackers already measured under
       # one arm would silently switch to the other.
-      EXPERIMENT_CONTROL_RATIO: "${EXPERIMENT_CONTROL_RATIO:-0.5}"
+      EXPERIMENT_CONTROL_RATIO: "${EXPERIMENT_CONTROL_RATIO:-0.15}"
       EXPERIMENT_SALT: "${EXPERIMENT_SALT:-genai-honeypot-v1}"
       BROKER_URL: http://session-broker:8080
       BACKEND_USER: devuser
