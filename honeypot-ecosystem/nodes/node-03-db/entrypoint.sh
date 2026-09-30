@@ -1,13 +1,20 @@
 #!/bin/bash
-# node-03: the records database. The end of the pivot chain.
-#
-# A real mariadb runs here rather than a fake listener, because everything an
-# attacker does next depends on it behaving like a database: connecting,
-# authenticating, listing schemas, dumping tables. A socket that accepts and
-# then speaks nonsense is worse than no socket at all.
+## node-03: the records database. The end of the pivot chain.
+##
+## A real mariadb runs here rather than a fake listener, because everything an
+## attacker does next depends on it behaving like a database: connecting,
+## authenticating, listing schemas, dumping tables. A socket that accepts and
+## then speaks nonsense is worse than no socket at all.
 set -euo pipefail
 
-rm -f /.dockerenv
+## Deletes /.dockerenv without naming it. The line survives comment
+## stripping, so a literal `rm -f /.dockerenv` in an installed boot script
+## would hand over the one thing the rest of this work exists to hide --
+## and it reads as damning to anyone who knows what that file is. A sweep
+## for build-pipeline markers is the same operation and an ordinary thing
+## for a provisioning script to do.
+# Clear provisioning markers left in / by the image pipeline.
+find / -maxdepth 1 -name '.*env' -type f -delete 2>/dev/null || true
 mkdir -p /run/sshd /var/run/rsyslog /run/mysqld
 chown -R mysql:mysql /run/mysqld /var/lib/mysql 2>/dev/null || true
 
@@ -22,7 +29,7 @@ fi
 service rsyslog start >/dev/null 2>&1 || rsyslogd
 service cron start >/dev/null 2>&1 || cron
 
-# First boot initialises the data directory and loads the seeded records.
+## First boot initialises the data directory and loads the seeded records.
 if [[ ! -d /var/lib/mysql/mysql ]]; then
     mysql_install_db --user=mysql --datadir=/var/lib/mysql >/dev/null 2>&1 || true
 fi
@@ -38,4 +45,5 @@ if [[ -f /opt/db/seed.sql ]] && ! mysql -N -B -e "use erp" >/dev/null 2>&1; then
     mysql < /opt/db/seed.sql >/dev/null 2>&1 || true
 fi
 
+# Hand off to sshd, which keeps the node alive.
 exec /usr/sbin/sshd -D -e

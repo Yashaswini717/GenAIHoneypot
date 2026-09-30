@@ -125,7 +125,36 @@ RUN chmod 0644 /lib/x86_64-linux-gnu/libnodeenv.so \
     && uname -r | grep -qv microsoft \
     && echo "uname now reports: $(uname -r)"
 
-COPY --chmod=0755 nodes/${NODE}/entrypoint.sh /usr/local/sbin/node-init
+# The boot script, with its internal narration removed and readable only by
+# root.
+#
+# It shipped 0755 and fully commented, which meant `student` -- the weakest
+# account on the box, whose password is three characters past guessable --
+# could read a file that said "that is the whole disguise", listed the
+# container tells by name, and showed the /.dockerenv removal. One command,
+# on the first account an attacker gets, and the entire estate is explained.
+#
+# `##` marks a comment for whoever maintains this; `#` marks one the box is
+# content for root to read. Only the second kind survives the install, so the
+# reasoning stays in git where the team needs it rather than on the node where
+# an attacker does.
+#
+# 0700 as well, because the decoy chain deliberately hands out sudo: the
+# stripping is what protects the script from the attacker who succeeds, and
+# the mode is what protects it from the one who has not yet.
+COPY nodes/${NODE}/entrypoint.sh /tmp/entrypoint.sh
+RUN sed -E '/^[[:space:]]*##/d' /tmp/entrypoint.sh | cat -s > /usr/local/sbin/node-init \
+    && rm -f /tmp/entrypoint.sh \
+    && chmod 0700 /usr/local/sbin/node-init \
+    && chown root:root /usr/local/sbin/node-init \
+    && bash -n /usr/local/sbin/node-init \
+    && if grep -Eiq 'honeypot|disguise|decoy|attacker|dockerenv|container tell' \
+            /usr/local/sbin/node-init; then \
+        echo 'FATAL: installed boot script still explains itself' >&2; \
+        grep -Ein 'honeypot|disguise|decoy|attacker|dockerenv|container tell' \
+            /usr/local/sbin/node-init >&2; exit 1; \
+    fi \
+    && echo "boot script installed: $(wc -l < /usr/local/sbin/node-init) lines, root-only"
 
 EXPOSE 22
 ENTRYPOINT ["/sbin/init", "-s", "--"]

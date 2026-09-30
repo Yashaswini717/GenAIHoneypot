@@ -49,7 +49,7 @@ class AmbientJob:
     #: hundred identical lines is not the log of a machine doing anything --
     #: and the moment, because a line that names a file has to name one whose
     #: date matches the line's own.
-    seed_tail: Callable[[random.Random, datetime], str]
+    seed_tail: Callable[[random.Random, datetime, dict], str]
     log_owner: str = "root:root"
     log_mode: int = 0o644
 
@@ -259,6 +259,16 @@ def _sessions_at(rng: random.Random, when: datetime) -> str:
     return f"sessions={sessions} sshd={established}"
 
 
+def _near(rng: random.Random, centre: int, spread: int) -> int:
+    """A reading close to a measured value, clamped to something sane.
+
+    Real samples wander; a log of one repeated number is not a log of
+    measurements. The clamp matters because the centre comes from whatever
+    filesystem the image was built on, which can legitimately be almost empty.
+    """
+    return max(1, min(97, centre + rng.randint(-spread, spread)))
+
+
 def _pct(rng: random.Random, low: int, high: int) -> str:
     return f"{rng.randint(low, high)}%"
 
@@ -287,7 +297,15 @@ AMBIENT_JOBS: dict[str, AmbientJob] = {
             "INODES=$(df -Pi / | awk 'NR==2 {print $5}')\n"
             "echo \"$(date '+%Y-%m-%d %H:%M:%S') root=$USED inodes=$INODES\" >> \"$LOG\"\n"
         ),
-        seed_tail=lambda rng, when: f"root={_pct(rng, 38, 44)} inodes={_pct(rng, 11, 14)}",
+        # Seeded around the filesystem this image was built on, not a
+        # hardcoded band. The live job reports real `df`, so a fixed 38-44%
+        # meant the first line after boot could read root=2% -- a step change
+        # at exactly the moment the engine exists to make seamless. Measuring
+        # at build time makes the two agree on whatever host this runs on.
+        seed_tail=lambda rng, when, facts: (
+            f"root={_near(rng, facts.get('disk_used_pct', 41), 3)}% "
+            f"inodes={_near(rng, facts.get('inodes_used_pct', 12), 2)}%"
+        ),
     ),
     # Counts the attacker's own session, so what they read is true and
     # includes them. The box is measuring them, not performing for them.
@@ -303,7 +321,7 @@ AMBIENT_JOBS: dict[str, AmbientJob] = {
             "ESTAB=$(ss -tn state established 2>/dev/null | grep -c ':22' || true)\n"
             "echo \"$(date '+%Y-%m-%d %H:%M:%S') sessions=$SESSIONS sshd=$ESTAB\" >> \"$LOG\"\n"
         ),
-        seed_tail=lambda rng, when: _sessions_at(rng, when),
+        seed_tail=lambda rng, when, facts: _sessions_at(rng, when),
     ),
     # Worth more than the line it writes: the probe goes through nginx, so the
     # access log an attacker greps first keeps growing on its own.
@@ -324,7 +342,7 @@ AMBIENT_JOBS: dict[str, AmbientJob] = {
         # upstream failure too -- and two independently drawn randoms do not
         # correlate. A week of 200s is what a healthy service's probe log
         # actually looks like.
-        seed_tail=lambda rng, when: "portal=200",
+        seed_tail=lambda rng, when, facts: "portal=200",
     ),
     # Leaves a real file in /var/backups/mysql that an attacker can find,
     # size, and gunzip -- a genuine dump of the data they came for, which is a
@@ -355,7 +373,7 @@ AMBIENT_JOBS: dict[str, AmbientJob] = {
         # The filename carries the moment the backup was taken, because it
         # does in the live script -- a log line whose timestamp and
         # filename disagree is a line nothing produced.
-        seed_tail=lambda rng, when: (
+        seed_tail=lambda rng, when, facts: (
             f"ok erp-{when.strftime('%Y%m%d-%H%M')}.sql.gz "
             f"{rng.randint(5100, 5900)} bytes"
         ),

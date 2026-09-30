@@ -31,6 +31,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shared" / "node-bu
 
 from ambient import AMBIENT_JOBS, Schedule  # noqa: E402
 
+#: What the renderer measures on the build host and hands to seed_tail.
+FACTS = {"disk_used_pct": 41, "inodes_used_pct": 12,
+         "disk_total_gb": 78.21, "memory_used_pct": 34}
+
 # 28 Sep 2026 is a Monday, 3 Oct a Saturday, 4 Oct a Sunday.
 MONDAY = datetime(2026, 9, 28, 0, 0)
 
@@ -152,7 +156,7 @@ def test_unsupported_schedule_fields_raise(field, spec):
 def test_every_job_seeds_a_line_and_writes_the_log_it_seeds():
     rng = random.Random(0)
     for name, job in AMBIENT_JOBS.items():
-        tail = job.seed_tail(rng, datetime(2026, 9, 25, 2, 15))
+        tail = job.seed_tail(rng, datetime(2026, 9, 25, 2, 15), FACTS)
         assert tail and "\n" not in tail, f"{name} seeded a bad line: {tail!r}"
         assert job.log in job.body, (
             f"{name} seeds {job.log} but its script never writes there"
@@ -178,7 +182,7 @@ def test_db_backup_line_names_a_file_matching_its_own_timestamp():
     """A log line whose timestamp and filename disagree is a line nothing
     produced, and the filename is right there in the same line."""
     moment = datetime(2026, 9, 25, 2, 15)
-    tail = AMBIENT_JOBS["db-backup"].seed_tail(random.Random(0), moment)
+    tail = AMBIENT_JOBS["db-backup"].seed_tail(random.Random(0), moment, FACTS)
     assert moment.strftime("%Y%m%d-%H%M") in tail
 
 
@@ -193,7 +197,7 @@ def test_session_counts_follow_the_working_day():
 
     def total(day, hour, samples=120):
         return sum(
-            int(job.seed_tail(rng, datetime(2026, 9, day, hour, 0)).split()[0].split("=")[1])
+            int(job.seed_tail(rng, datetime(2026, 9, day, hour, 0), FACTS).split()[0].split("=")[1])
             for _ in range(samples)
         )
 
@@ -211,7 +215,37 @@ def test_established_connections_are_never_fewer_than_sessions():
     rng = random.Random(3)
     for hour in range(24):
         for _ in range(40):
-            tail = job.seed_tail(rng, datetime(2026, 9, 30, hour, 0))
+            tail = job.seed_tail(rng, datetime(2026, 9, 30, hour, 0), FACTS)
             sessions = int(tail.split()[0].split("=")[1])
             sshd = int(tail.split()[1].split("=")[1])
             assert sshd >= sessions, tail
+
+
+def test_disk_report_seeds_near_the_measured_filesystem():
+    """Seeded around what df says, not a hardcoded band.
+
+    The live job reports real df. With a fixed 38-44% band the first line after
+    boot read root=2% on a container over a near-empty host disk -- a step
+    change at exactly the boundary this engine exists to make seamless.
+    """
+    job = AMBIENT_JOBS["disk-report"]
+    rng = random.Random(5)
+    for measured in (2, 41, 88):
+        facts = dict(FACTS, disk_used_pct=measured)
+        for _ in range(60):
+            tail = job.seed_tail(rng, datetime(2026, 9, 30, 12, 0), facts)
+            value = int(tail.split()[0].split("=")[1].rstrip("%"))
+            assert abs(value - measured) <= 3, f"{value} is not near {measured}"
+
+
+def test_disk_readings_stay_in_range_for_an_empty_or_full_disk():
+    """A near-empty or near-full build host must not seed 0% or 101%."""
+    job = AMBIENT_JOBS["disk-report"]
+    rng = random.Random(6)
+    for measured in (0, 1, 99, 100):
+        facts = dict(FACTS, disk_used_pct=measured, inodes_used_pct=measured)
+        for _ in range(60):
+            tail = job.seed_tail(rng, datetime(2026, 9, 30, 12, 0), facts)
+            for field in tail.split():
+                value = int(field.split("=")[1].rstrip("%"))
+                assert 1 <= value <= 97, tail

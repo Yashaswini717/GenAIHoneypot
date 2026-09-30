@@ -81,6 +81,76 @@ class NodeRenderer:
 
     # -- helpers -----------------------------------------------------------
 
+    #: Filled by measure(), which reads the build host's filesystem once.
+    _facts: dict[str, int] | None = None
+
+    def measure(self) -> dict[str, int]:
+        """Facts about the filesystem this image is being built on.
+
+        Three places used to state the disk usage of / and all three disagreed:
+        the motd said 61.4%, the seeded monitoring log said 44%, and `df` on the
+        running container said 2%. The last one is the only one an attacker can
+        check against the others, and the live monitoring job reports it -- so
+        the first line after boot stepped from 44% to 2% in a log whose whole
+        purpose is having no seam at the boot.
+
+        Measured once here and used everywhere, so all three agree on whatever
+        host the image is built on. On a container over a nearly empty host
+        disk that means the box reads as nearly empty, which is honest; on the
+        VPS this deploys to it will read as that disk.
+        """
+        if self._facts is None:
+            self._facts = {
+                "disk_used_pct": self._df_percent(["df", "-P", "/"]),
+                "inodes_used_pct": self._df_percent(["df", "-Pi", "/"]),
+                "disk_total_gb": self._df_total_gb(),
+                "memory_used_pct": self._memory_percent(),
+            }
+        return self._facts
+
+    @staticmethod
+    def _df_total_gb() -> float:
+        """Size of / in GB, for the banner that used to claim a fixed 78.21."""
+        try:
+            output = subprocess.run(
+                ["df", "-PBM", "/"], check=True, capture_output=True, text=True
+            ).stdout
+            return int(output.splitlines()[1].split()[1].rstrip("M")) / 1024
+        except (subprocess.CalledProcessError, IndexError, ValueError, OSError):
+            return 78.21
+
+    @staticmethod
+    def _memory_percent() -> int:
+        """Used memory as a percentage, from /proc/meminfo.
+
+        A frozen figure in a static banner drifts from reality the moment the
+        box does anything -- on a real Ubuntu host this line is recomputed by
+        update-motd at every login, and ours cannot be because those scripts
+        were removed for printing the host kernel. Measured at build is the
+        floor: it is at least the right order of magnitude for this machine
+        rather than a number typed into a template.
+        """
+        try:
+            values: dict[str, int] = {}
+            with open("/proc/meminfo", encoding="utf-8") as handle:
+                for line in handle:
+                    key, _, rest = line.partition(":")
+                    values[key] = int(rest.strip().split()[0])
+            total = values["MemTotal"]
+            available = values.get("MemAvailable", values.get("MemFree", 0))
+            return max(1, min(99, round((total - available) * 100 / total)))
+        except (OSError, KeyError, IndexError, ValueError, ZeroDivisionError):
+            return 34
+
+    @staticmethod
+    def _df_percent(command: list[str]) -> int:
+        """The Use% column, or a plausible default if df cannot be read."""
+        try:
+            output = subprocess.run(command, check=True, capture_output=True, text=True).stdout
+            return int(output.splitlines()[1].split()[4].rstrip("%"))
+        except (subprocess.CalledProcessError, IndexError, ValueError, OSError):
+            return 41
+
     def path(self, *parts: str) -> Path:
         return self.root.joinpath(*[p.lstrip("/") for p in parts])
 
@@ -185,8 +255,11 @@ class NodeRenderer:
             f"  System information as of {self.now.strftime('%a %d %b %Y %I:%M:%S %p IST')}\n"
             "\n"
             "  System load:  0.08              Processes:             118\n"
-            f"  Usage of /:   61.4% of 78.21GB  Users logged in:       0\n"
-            "  Memory usage: 34%               IPv4 address for eth0: 10.60.0.11\n"
+            # Measured, not stated. This read 61.4% while the seeded
+            # monitoring log said 44% and df on the running box said 2%:
+            # three numbers for one filesystem, one of them checkable.
+            f"  Usage of /:   {self.measure()['disk_used_pct']}.{self.rng.randint(1, 9)}% of {self.measure()['disk_total_gb']:.2f}GB  Users logged in:       0\n"
+            f"  Memory usage: {self.measure()['memory_used_pct']}%               IPv4 address for eth0: 10.60.0.11\n"
             "  Swap usage:   0%\n"
             "\n"
             # ASCII only. The motd is rendered by a terminal whose encoding we
@@ -1215,7 +1288,7 @@ class NodeRenderer:
             else:
                 # Older than the retention window, so the file it names is
                 # genuinely gone. Nothing can contradict the size.
-                tail = job.seed_tail(self.rng, when)
+                tail = job.seed_tail(self.rng, when, self.measure())
             rendered.append(f"{when.strftime('%Y-%m-%d %H:%M:%S')} {tail}\n")
 
         self.write(job.log, "".join(rendered), mode=job.log_mode, when=occurrences[-1])
@@ -1263,6 +1336,25 @@ class NodeRenderer:
         self.run("chown", "-R", "root:root", str(destination))
         self.path("/var/backups/mysql").chmod(0o700)
         return sizes
+
+    def date_apt_metadata(self) -> None:
+        """Age /var/lib/apt/lists to match the motd's last-patched date.
+
+        `ls -l /var/lib/apt/lists` against a banner claiming a patch date is a
+        cheap check, and at build time the directory carries the moment the
+        image was assembled.
+
+        Done here rather than in the boot script, where it used to live. Once
+        that script's internal comments stopped shipping, a bare `touch -d '37
+        days ago' /var/lib/apt/lists` was left in an installed boot script with
+        nothing explaining it -- a line whose only conceivable purpose is
+        backdating evidence. It also belongs at build time on its own merits:
+        the motd is rendered here from the same clock, so the two age together
+        instead of drifting apart every time a container starts.
+        """
+        target = self.path("/var/lib/apt/lists")
+        if target.exists():
+            self.set_time(target, self.now - timedelta(days=37))
 
     def scatter_mtimes(self) -> None:
         """Spread modification times across the seeded period.
@@ -1615,6 +1707,7 @@ def main() -> int:
     renderer.render_environment()
     renderer.render_role()
     renderer.render_ambient()
+    renderer.date_apt_metadata()
     renderer.render_history()
     renderer.render_decoys()
     renderer.scatter_mtimes()
