@@ -221,6 +221,13 @@ class PeerServer(asyncssh.SSHServer):
             self.conn._honeypot_target = self.target  # noqa: SLF001
         if self.target and self.events is not None:
             self.events.sensor = self.target["node"]
+            # The peer address on a pivot is our own jump host, so without
+            # this the attacker's deepest sessions are attributed to an
+            # internal address and their journey cannot be reassembled --
+            # which is exactly what the retention measurement needs.
+            owner = self.target.get("owner")
+            if owner:
+                self.events.attacker = owner
 
     def connection_lost(self, exc: Exception | None) -> None:
         if self.events is not None:

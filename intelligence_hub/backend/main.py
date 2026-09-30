@@ -14,6 +14,7 @@ from api.events import router as events_router
 from api.iocs import router as iocs_router
 from api.sessions import router as sessions_router
 from api.alerts import router as alerts_router
+from api.retention import router as retention_router
 from websocket.feed import router as ws_router
 
 
@@ -46,6 +47,7 @@ app.include_router(events_router,   prefix="/events",   tags=["events"])
 app.include_router(iocs_router,     prefix="/iocs",     tags=["iocs"])
 app.include_router(sessions_router, prefix="/sessions", tags=["sessions"])
 app.include_router(alerts_router,   prefix="/alerts",   tags=["alerts"])
+app.include_router(retention_router, prefix="/retention", tags=["retention"])
 app.include_router(ws_router,                           tags=["websocket"])
 
 

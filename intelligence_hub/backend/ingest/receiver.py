@@ -76,6 +76,8 @@ async def process_event(raw: dict):
             sess = Session(
                 session_id  = event["session_id"],
                 src_ip      = event["src_ip"],
+                attacker_id = event.get("attacker_id") or event["src_ip"],
+                adaptive    = event.get("adaptive"),
                 sensor_id   = event["sensor_id"],
                 protocol    = event.get("protocol", "ssh"),
                 started_at  = normalized.timestamp.replace(tzinfo=None),
@@ -96,6 +98,23 @@ async def process_event(raw: dict):
                 sess.duration = event.get("duration")
             if event.get("hassh") and not sess.hassh:
                 sess.hassh = event["hassh"]
+            # A pivot's session.connect is emitted before the broker has
+            # resolved who owns the environment, so that first event carries
+            # the fallback (attacker_id == src_ip, which on a pivot is our own
+            # jump host). Every later event in the session carries the real
+            # owner.
+            #
+            # So a value that differs from src_ip is authoritative and must
+            # overwrite: refusing to correct an already-set field left every
+            # pivot session attributed to an internal address, which is the
+            # precise failure this column exists to prevent.
+            incoming = event.get("attacker_id")
+            if incoming and incoming != event["src_ip"]:
+                sess.attacker_id = incoming
+            elif incoming and not sess.attacker_id:
+                sess.attacker_id = incoming
+            if sess.adaptive is None and event.get("adaptive") is not None:
+                sess.adaptive = event["adaptive"]
             if event.get("country") and not sess.country:
                 sess.country = event["country"]
 

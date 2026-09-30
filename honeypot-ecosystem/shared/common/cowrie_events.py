@@ -76,6 +76,8 @@ class SessionEventFactory:
         sensor: str | None = None,
         session_id: str | None = None,
         protocol: str = "ssh",
+        attacker: str | None = None,
+        adaptive: bool = True,
     ) -> None:
         self.session_id = session_id or new_session_id()
         self.src_ip = src_ip
@@ -84,6 +86,16 @@ class SessionEventFactory:
         self.dst_port = dst_port
         self.sensor = sensor or os.environ.get("SENSOR_ID", "node-01-jump")
         self.protocol = protocol
+
+        # Who this session belongs to. At the perimeter the attacker IS the
+        # peer, so it defaults to src_ip; on a pivot the gateway overwrites it
+        # with the owner the broker resolved, because the peer there is our
+        # own jump host rather than the person driving it.
+        self.attacker = attacker or src_ip
+
+        # Which experimental arm this attacker is in. Recorded on every event
+        # so retention can be split by arm without joining anything later.
+        self.adaptive = adaptive
 
         # Set once the client identifies itself, then echoed on later events so
         # a single event is enough to fingerprint the client.
@@ -107,6 +119,18 @@ class SessionEventFactory:
             "protocol": self.protocol,
             "sensor": self.sensor,
             "message": message,
+            # Extensions beyond the Cowrie schema. Cowrie has no notion of an
+            # attacker who moves between hosts, because a Cowrie sensor is one
+            # host; ours is an estate, and the whole research question is how
+            # far through it somebody gets.
+            #
+            # src_ip stays truthful — on a pivot it is genuinely node-01's
+            # address, and geo enrichment and IOC correlation depend on it
+            # being the real peer. `attacker` carries who the session belongs
+            # to instead, so a jump-host session and the pivots that follow it
+            # can be joined into one journey.
+            "attacker": self.attacker,
+            "adaptive": self.adaptive,
         }
         # Carried forward once known so every downstream event is self-contained.
         if self.client_version:

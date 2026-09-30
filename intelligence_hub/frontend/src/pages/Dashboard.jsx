@@ -5,6 +5,7 @@ import AlertQueue from '../components/AlertQueue.jsx'
 import SessionTimeline from '../components/SessionTimeline.jsx'
 import AttackMap from '../components/AttackMap.jsx'
 import Overview from '../components/Overview.jsx'
+import Retention from '../components/Retention.jsx'
 
 export default function Dashboard({ activePage }) {
   const pages = {
@@ -14,6 +15,7 @@ export default function Dashboard({ activePage }) {
     iocs:      <IOCPanel />,
     alerts:    <AlertQueue />,
     map:       <AttackMap />,
+    retention: <Retention />,
   }
   return pages[activePage] || <Overview />
 }

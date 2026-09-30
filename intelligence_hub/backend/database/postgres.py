@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
-from sqlalchemy import Column, String, Integer, Float, DateTime, Text, Enum
+from sqlalchemy import text, Boolean, Column, String, Integer, Float, DateTime, Text, Enum
 from sqlalchemy.dialects.postgresql import ARRAY
 from datetime import datetime
 import enum
@@ -27,6 +27,21 @@ class Session(Base):
 
     session_id   = Column(String, primary_key=True)
     src_ip       = Column(String, nullable=False)
+
+    # Who the session belongs to, which is not always who it came from.
+    #
+    # On a pivot the peer is our own jump host, so src_ip is an internal
+    # address: grouping retention by src_ip counts one attacker as several
+    # and attributes their deepest sessions to a machine of ours. attacker_id
+    # carries the original source address through every hop, so a jump-host
+    # session and the pivots that follow it join into one journey.
+    attacker_id  = Column(String, index=True)
+
+    # Which experimental arm this attacker was in when the session ran.
+    # Recorded per session rather than derived later, because the assignment
+    # is a property of the moment and config changes underneath it.
+    adaptive     = Column(Boolean, default=True, index=True)
+
     sensor_id    = Column(String)
     protocol     = Column(String, default="ssh")
     started_at   = Column(DateTime, default=datetime.utcnow)
@@ -58,9 +73,26 @@ class Alert(Base):
     updated_at   = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+#: Columns added after the sessions table already existed in deployments.
+#:
+#: create_all() creates missing TABLES and silently ignores missing COLUMNS,
+#: so a model change alone leaves every existing database without them and
+#: every insert failing on a column that is not there. ADD COLUMN IF NOT
+#: EXISTS is idempotent, so this is safe to run on every startup and needs no
+#: migration tool for a change this size.
+_SESSION_COLUMNS = (
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS attacker_id VARCHAR",
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS adaptive BOOLEAN DEFAULT TRUE",
+    "CREATE INDEX IF NOT EXISTS ix_sessions_attacker_id ON sessions (attacker_id)",
+    "CREATE INDEX IF NOT EXISTS ix_sessions_adaptive ON sessions (adaptive)",
+)
+
+
 async def init_postgres():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        for statement in _SESSION_COLUMNS:
+            await conn.execute(text(statement))
     print("✓ PostgreSQL tables ready")
 
 

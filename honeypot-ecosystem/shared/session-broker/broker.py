@@ -249,6 +249,11 @@ class PeerResponse(BaseModel):
     address: str
     port: int = 22
     spawned: bool
+    #: Who this environment belongs to — the attacker's real source address.
+    #: The gateway stamps it on the pivot session, because the peer address it
+    #: sees is our own jump host and would otherwise split one attacker's
+    #: journey into unrelated sessions.
+    owner: str
 
 
 @app.post("/session/peer", response_model=PeerResponse)
@@ -296,6 +301,7 @@ async def acquire_peer(request: PeerRequest) -> PeerResponse:
         hostname=spec["hostname"],
         address=address,
         spawned=not existed,
+        owner=owner,
     )
 
 

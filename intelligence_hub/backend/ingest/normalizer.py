@@ -27,6 +27,12 @@ class NormalizedEvent(BaseModel):
     event_type:    str           # our category
     base_score:    int           # 0–100
     sensor_id:     str
+
+    # Extensions beyond Cowrie. A Cowrie sensor is one host, so its schema has
+    # no way to say "the same attacker, one hop deeper". Ours is an estate and
+    # that is the measurement, so the sensor sends it and we carry it through.
+    attacker_id:   Optional[str] = None
+    adaptive:      Optional[bool] = None
     timestamp:     datetime
     username:      Optional[str]
     password:      Optional[str]
@@ -61,6 +67,11 @@ def normalize(raw: dict) -> NormalizedEvent:
         event_type   = event_type,
         base_score   = base_score,
         sensor_id    = raw.get("sensor", ""),
+        # Falls back to src_ip so events from a plain Cowrie sensor, or from
+        # a honeypot build predating this field, still group by something
+        # sensible instead of by nothing.
+        attacker_id  = raw.get("attacker") or raw.get("src_ip", ""),
+        adaptive     = raw.get("adaptive"),
         timestamp    = raw.get("timestamp"),
         username     = raw.get("username"),
         password     = raw.get("password"),
