@@ -54,6 +54,11 @@ log = logging.getLogger("session-broker")
 NODE_IMAGE = os.environ.get("NODE_IMAGE", "honeypot/node-01-jump:current")
 NODE_NETWORK = os.environ.get("NODE_NETWORK", "deception-net")
 NODE_HOSTNAME = os.environ.get("NODE_HOSTNAME", "jump-01")
+
+#: The node the SSH proxy fronts. Used both as the label on entry containers
+#: and as the filter when rebuilding state after a restart -- the two must
+#: stay the same string, so they read it from here rather than repeating it.
+ENTRY_NODE_NAME = os.environ.get("ENTRY_NODE_NAME", "node-01-jump")
 NODE_DOMAIN = os.environ.get("NODE_DOMAIN", "cs.internal")
 SSH_PORT = int(os.environ.get("NODE_SSH_PORT", "22"))
 
@@ -880,7 +885,7 @@ def _create_container(key: str) -> Backend:
         privileged=False,
         labels={
             "honeypot.role": "node",
-            "honeypot.node": "node-01-jump",
+            "honeypot.node": ENTRY_NODE_NAME,
             "honeypot.key": key,
         },
     )
@@ -1061,8 +1066,20 @@ def _reconcile() -> list[Backend]:
         return []
     found: list[Backend] = []
     try:
+        # ENTRY NODES ONLY.
+        #
+        # Every node an attacker owns -- the jump host and both pivot targets
+        # -- carries the same honeypot.key, because the key is their source
+        # IP. Filtering on honeypot.role=node therefore adopted all three
+        # under one key and whichever Docker happened to list last won, so
+        # after a broker restart a perimeter SSH session was routed to
+        # erp-web or db-01 instead of the jump host. Nondeterministic, and it
+        # broke the session outright.
+        #
+        # Peers are found through _spawn_peer by name when a pivot resolves,
+        # so they never needed to be in this map at all.
         containers = _docker.containers.list(
-            all=True, filters={"label": "honeypot.role=node"}
+            all=True, filters={"label": f"honeypot.node={ENTRY_NODE_NAME}"}
         )
     except DockerException:
         log.warning("could not list existing node containers", exc_info=True)
