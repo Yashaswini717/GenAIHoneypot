@@ -22,6 +22,7 @@ Run at image build time:
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import random
@@ -34,6 +35,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from ambient import AMBIENT_JOBS, Schedule, as_mysqldump  # noqa: E402
 from seed_history import (  # noqa: E402
     LoginRecord,
     scatter_events,
@@ -46,6 +48,12 @@ from seed_history import (  # noqa: E402
 #: change every build is one whose "history" is obviously synthetic to anyone
 #: who sees two versions of it.
 SEED = 0x9E3779B9
+
+#: Bytes nginx logs for a GET / against the portal. Measured against the
+#: running node rather than guessed: the seeded availability-probe lines carry
+#: this size, and a response size in the access log that does not match what
+#: the portal actually serves is checkable with one curl.
+_PORTAL_INDEX_BYTES = 386
 
 
 class NodeRenderer:
@@ -1002,18 +1010,41 @@ class NodeRenderer:
             workday_end=self.workday[1],
             rng=self.rng,
         )
-        lines = []
+        entries: list[tuple[datetime, str]] = []
         for when in moments:
             client = f"10.60.{self.rng.randint(12, 18)}.{self.rng.randint(2, 250)}"
             path = self.rng.choice(paths)
             status = self.rng.choices([200, 200, 200, 304, 404, 401], weights=[60, 15, 10, 8, 5, 2])[0]
             size = self.rng.randint(180, 9400)
             stamp = when.strftime("%d/%b/%Y:%H:%M:%S +0530")
-            lines.append(
+            entries.append((
+                when,
                 f'{client} - - [{stamp}] "GET {path} HTTP/1.1" {status} {size} '
-                f'"-" "{self.rng.choice(agents)}"'
-            )
-        self.write("/var/log/nginx/erp-access.log", "\n".join(lines) + "\n", mode=0o640)
+                f'"-" "{self.rng.choice(agents)}"',
+            ))
+
+        # The availability probe goes through nginx, so its requests belong
+        # in this log too -- and if they appear only from boot onwards, the
+        # log says the monitoring was installed the moment the attacker
+        # arrived. Seeded from this node's own schedule rather than a second
+        # copy of the interval, so the cadence is the same either side of
+        # the boot.
+        probe = self._ambient_schedule("portal-healthcheck")
+        if probe is not None:
+            for when in probe.occurrences(self.now - timedelta(days=6), self.now):
+                stamp = when.strftime("%d/%b/%Y:%H:%M:%S +0530")
+                entries.append((
+                    when,
+                    f'127.0.0.1 - - [{stamp}] "GET / HTTP/1.1" 200 {_PORTAL_INDEX_BYTES} '
+                    f'"-" "curl/7.81.0"',
+                ))
+
+        entries.sort(key=lambda item: item[0])
+        self.write(
+            "/var/log/nginx/erp-access.log",
+            "\n".join(line for _, line in entries) + "\n",
+            mode=0o640,
+        )
         self.write(
             "/var/log/nginx/erp-error.log",
             "\n".join(
@@ -1091,6 +1122,147 @@ class NodeRenderer:
         )
 
     # -- filesystem realism ------------------------------------------------
+
+    # -- ambient activity ---------------------------------------------------
+
+    def _ambient_schedule(self, job_name: str) -> "Schedule | None":
+        """This node's schedule for one job, or None if it does not run it.
+
+        Exists so nothing rebuilds a schedule from a second copy of the
+        numbers. The nginx access log has to be seeded with the health check's
+        own cadence, and a hardcoded five minutes there would drift silently
+        the first time an identity.yaml changed.
+        """
+        for entry in self.identity.get("ambient") or []:
+            if entry.get("job") == job_name:
+                return Schedule(
+                    every_minutes=entry.get("every_minutes"),
+                    at=entry.get("at"),
+                    hours=entry.get("hours"),
+                    days=entry.get("days"),
+                )
+        return None
+
+    def render_ambient(self) -> None:
+        """Install the cron jobs that keep this box doing something.
+
+        Everything else here is history: true when the image was built and
+        frozen from then on. These are the part that is still happening while
+        somebody watches, which is the difference between a box that survives
+        a glance and one that survives a stakeout.
+
+        Runs after render_role() because the database node's backup job seeds
+        real dumps of the schema that render_role() writes.
+        """
+        entries = self.identity.get("ambient") or []
+        if not entries:
+            return
+
+        window_start = self.now - timedelta(days=7)
+        # Two minutes back, not self.now: a monitoring log whose last line is
+        # the same second the image finished building says what it is.
+        window_end = self.now - timedelta(minutes=2)
+
+        lines = [
+            "# Departmental monitoring and housekeeping. Managed by ITS;",
+            "# see /opt/deploy/CHANGELOG before editing.",
+            "SHELL=/bin/sh",
+            "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin",
+            "",
+        ]
+
+        for entry in entries:
+            name = entry["job"]
+            # KeyError on purpose. A node asking for a job that does not exist
+            # is a typo in its identity.yaml, and failing the build is how it
+            # gets noticed rather than shipping a node missing its activity.
+            job = AMBIENT_JOBS[name]
+            schedule = self._ambient_schedule(name)
+            assert schedule is not None  # it came from this very list
+            user = entry.get("user", "root")
+
+            # Backdated: a monitoring script whose mtime is the build is a
+            # script installed the day the box appeared.
+            self.write(job.script, job.body, mode=0o755, when=self.random_moment(30, 120))
+            occurrences = schedule.occurrences(window_start, window_end)
+            self._seed_ambient_log(job, occurrences)
+            lines.append(f"{schedule.to_cron()}  {user}  {job.script} >/dev/null 2>&1")
+
+        lines.append("")
+        # No dot in the filename: cron silently ignores files under cron.d
+        # whose names contain one, which would leave the scripts and the
+        # seeded logs in place and nothing running.
+        self.write("/etc/cron.d/cs-monitoring", "\n".join(lines))
+
+    def _seed_ambient_log(self, job, occurrences: list[datetime]) -> None:
+        """Give a job's log the history it would have, at its own cadence."""
+        if not occurrences:
+            return
+
+        # The backup job is the one that leaves files rather than only lines,
+        # and its log states each file's size -- so the files have to be
+        # written first and the sizes read back from them. A log claiming
+        # 5,412 bytes next to a file of a different size is worse than either
+        # alone, because it proves neither was produced by the other.
+        sizes: dict[datetime, int] = {}
+        if job.script.endswith("/db-backup"):
+            sizes = self._seed_db_backups(occurrences)
+
+        rendered = []
+        for when in occurrences:
+            if when in sizes:
+                tail = f"ok erp-{when.strftime('%Y%m%d-%H%M')}.sql.gz {sizes[when]} bytes"
+            else:
+                # Older than the retention window, so the file it names is
+                # genuinely gone. Nothing can contradict the size.
+                tail = job.seed_tail(self.rng, when)
+            rendered.append(f"{when.strftime('%Y-%m-%d %H:%M:%S')} {tail}\n")
+
+        self.write(job.log, "".join(rendered), mode=job.log_mode, when=occurrences[-1])
+        if job.log_owner != "root:root":
+            self.own(job.log, job.log_owner)
+
+    def _seed_db_backups(self, occurrences: list[datetime]) -> dict[datetime, int]:
+        """Write the dumps the backup job's retention would still be holding.
+
+        Real gzip of the real schema, so an attacker who finds these can
+        gunzip them and read the data they came for. That is the point: a
+        directory of genuine dumps is a better reason to keep digging than any
+        log line, and it costs nothing we were not already shipping.
+        """
+        source = self.path("/opt/db/seed.sql")
+        if not source.exists():
+            return {}
+
+        destination = self.path("/var/backups/mysql")
+        destination.mkdir(parents=True, exist_ok=True)
+        schema = source.read_text(encoding="utf-8")
+
+        sizes: dict[datetime, int] = {}
+        # RETENTION in the script keeps 8; seeding more would leave files the
+        # job itself would have deleted.
+        for when in occurrences[-8:]:
+            target = destination / f"erp-{when.strftime('%Y%m%d-%H%M')}.sql.gz"
+            # mtime inside the gzip header as well as on the file, because
+            # `gunzip -l` prints the header one and a dump stamped with the
+            # build time inside a file stamped three days ago is a mismatch
+            # that only exists in fabricated archives.
+            with gzip.GzipFile(
+                filename=target.name[:-3], mode="wb", fileobj=target.open("wb"),
+                mtime=int(when.timestamp()),
+            ) as handle:
+                # Completion is a few seconds after cron fired it, which is
+                # what the footer of a real dump records -- and is why no two
+                # of these compress to the same length. Seven backups listing
+                # at identical byte counts is its own small tell.
+                completed = when + timedelta(seconds=self.rng.randint(1, 9))
+                handle.write(as_mysqldump(schema, completed).encode("utf-8"))
+            target.chmod(0o600)
+            self.set_time(target, when)
+            sizes[when] = target.stat().st_size
+        self.run("chown", "-R", "root:root", str(destination))
+        self.path("/var/backups/mysql").chmod(0o700)
+        return sizes
 
     def scatter_mtimes(self) -> None:
         """Spread modification times across the seeded period.
@@ -1442,6 +1614,7 @@ def main() -> int:
     renderer.render_homes()
     renderer.render_environment()
     renderer.render_role()
+    renderer.render_ambient()
     renderer.render_history()
     renderer.render_decoys()
     renderer.scatter_mtimes()

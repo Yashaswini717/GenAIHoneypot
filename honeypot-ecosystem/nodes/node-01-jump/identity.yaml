@@ -183,3 +183,25 @@ decoy_chain:
   alternate:
     repo: /home/devuser/projects/erp-backend
     removed_in_commit: true
+
+# Ambient activity: the cron jobs that keep this box doing something while
+# somebody is watching it. Everything else in this file is history, true when
+# the image was built and frozen after it; these are what an attacker sees
+# change if they tail a log or run the same command twice ten minutes apart.
+#
+# The schedule is written in structured fields rather than a cron expression
+# because the same fields generate the crontab line AND the seeded history --
+# a fixed-interval job whose log has irregular gaps before this boot and
+# regular ones after it is a sharper tell than no monitoring at all.
+#
+# Job names come from AMBIENT_JOBS in shared/node-build/ambient.py; asking for
+# one that does not exist fails the build.
+ambient:
+  # Working hours only, matching the timetable the seeded logs follow.
+  - job: disk-report
+    every_minutes: 20
+    hours: "8-20"
+  # Counts the attacker's own session, so what they read is true and includes
+  # them -- the box is measuring them, not performing for them.
+  - job: session-audit
+    every_minutes: 10
