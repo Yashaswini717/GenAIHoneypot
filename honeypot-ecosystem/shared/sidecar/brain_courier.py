@@ -114,6 +114,11 @@ class SessionState:
     session_id: str
     src_ip: str
     sensor: str
+    #: Which experimental arm this attacker is in, as decided by the proxy and
+    #: carried on the event. Read rather than recomputed here so the arm the
+    #: hub records and the arm the courier acts on can never disagree -- two
+    #: independent computations of the same split is a bug waiting to happen.
+    adaptive: bool = True
     commands: list[str] = field(default_factory=list)
     timestamps: list[str] = field(default_factory=list)
     unclassified: int = 0
@@ -247,8 +252,21 @@ class BrainCourier:
                 session_id=session_id,
                 src_ip=event.get("src_ip", ""),
                 sensor=event.get("sensor", ""),
+                adaptive=bool(event.get("adaptive", True)),
             )
             self.sessions[session_id] = state
+
+        # A control-arm attacker gets a static honeypot: the same three nodes,
+        # the same seeded decoys baked into the images, the same credentials,
+        # the same traffic. Nothing is generated or planted for them
+        # mid-session. That difference, and only that difference, is what the
+        # retention comparison measures.
+        #
+        # Tracked from the first event rather than re-derived, because the
+        # event already carries the arm the hub will record the session under.
+        if not state.adaptive:
+            state.last_seen = time.time()
+            return
 
         state.commands.append(command)
         state.timestamps.append(event.get("timestamp", ""))

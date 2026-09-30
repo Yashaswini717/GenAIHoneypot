@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from analytics.retention import (  # noqa: E402
     ENGAGED_MIN_SECONDS,
+    MIN_ARM_VISITS,
     VISIT_GAP_SECONDS,
     build_visits,
     summarise,
@@ -165,3 +166,61 @@ def test_a_gap_exactly_at_the_threshold_stays_one_visit():
 def test_arm_is_carried_onto_the_visit(adaptive):
     visits = build_visits([session("1.2.3.4", 0, 100, adaptive=adaptive)])
     assert visits[0]["adaptive"] is adaptive
+
+
+def test_a_visit_spanning_both_arms_is_flagged_not_absorbed():
+    """The rule that replaced any(), which biased the headline number.
+
+    Flipping the control ratio mid-session gave one address adaptive sessions
+    and then control sessions 11 minutes apart. any() labelled the merged
+    visit adaptive, so the control sessions were counted as adaptive ones and
+    the control arm read as empty -- silently, and in the direction that
+    flatters the claim.
+    """
+    visits = build_visits([
+        session("1.2.3.4", 0, 100, adaptive=True),
+        session("1.2.3.4", 700, 100, adaptive=False),   # same visit, other arm
+    ])
+    assert len(visits) == 1
+    assert visits[0]["mixed_arm"] is True
+    assert visits[0]["adaptive"] is False, "a contaminated visit must not read as adaptive"
+
+
+def test_an_uncontaminated_visit_is_not_flagged():
+    """Negative control: the flag must not fire on ordinary traffic."""
+    for arm in (True, False):
+        visits = build_visits([
+            session("1.2.3.4", 0, 100, adaptive=arm),
+            session("1.2.3.4", 700, 100, sensor="node-02-erp", adaptive=arm),
+        ])
+        assert len(visits) == 1
+        assert visits[0]["mixed_arm"] is False
+        assert visits[0]["adaptive"] is arm
+
+
+def test_arm_change_across_separate_visits_is_not_contamination():
+    """Each visit is judged on its own sessions, not the attacker's history.
+
+    Two visits far enough apart are two clean measurements even if the arm
+    moved between them, so neither should be discarded.
+    """
+    visits = build_visits([
+        session("1.2.3.4", 0, 100, adaptive=True),
+        session("1.2.3.4", VISIT_GAP_SECONDS + 500, 100, adaptive=False),
+    ])
+    assert len(visits) == 2
+    assert [v["mixed_arm"] for v in visits] == [False, False]
+    assert [v["adaptive"] for v in visits] == [True, False]
+
+
+def test_engaged_visits_is_what_the_comparison_floor_counts():
+    """The floor must not be satisfiable by scanner noise.
+
+    MIN_ARM_VISITS is checked against engaged_visits rather than visits, so a
+    handful of connect-and-drops cannot unlock a comparison that has no
+    retention signal behind it at all.
+    """
+    scanners = [session(f"9.9.9.{i}", 0, 1) for i in range(MIN_ARM_VISITS + 3)]
+    s = summarise(build_visits(scanners))
+    assert s["visits"] > MIN_ARM_VISITS
+    assert s["engaged_visits"] == 0, "scanner hits must not count toward the floor"

@@ -14,6 +14,7 @@ from sqlalchemy import text
 
 from analytics.retention import (
     ENGAGED_MIN_SECONDS,
+    MIN_ARM_VISITS,
     VISIT_GAP_SECONDS,
     build_visits,
     summarise,
@@ -44,29 +45,63 @@ async def _fetch_sessions() -> list[dict[str, Any]]:
         return [dict(row) for row in result.mappings().all()]
 
 
-async def _fetch_sessions() -> list[dict[str, Any]]:
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(text(_SESSIONS))
-        return [dict(row) for row in result.mappings().all()]
+def _note(adaptive_n: int, control_n: int, mixed: int) -> str:
+    """Wording for the comparison, including everything that qualifies it."""
+    caveat = (
+        f" {mixed} visit(s) spanned both arms and were excluded — the control "
+        "ratio or salt changed mid-experiment."
+        if mixed else ""
+    )
+    if not control_n:
+        return (
+            "Control arm is empty — assign attackers to both arms before "
+            "drawing any comparison." + caveat
+        )
+    short = [
+        f"{name} has {n}"
+        for name, n in (("adaptive", adaptive_n), ("control", control_n))
+        if n < MIN_ARM_VISITS
+    ]
+    if short:
+        return (
+            f"Too few engaged visits to compare ({', '.join(short)}; "
+            f"{MIN_ARM_VISITS} needed per arm). A ratio from this little "
+            "traffic reflects who happened to connect, not the deception."
+            + caveat
+        )
+    return (
+        "Both arms have enough engaged visits; uplift is the ratio of median "
+        "visit length." + caveat
+    )
 
 
 @router.get("/")
 async def retention() -> dict[str, Any]:
     """Retention overall, and split by experimental arm.
 
-    `by_arm` is the comparison the research claim needs. It only means
-    anything once attackers are actually being assigned to both arms; until
-    then the control arm is empty and `comparable` says so, rather than
-    inviting a conclusion the data cannot support.
+    `by_arm` is the comparison the research claim needs, and `comparable`
+    guards it. Both arms are always reported; the uplift is withheld until
+    each has enough engaged visits to mean anything, because a ratio computed
+    from one or two sessions looks exactly like a finding and is not one.
     """
     visits = build_visits(await _fetch_sessions())
 
-    adaptive = [v for v in visits if v["adaptive"]]
-    control = [v for v in visits if not v["adaptive"]]
+    # A visit that received both treatments belongs to neither arm. Left in,
+    # it would count toward whichever arm it was labelled, which is how a
+    # mid-experiment ratio change quietly biases the result.
+    mixed = [v for v in visits if v["mixed_arm"]]
+    clean = [v for v in visits if not v["mixed_arm"]]
+    adaptive = [v for v in clean if v["adaptive"]]
+    control = [v for v in clean if not v["adaptive"]]
     summary_adaptive = summarise(adaptive)
     summary_control = summarise(control)
 
-    comparable = bool(adaptive) and bool(control)
+    # Both arms must clear the floor. Counted on engaged visits, because a
+    # connect-and-drop carries no retention signal and would let five scanner
+    # hits unlock a comparison.
+    adaptive_n = summary_adaptive["engaged_visits"]
+    control_n = summary_control["engaged_visits"]
+    comparable = adaptive_n >= MIN_ARM_VISITS and control_n >= MIN_ARM_VISITS
     uplift = None
     if comparable and summary_control["median_visit_seconds"] > 0:
         uplift = round(
@@ -78,16 +113,21 @@ async def retention() -> dict[str, Any]:
         "overall": summarise(visits),
         "by_arm": {"adaptive": summary_adaptive, "control": summary_control},
         "comparison": {
-            # Guarded deliberately. A ratio against an empty control arm is
-            # not a rounding error, it is a claim with nothing behind it.
+            # False while either arm is empty or below the floor. The arms'
+            # own figures are still published either way -- what is withheld
+            # is only the ratio, which is the part that reads as a result.
             "comparable": comparable,
             "median_visit_uplift": uplift,
-            "note": (
-                "Both arms populated; uplift is the ratio of median visit length."
-                if comparable else
-                "Control arm is empty — assign attackers to both arms before "
-                "drawing any comparison."
-            ),
+            # Surfaced rather than logged. A non-zero count means the control
+            # ratio or salt moved while attackers were being measured, and
+            # whoever reads the uplift needs to know that before quoting it.
+            "excluded_mixed_arm": len(mixed),
+            # Published so the dashboard can say how far off the comparison is
+            # instead of only that it is unavailable.
+            "min_arm_visits": MIN_ARM_VISITS,
+            "engaged_adaptive": adaptive_n,
+            "engaged_control": control_n,
+            "note": _note(adaptive_n, control_n, len(mixed)),
         },
         "method": {
             "visit_gap_seconds": VISIT_GAP_SECONDS,

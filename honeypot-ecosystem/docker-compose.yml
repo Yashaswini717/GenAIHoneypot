@@ -57,6 +57,18 @@ services:
       PROXY_LISTEN_PORT: 2222
       PROXY_ADVERTISED_PORT: "${PROXY_ADVERTISED_PORT:-22}"
       SENSOR_ID: node-01-jump
+      # The adaptive-vs-static experiment. The proxy assigns each attacker to
+      # an arm and stamps it on every event; the sidecar reads that field
+      # rather than recomputing, so the arm the hub records and the arm the
+      # courier acts on cannot disagree.
+      #
+      # 0.5 gives the most statistical power per attacker seen, which matters
+      # when traffic is the scarce resource. Set 0 to turn the experiment off
+      # and give everyone adaptation. Do NOT change the salt mid-experiment:
+      # it reshuffles every assignment, and attackers already measured under
+      # one arm would silently switch to the other.
+      EXPERIMENT_CONTROL_RATIO: "${EXPERIMENT_CONTROL_RATIO:-0.5}"
+      EXPERIMENT_SALT: "${EXPERIMENT_SALT:-genai-honeypot-v1}"
       BROKER_URL: http://session-broker:8080
       BACKEND_USER: devuser
       BACKEND_KEY_PATH: /run/secrets/backend_key

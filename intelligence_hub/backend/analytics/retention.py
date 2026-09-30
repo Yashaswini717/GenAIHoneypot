@@ -46,6 +46,16 @@ NODE_DEPTH: dict[str, int] = {
 #: between someone leaving and coming back.
 VISIT_GAP_SECONDS = 30 * 60
 
+#: Engaged visits required in *each* arm before the comparison is reported.
+#:
+#: Not a statistical test -- it is the floor below which the ratio is
+#: obviously an artefact. One scripted 40-second control visit against
+#: seventeen hand-driven adaptive ones produced a 24x "uplift" that measured
+#: the operator's typing speed, and nothing in the output said so. Five is
+#: low for a real claim and deliberately so: it blocks the arithmetic that is
+#: meaningless, not the analysis that is merely early.
+MIN_ARM_VISITS = 5
+
 #: Visits shorter than this are a connect-and-drop: a scanner completing a
 #: handshake, not an attacker looking around. Counting them drags every mean
 #: toward zero and hides the effect being measured, so they are reported
@@ -94,11 +104,23 @@ def _close_visit(attacker: str, sessions: list[dict[str, Any]]) -> dict[str, Any
     start = min(s["started_at"] for s in sessions)
     end = max(s["ended_at"] for s in sessions)
     hosts = {s["sensor_id"] for s in sessions if s["sensor_id"]}
+    # Arms present across the visit's sessions. Normally one: assignment is
+    # derived from the address, so an attacker keeps their arm across every
+    # session and every return.
+    arms = {bool(s["adaptive"]) for s in sessions}
     return {
         "attacker": attacker,
-        # A visit is adaptive if adaptation was on for any session in it;
-        # an attacker does not change arm mid-visit in practice.
-        "adaptive": any(s["adaptive"] for s in sessions),
+        # True only when every session in the visit was adaptive. This used to
+        # be any(), which silently relabelled a visit containing both arms as
+        # adaptive -- absorbing control sessions into the adaptive arm and
+        # inflating the one number the thesis rests on, in the flattering
+        # direction, with nothing recording that it happened.
+        "adaptive": arms == {True},
+        # Set when the visit really did receive both treatments, which means
+        # neither arm can claim it. Only reachable by changing the control
+        # ratio or salt mid-experiment; carried out so the comparison can
+        # exclude the visit and report the exclusion rather than absorb it.
+        "mixed_arm": len(arms) > 1,
         "started_at": start,
         "ended_at": end,
         "dwell_seconds": _seconds(end, start),

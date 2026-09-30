@@ -158,7 +158,22 @@ export default function Retention() {
           {cmp.comparable
             ? <><strong style={{ color: ADAPTIVE }}>{cmp.median_visit_uplift}×</strong> median visit length with adaptation on. {cmp.note}</>
             : <><strong>Not yet comparable.</strong> {cmp.note}</>}
+          {!cmp.comparable && cmp.engaged_control > 0 && (
+            <span style={{ color: MUTED }}>
+              {' '}Engaged visits so far: {cmp.engaged_adaptive} adaptive,
+              {' '}{cmp.engaged_control} control, {cmp.min_arm_visits} needed in each.
+            </span>
+          )}
         </div>
+        {/* Shown whenever it is non-zero, next to the number it qualifies.
+            Excluded visits mean the assignment moved while attackers were
+            being measured, which the reader needs before quoting the uplift. */}
+        {cmp.excluded_mixed_arm > 0 && (
+          <div style={{ fontSize: 11, color: '#fbbf24', marginTop: 8 }}>
+            {cmp.excluded_mixed_arm} visit{cmp.excluded_mixed_arm === 1 ? '' : 's'} excluded
+            for spanning both arms.
+          </div>
+        )}
       </div>
 
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
