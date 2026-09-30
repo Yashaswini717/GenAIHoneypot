@@ -24,7 +24,8 @@
 # A separate stage purely so gcc never reaches the final image. The shim makes
 # uname() report the kernel we claim rather than the host's -- without it a
 # container on Docker Desktop answers "6.6.87.2-microsoft-standard-WSL2",
-# contradicting our own motd. See unamed.c.
+# contradicting our own motd, and /proc/uptime reports the host's uptime
+# rather than this container's. See nodeenv.c.
 
 FROM ubuntu:22.04 AS shimbuilder
 
@@ -34,11 +35,11 @@ ARG KERNEL_VERSION="#128-Ubuntu SMP Fri Jul 5 09:28:59 UTC 2026"
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY shared/node-build/unamed.c /tmp/unamed.c
+COPY shared/node-build/nodeenv.c /tmp/nodeenv.c
 RUN gcc -shared -fPIC -O2 -Wall \
         -DFAKE_RELEASE="\"${KERNEL_RELEASE}\"" \
         -DFAKE_VERSION="\"${KERNEL_VERSION}\"" \
-        -o /tmp/libnodeenv.so /tmp/unamed.c -ldl \
+        -o /tmp/libnodeenv.so /tmp/nodeenv.c -ldl \
     && test -s /tmp/libnodeenv.so
 
 
@@ -123,7 +124,10 @@ RUN chmod 0644 /lib/x86_64-linux-gnu/libnodeenv.so \
     && ldconfig \
     && test -z "$(/bin/echo -n 2>&1)" \
     && uname -r | grep -qv microsoft \
-    && echo "uname now reports: $(uname -r)"
+    && echo "uname now reports: $(uname -r)" \
+    && PROC_UP="$(cut -d' ' -f1 /proc/uptime)" \
+    && awk -v u="$PROC_UP" 'BEGIN { if (u+0 <= 0 || u+0 > 86400) { print "FATAL: /proc/uptime reads " u "s, which is the host, not this " "container" > "/dev/stderr"; exit 1 } }' \
+    && echo "/proc/uptime now reports ${PROC_UP}s: this container, not the host"
 
 # The boot script, with its internal narration removed and readable only by
 # root.
