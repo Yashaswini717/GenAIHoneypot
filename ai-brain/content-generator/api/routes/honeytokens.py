@@ -6,6 +6,7 @@ from api.dependencies import get_honeytoken_store
 from api.schemas.requests import HoneytokenCheckRequest
 from api.schemas.responses import HoneytokenCheckResponse, HoneytokenResponse
 from storage.honeytoken_store import HoneytokenStore
+from storage.models import HoneytokenCreate
 from storage.models import HoneytokenResponse as StorageHoneytokenResponse
 
 router = APIRouter(prefix="/api/v1/honeytokens", tags=["honeytokens"])
@@ -25,6 +26,25 @@ def _convert_to_api_response(token: StorageHoneytokenResponse) -> HoneytokenResp
         access_count=token.access_count,
         token_metadata=token.token_metadata,
     )
+
+
+@router.post("/", response_model=HoneytokenResponse, status_code=201)
+async def register_honeytoken(
+    request: HoneytokenCreate,
+    store: HoneytokenStore = Depends(get_honeytoken_store),
+):
+    """Register a decoy value so that using it later trips the tripwire.
+
+    Until this existed the store was populated only as a side effect of LLM
+    content generation, which meant the decoys an attacker actually sees — the
+    sidecar's offline bundles — were never registered at all. Nothing could
+    match them, so `REWARD_HONEYTOKEN_TRIGGERED` was unreachable by
+    construction and the bandit never saw its strongest signal.
+
+    Idempotent on `token_value`: re-planting a bundle, or two bundles sharing a
+    database password, must converge on a single row.
+    """
+    return _convert_to_api_response(store.register_honeytoken(request))
 
 
 @router.get("/", response_model=list[HoneytokenResponse])

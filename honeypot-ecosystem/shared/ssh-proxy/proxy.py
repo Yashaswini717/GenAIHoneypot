@@ -325,11 +325,30 @@ async def handle_session(process: asyncssh.SSHServerProcess) -> None:
     term_type = process.get_terminal_type() or "xterm-256color"
     term_size = process.get_terminal_size() or (80, 24, 0, 0)
 
+    # `ssh host 'command'` must run that command and exit, not open a shell.
+    #
+    # Ignoring process.command meant a non-interactive session was handed an
+    # interactive shell that never exits, so the client hung forever instead of
+    # printing output and returning. A real sshd answers in milliseconds, and
+    # non-interactive SSH is how scripts, scp, rsync and config management all
+    # reach a host -- so the most ordinary automated use of a stolen credential
+    # hung, which is a louder tell than any wrong banner.
+    #
+    # PeerGateway already did this for node-02/03; the perimeter did not.
+    requested = process.command
+    interactive = requested is None
+
     try:
+        if requested:
+            # Emitted here because a one-shot command produces no shell echo
+            # for the reconstructor to recover it from.
+            await emitter.emit(events.command(requested))
+
         async with await _connect_backend_when_ready(backend, username) as backend_conn:
             async with backend_conn.create_process(
-                term_type=term_type,
-                term_size=term_size[:2],
+                requested,
+                term_type=term_type if interactive else None,
+                term_size=term_size[:2] if interactive else None,
                 encoding=None,
             ) as shell:
                 await _pump(process, shell, reconstructor, transcript, events)

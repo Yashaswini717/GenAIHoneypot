@@ -142,12 +142,31 @@ services:
     environment:
       API_PORT: 8000
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
-      # No key configured. The brain still classifies; generation degrades to
-      # the sidecar's offline bundles rather than failing the loop.
+      # Without a key the brain still classifies; generation degrades to the
+      # sidecar's offline bundles rather than failing the loop.
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-    networks: [control]
-    # Not on deception and not on edge: an attacker must never be able to
-    # reach the component that decides what to show them.
+      # Provider and model have to be passed explicitly. Only the key used to
+      # be, so setting OPENAI_BASE_URL or LLM_MODEL in .env changed nothing --
+      # Compose read them for substitution, nothing referenced them, and the
+      # container quietly kept the defaults from config/settings.py. Defaulted
+      # here to those same values so behaviour is unchanged when unset.
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}"
+      # Free model ids on OpenRouter are retired without notice; the previous
+      # default now 404s with "No endpoints found".
+      LLM_MODEL: "${LLM_MODEL:-nex-agi/nex-n2.5-mini:free}"
+    # control reaches the sidecar and broker; uplink is how the model provider
+    # is reached.
+    #
+    # `control` is internal: true, so on it alone this container has no DNS and
+    # no route off the host -- every generation attempt died as "Connection
+    # failed" after three retries, which surfaced as a 503 and looked
+    # indistinguishable from having no API key. Content generation is the one
+    # thing here that needs the internet, so it needs a network that has it.
+    #
+    # Still not on deception and not on edge: an attacker must never be able to
+    # reach the component that decides what to show them, and uplink is
+    # outbound-only, so this does not hand them an egress path either.
+    networks: [control, uplink]
 
   sidecar:
     build:
@@ -184,8 +203,10 @@ services:
 networks:
   edge:
     driver: bridge
-  # Outbound only, and only for the sidecar. Nothing an attacker can reach
-  # joins this network, so it is not a path back into the deception side.
+  # Outbound only. Carries the sidecar's telemetry to the hub and the brain's
+  # calls to the model provider. Nothing an attacker can reach joins this
+  # network -- both members sit on control, which deception has no route to --
+  # so it is not a path back into the deception side, nor a way out of it.
   uplink:
     driver: bridge
   # Shared with the intelligence hub so the sidecar reaches it by name rather

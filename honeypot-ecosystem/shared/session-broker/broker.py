@@ -32,6 +32,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import docker
@@ -365,10 +366,11 @@ def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> int:
     """
     import io
     import tarfile
-    import time as _time
 
     container = _docker.containers.get(container_id)
     written = 0
+    # Read once: every decoy in this container hangs off the same fixed point.
+    anchor = _container_epoch(container)
 
     # Group by directory: put_archive extracts a tar relative to one path.
     by_dir: dict[str, list[tuple[str, str, int]]] = {}
@@ -396,10 +398,7 @@ def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> int:
                 info.mode = mode
                 info.uname = owner
                 info.gname = owner
-                # Timestamps land in the recent past rather than exactly now:
-                # a file whose mtime is the current second, sitting in a home
-                # directory whose other files are months old, is conspicuous.
-                info.mtime = int(_time.time()) - 86400 * 3
+                info.mtime = _decoy_mtime(anchor, container_id, f"{directory}/{name}")
                 archive.addfile(info, io.BytesIO(payload))
         buffer.seek(0)
 
@@ -412,9 +411,104 @@ def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> int:
                 container.exec_run(
                     ["sh", "-c", f"chown {owner}:{owner} {paths}"], user="root"
                 )
-                container.exec_run(["chown", owner, directory], user="root")
+                # Every directory `mkdir -p` had to create, not just the leaf.
+                #
+                # A path like /home/devuser/.config/gh creates BOTH .config and
+                # gh as root, and chowning only the leaf left `.config` sitting
+                # root-owned in a user's home -- the first line of `ls -la ~`,
+                # and exactly the anomaly the comment above is about. Flat
+                # bundles never showed it because they had no intermediate
+                # directories; generated profiles have several.
+                #
+                # Also `owner:owner` rather than a bare `owner`: chown without
+                # a group leaves group root, which `ls -la` prints just as
+                # plainly as a wrong owner does.
+                ancestors = _owned_ancestors(directory, owner)
+                if ancestors:
+                    container.exec_run(
+                        ["sh", "-c", f"chown {owner}:{owner} {' '.join(ancestors)}"],
+                        user="root",
+                    )
 
     return written
+
+
+#: Decoys are dated between these two bounds, in days before now.
+#:
+#: Never newer than the lower bound, because a file whose mtime is the current
+#: second, sitting in a home directory whose other files are months old, is the
+#: thing `ls -lat` puts at the very top. Never older than the upper bound, so
+#: decoys stay inside the window of history the node claims to have
+#: (`identity.yaml` seeds 94 days, and the image's own files run back years).
+_DECOY_AGE_MIN_DAYS = 3
+_DECOY_AGE_MAX_DAYS = 180
+
+
+def _decoy_mtime(anchor: int, container_id: str, path: str) -> int:
+    """A plausible, stable modification time for one decoy.
+
+    Two properties matter, and a fixed `now - 3 days` had neither.
+
+    Spread: every file planted in a session used to share an mtime to the
+    second. Half a dozen files stamped identically, among neighbours dated
+    across months and years, is a cluster `ls -lat` surfaces immediately -- and
+    it reads as exactly what it is, a batch written by one process.
+
+    Stability: `anchor` is the container's creation time, not the current time.
+    Anchoring to now would keep the *relative* age fixed while the absolute
+    mtime crept forward, so an attacker returning two days later would find
+    every decoy's timestamp had moved two days with them. A file whose mtime
+    changes between two logins is a far louder tell than one that merely looks
+    recent, and letting them come back to their own environment is the whole
+    reason the container is kept.
+
+    Keying on the container as well as the path means two attackers do not see
+    identical timestamps on identical decoys, which is what separate machines
+    would look like.
+    """
+    digest = hashlib.sha256(f"{container_id}:{path}".encode()).digest()
+    span = (_DECOY_AGE_MAX_DAYS - _DECOY_AGE_MIN_DAYS) * 86400
+    offset = _DECOY_AGE_MIN_DAYS * 86400 + int.from_bytes(digest[:6], "big") % span
+    return anchor - offset
+
+
+def _container_epoch(container: Any) -> int:
+    """When this container was created, as a Unix timestamp.
+
+    The stable reference decoy timestamps hang off. Docker reports nanosecond
+    precision, which `fromisoformat` will not parse, so the fraction is
+    truncated to microseconds.
+    """
+    try:
+        created = container.attrs["Created"]
+        head, _, frac = created.partition(".")
+        if frac:
+            created = f"{head}.{frac.rstrip('Z')[:6]}+00:00"
+        else:
+            created = f"{head.rstrip('Z')}+00:00"
+        return int(datetime.fromisoformat(created).timestamp())
+    except Exception:
+        log.debug("could not read container creation time; anchoring to now", exc_info=True)
+        return int(time.time())
+
+
+def _owned_ancestors(directory: str, owner: str) -> list[str]:
+    """Directories between the owner's home and `directory`, inclusive.
+
+    `/home/devuser/.config/gh` yields `/home/devuser/.config` and
+    `/home/devuser/.config/gh`. The home directory itself is left alone: it
+    exists in the image, already has the right owner, and rewriting it would be
+    one more mtime that moved for no reason a reader could explain.
+    """
+    parts = [p for p in directory.split("/") if p]
+    if len(parts) < 3 or parts[0] != "home" or parts[1] != owner:
+        return []
+    home = f"/home/{owner}"
+    out, current = [], home
+    for segment in parts[2:]:
+        current = f"{current}/{segment}"
+        out.append(current)
+    return out
 
 
 def _owner_for(directory: str) -> str:

@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.middleware import RequestLoggingMiddleware, error_handler
-from api.routes import adaptive, generate, health, honeytokens, populate
+from api.routes import adaptive, decoys, generate, health, honeytokens, populate
 from api.routes.intent_classification import router as intent_classification_router
 from config.logging_config import setup_logging
 from config.settings import settings
@@ -49,6 +49,11 @@ app.include_router(generate.router)
 app.include_router(populate.router)
 app.include_router(honeytokens.router)
 app.include_router(adaptive.router)
+# Returns generated decoy content instead of writing it to this container's own
+# filesystem, which is where the background populate in /intent-classify sent it
+# — somewhere no attacker could ever reach. The sidecar calls this and plants
+# the result through the broker.
+app.include_router(decoys.router)
 # NOTE: previously this router was only mounted in the unused api/phase3_main.py
 # entrypoint, so /intent-classify (and therefore the decision engine, adaptive
 # or not) was never actually reachable from the deployed app (Dockerfile runs

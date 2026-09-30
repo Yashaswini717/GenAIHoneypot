@@ -75,15 +75,16 @@ class IntentClassificationResponse(BaseModel):
     )
     deployment_triggered: bool = Field(
         default=False,
-        description="Whether the chosen action's decoy profile was scheduled for real "
-        "generation/deployment via the population pipeline. Only happens when the caller "
-        "provides metadata.honeypot_id; runs as a background task, not synchronously, "
-        "since a full population can take several minutes.",
+        description="Always false. This endpoint used to schedule a background populate, "
+        "but that wrote into the brain container's own filesystem, which no attacker can "
+        "reach. Generation moved to POST /api/v1/decoys/generate, which returns the files "
+        "to a caller that can place them. Retained so existing clients do not break.",
     )
     deployment_profile: Optional[str] = Field(
         default=None,
         description="The populate profile (developer_workstation/production_server/"
-        "database_server/web_server) the chosen action mapped to, if deployment was triggered.",
+        "database_server/web_server) the chosen action maps to. Reported so a caller can "
+        "fetch the matching content without a second round trip.",
     )
 
     @field_validator("intent")
