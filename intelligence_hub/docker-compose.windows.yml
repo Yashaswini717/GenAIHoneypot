@@ -1,0 +1,56 @@
+# Running the hub on its own Windows PC, with the honeypot on another machine
+# on the same LAN streaming signed events to it over port 8000.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.windows.yml up -d --build
+#
+# setup-windows.ps1 runs exactly that, after opening the firewall. Naming the
+# files explicitly also keeps a stray docker-compose.override.yml -- the Linux
+# dev box's, tuned for a disk and host ports this PC does not have -- out of it.
+#
+# Two things change from the base file.
+#
+# Ports. The base publishes every database on every interface. Elasticsearch
+# runs with security disabled and Redis has no password, so on a PC that other
+# machines can reach, that is an open database on the LAN. Only the backend
+# (8000, where the sidecar posts) and the dashboard (5173) need to be reachable
+# from outside. Elasticsearch and Neo4j stay on 127.0.0.1 for curl or the Neo4j
+# browser on this PC. Postgres and Redis are not published at all: nothing
+# outside the compose network talks to them, and a local install already on
+# 5432 or 6379 would make the publish fail.
+#
+# Memory. The same ceilings that kept this stack alive on a 7.5 GB Linux box,
+# about 2.8 GB in total. Neo4j sizes itself from the VM's RAM rather than from
+# its container limit, so its heap and page cache are pinned too -- a mem_limit
+# alone just turns that overreach into an OOM kill.
+
+services:
+  elasticsearch:
+    ports: !override
+      - "127.0.0.1:9200:9200"
+    environment:
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+    mem_limit: 768m
+
+  postgres:
+    ports: !reset []
+    mem_limit: 256m
+
+  redis:
+    ports: !reset []
+    mem_limit: 128m
+
+  neo4j:
+    ports: !override
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      - NEO4J_server_memory_heap_initial__size=256m
+      - NEO4J_server_memory_heap_max__size=256m
+      - NEO4J_server_memory_pagecache_size=128m
+    mem_limit: 640m
+
+  backend:
+    mem_limit: 512m
+
+  frontend:
+    mem_limit: 512m
