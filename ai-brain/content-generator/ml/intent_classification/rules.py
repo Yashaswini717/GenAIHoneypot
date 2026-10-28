@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from core.intent_taxonomy import INTENT_CLASSES
+from core.intent_taxonomy import INTENT_CLASSES, KILL_CHAIN_ORDER
 
 
 @dataclass
@@ -118,4 +118,27 @@ def detect_intent_by_rules(activity: dict[str, Any]) -> RuleMatch | None:
             matched_rules=scored_rules[top_intent],
         )
 
+
+    # A tie used to abstain, handing the decision to the model. That is the
+    # wrong default: a tie means two intents BOTH have hard evidence, which
+    # is more information than the model gets, not less -- and abstaining
+    # was by far the most common path, so most classifications came from the
+    # weakest component. `sudo -l` followed by `ssh host` scored 1-1 and fell
+    # through to a 0.43-confidence guess of privilege_escalation, when both
+    # rules had fired correctly and the attacker was plainly moving laterally.
+    #
+    # Ties are broken by kill-chain depth. An attacker who has escalated and
+    # is now reaching for another host is further along than one who has only
+    # escalated, and the later stage better describes what they are doing now.
+    # Confidence sits below the clean-signal band so a contested call never
+    # outranks an uncontested one.
+    if top_count >= 1 and top_count == second_count:
+        tied = [intent for intent, count in counts.items() if count == top_count]
+        deepest = max(tied, key=lambda intent: KILL_CHAIN_ORDER.get(intent, 0))
+        label = 'tiebreak:kill_chain_depth(' + '|'.join(sorted(tied)) + ')'
+        return RuleMatch(
+            intent=deepest,
+            confidence=0.65,
+            matched_rules=scored_rules[deepest] + [label],
+        )
     return None

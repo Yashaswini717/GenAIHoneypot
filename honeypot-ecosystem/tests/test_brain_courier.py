@@ -22,6 +22,8 @@ import json
 import sys
 from pathlib import Path
 
+import time
+
 import httpx
 import pytest
 
@@ -33,6 +35,7 @@ from brain_courier import (  # noqa: E402
     BUNDLE_TOKENS,
     CLASSIFY_WINDOW,
     DECOY_BUNDLES,
+    OBSERVATION_GRACE,
     BrainCourier,
     SessionState,
     _extract_tokens,
@@ -181,17 +184,52 @@ GENERATED = {
 # --------------------------------------------------------------------------
 
 
-def test_short_session_still_resolves_its_decision():
-    """Two commands then a disconnect: the classic case that used to leak."""
+def test_decoy_the_attacker_never_saw_is_not_scored_as_a_failure():
+    """Two commands then an immediate disconnect.
+
+    This used to resolve as `session_terminated`, reward 0.0. That was wrong,
+    and measurably so: `serve_fake_network_map` reached a 0.300 posterior over
+    four trials in which the session ended within a second of the plant. The
+    bandit had concluded the action did not work; what actually happened is
+    that nobody was there to see it.
+
+    Within OBSERVATION_GRACE the decision is left pending instead. Unresolved
+    means no observation, which is the honest record. The arm keeps its
+    selection count and its posterior is untouched.
+    """
     rec = Recorder()
     courier = build_courier(rec)
 
     drive(courier, [command("s1", "whoami"), command("s1", "uname -a"), closed("s1")])
 
     assert "/api/v1/intent-classify" in rec.paths(), "the session should have been classified"
+    assert rec.feedback() == [], "an unseen decoy must not be scored at all"
+    assert courier.resolved == 0
+
+
+def test_a_decoy_that_was_on_screen_long_enough_still_resolves():
+    """The guard must be narrow, or pending decisions accumulate forever.
+
+    Past the grace window the attacker had the opportunity to encounter the
+    decoy, so leaving without acting is real evidence and is scored.
+    """
+    rec = Recorder()
+    courier = build_courier(rec)
+
+    state = SessionState(session_id="s9", src_ip="10.0.0.9", sensor="node-01-jump")
+    state.pending_decision = "dec-9"
+    state.pending_since = time.time() - (OBSERVATION_GRACE + 1)
+    state.unclassified = 0          # they did nothing after it was planted
+
+    async def run() -> None:
+        await courier._resolve_on_close(state, reason="closed")
+        await courier.client.aclose()
+
+    asyncio.run(run())
+
     feedback = rec.feedback()
     assert len(feedback) == 1, f"expected exactly one resolution, got {rec.paths()}"
-    assert feedback[0]["session_id"] == "s1"
+    assert feedback[0]["session_id"] == "s9"
     assert feedback[0]["signal"] == "session_terminated"
     assert courier.resolved == 1
 

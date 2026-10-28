@@ -93,6 +93,20 @@ MIN_CLASSIFY_INTERVAL = 1.5
 #: ambiguous line.
 CLASSIFY_WINDOW = 3
 
+#: How long an attacker needs to plausibly have seen a decoy before its
+#: absence of effect means anything.
+#:
+#: A decoy is written into the filesystem; the attacker only encounters it if
+#: they look. When a session ends seconds after a plant, nothing was learned
+#: about that action -- but the bandit was being told the action FAILED, which
+#: is a different and much stronger claim. `serve_fake_network_map` fell to a
+#: 0.300 posterior over four trials that way, having never actually been shown
+#: to anyone long enough to matter.
+#:
+#: Below this, the decision is left pending instead: unresolved means no
+#: observation, which is what actually happened.
+OBSERVATION_GRACE = 25.0
+
 #: Sessions we stop tracking after this long idle, so a long-running sidecar
 #: does not accumulate state for every attacker it has ever seen.
 SESSION_TTL = 3600
@@ -125,6 +139,9 @@ class SessionState:
     last_classified: float = 0.0
     last_seen: float = field(default_factory=time.time)
     pending_decision: str | None = None
+    #: When the pending decision's decoy was planted, so session close can
+    #: tell an action that failed from one that was never seen.
+    pending_since: float = 0.0
     last_intent: str | None = None
     deployed_actions: set[str] = field(default_factory=set)
     #: Decoy values this session has already been caught using. Reported once
@@ -301,6 +318,7 @@ class BrainCourier:
         action = decision.get("action")
         state.last_intent = intent
         state.pending_decision = decision.get("decision_id")
+        state.pending_since = time.time()
 
         log.info(
             "session %s: intent=%s action=%s confidence=%.2f (%s)",
@@ -650,6 +668,29 @@ class BrainCourier:
             return
 
         engaged = state.unclassified > 0
+        # Unknown plant time resolves as before. Treating it as 'just planted'
+        # would silence the feedback for every state that predates this field,
+        # including a session expiring after an hour idle -- which is the one
+        # case where we are most certain the decoy was there to be seen.
+        shown_for = (
+            time.time() - state.pending_since if state.pending_since else float("inf")
+        )
+
+        # An attacker who did nothing after the decoy and left within the grace
+        # window never encountered it. Reporting that as a failure teaches the
+        # bandit that the action does not work, when nothing was observed at
+        # all. Leaving the decision pending is the honest record: the arm keeps
+        # its selection count and its posterior is left untouched.
+        if not engaged and shown_for < OBSERVATION_GRACE:
+            log.info(
+                "session %s %s: decision left unresolved - decoy was planted "
+                "%.1fs before the session ended, so nothing was observed",
+                state.session_id,
+                reason,
+                shown_for,
+            )
+            return
+
         signal = "session_continued" if engaged else "session_terminated"
 
         try:
