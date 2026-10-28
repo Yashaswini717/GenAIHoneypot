@@ -84,6 +84,18 @@ export default function AttackMap() {
 
   return (
     <div>
+      <style>{`
+        .map-dark-tiles {
+          filter: invert(1) hue-rotate(180deg) brightness(0.92)
+                  contrast(0.88) saturate(0.55);
+        }
+        .leaflet-container { background: #0f1117; }
+        .leaflet-control-attribution {
+          background: rgba(20,24,36,.85) !important;
+          color: #64748b !important;
+        }
+        .leaflet-control-attribution a { color: #60a5fa !important; }
+      `}</style>
       <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>Attack Map</h2>
       <div style={{ fontSize: 12, color: MUTED, marginBottom: 14 }}>
         {located.length} located {located.length === 1 ? 'attacker' : 'attackers'}
@@ -120,11 +132,24 @@ export default function AttackMap() {
           center={[20, 0]}
           zoom={2}
           worldCopyJump
+          minZoom={2}
+          maxBounds={[[-85, -180], [85, 180]]}
+          maxBoundsViscosity={1}
+          // The wheel belongs to the page. With zoom on it, scrolling down to
+          // the internal-sources list zoomed the map out to a tiled strip of
+          // repeated worlds instead. The +/- control still zooms.
+          scrollWheelZoom={false}
           style={{ height: '100%', width: '100%', background: '#0f1117' }}
         >
+          {/* OpenStreetMap, not CARTO. CARTO's basemaps now return tiles
+              stamped API KEY REQUIRED, which is what the map had been showing
+              instead of a world. OSM needs no key; it is light, so it is
+              inverted in CSS to match the dashboard rather than swapped for
+              another provider that could start demanding a key too. */}
           <TileLayer
-            url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-            attribution='&copy; CartoDB · IP data &copy; <a href="https://db-ip.com">DB-IP</a>'
+            url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+            className="map-dark-tiles"
+            attribution='&copy; OpenStreetMap contributors · IP data &copy; <a href="https://db-ip.com">DB-IP</a>'
           />
           {located.map((a) => (
             <CircleMarker
