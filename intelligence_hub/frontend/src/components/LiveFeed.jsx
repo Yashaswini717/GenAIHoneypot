@@ -7,8 +7,14 @@ function scoreBadge(score) {
   return <span className="badge badge-low">{score}</span>
 }
 
+// Through Vite's /ws proxy on whichever host served this page. A hardcoded
+// localhost:8000 only worked when the browser ran on the hub's own machine --
+// opened from another PC on the LAN, localhost is that PC, and the feed
+// silently never connected.
+const FEED_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/feed`
+
 export default function LiveFeed() {
-  const { messages, connected } = useWebSocket('ws://localhost:8000/ws/feed')
+  const { messages, connected } = useWebSocket(FEED_URL)
 
   return (
     <div>

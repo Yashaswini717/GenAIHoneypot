@@ -57,7 +57,9 @@ export default function IngestLogs() {
       setProgress(pct)
 
       try {
-        const res = await fetch('http://localhost:8000/ingest/batch', {
+        // Same-origin through Vite's /api proxy, like every other panel, so it
+        // works from any PC that can open the dashboard and needs no CORS entry.
+        const res = await fetch('/api/ingest/batch', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body,
