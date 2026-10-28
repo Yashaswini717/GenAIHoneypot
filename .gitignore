@@ -109,3 +109,11 @@ package-lock.json
 Thumbs.db
 *.zip
 geoip/*.mmdb
+
+# City geolocation database for the attack map. ~127 MB unpacked, which is over
+# GitHub's file limit, and it is a redistributable build rather than our source.
+# The existing `geoip/*.mmdb` above contains a slash, so git anchors it to the
+# repository root and it never matched the real location.
+# See intelligence_hub/geoip/README.md to fetch it.
+intelligence_hub/geoip/*.mmdb
+intelligence_hub/geoip/*.mmdb.gz

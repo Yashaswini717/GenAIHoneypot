@@ -7,6 +7,7 @@ from websocket.feed import redis_listener
 
 from config import settings
 from database.elastic import init_elasticsearch
+from enrichment.geoip import init_geoip
 from database.postgres import init_postgres
 from database.neo4j import init_neo4j
 from ingest.receiver import router as ingest_router
@@ -20,6 +21,7 @@ from websocket.feed import router as ws_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_geoip()
     await init_elasticsearch()
     await init_postgres()
     await init_neo4j()
