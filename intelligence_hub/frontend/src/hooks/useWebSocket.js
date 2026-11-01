@@ -6,15 +6,27 @@ export default function useWebSocket(url) {
   const ws = useRef(null)
 
   useEffect(() => {
-    function connect() {
-      ws.current = new WebSocket(url)
+    // Set on cleanup. Closing the socket there used to fire onclose, whose
+    // reconnect opened a new socket after the component had gone: React's
+    // StrictMode mounts twice in development, so two sockets stayed live and
+    // every event was shown twice, and each return to the page leaked another.
+    let disposed = false
+    let retry = null
 
-      ws.current.onopen = () => setConnected(true)
-      ws.current.onclose = () => {
-        setConnected(false)
-        setTimeout(connect, 3000)
+    function connect() {
+      const socket = new WebSocket(url)
+      ws.current = socket
+
+      socket.onopen = () => {
+        if (!disposed) setConnected(true)
       }
-      ws.current.onmessage = (e) => {
+      socket.onclose = () => {
+        if (disposed) return
+        setConnected(false)
+        retry = setTimeout(connect, 3000)
+      }
+      socket.onmessage = (e) => {
+        if (disposed) return
         try {
           const data = JSON.parse(e.data)
           if (data.type === 'ping') return
@@ -23,7 +35,11 @@ export default function useWebSocket(url) {
       }
     }
     connect()
-    return () => ws.current?.close()
+    return () => {
+      disposed = true
+      clearTimeout(retry)
+      ws.current?.close()
+    }
   }, [url])
 
   return { messages, connected }

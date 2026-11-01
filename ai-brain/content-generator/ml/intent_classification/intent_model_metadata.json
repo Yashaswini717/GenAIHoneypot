@@ -113,6 +113,56 @@
         "macro_f1": 0.963,
         "coverage": 1.0
       }
+    },
+    "holdout": {
+      "rules": {
+        "windows": 509,
+        "accuracy": 0.705,
+        "accuracy_ci95": [
+          0.664,
+          0.743
+        ],
+        "informative_accuracy": 0.859,
+        "macro_f1": 0.868,
+        "coverage": 0.766,
+        "traffic_weighted_accuracy": 0.764
+      },
+      "ml": {
+        "windows": 509,
+        "accuracy": 0.668,
+        "accuracy_ci95": [
+          0.626,
+          0.707
+        ],
+        "informative_accuracy": 0.789,
+        "macro_f1": 0.561,
+        "coverage": 1.0,
+        "traffic_weighted_accuracy": 0.699
+      },
+      "hybrid": {
+        "windows": 509,
+        "accuracy": 0.758,
+        "accuracy_ci95": [
+          0.719,
+          0.794
+        ],
+        "informative_accuracy": 0.9,
+        "macro_f1": 0.693,
+        "coverage": 1.0,
+        "traffic_weighted_accuracy": 0.815
+      },
+      "session": {
+        "windows": 509,
+        "accuracy": 0.768,
+        "accuracy_ci95": [
+          0.73,
+          0.803
+        ],
+        "informative_accuracy": 0.892,
+        "macro_f1": 0.78,
+        "coverage": 1.0,
+        "traffic_weighted_accuracy": 0.815
+      }
     }
   }
 }
