@@ -232,6 +232,9 @@ _DOMAIN = re.compile(
     r"shop|live|space|icu|buzz|cyou|fun|store|tech|vip|win|bid|cf|ga|gq|ml)(?![\w-])",
     re.IGNORECASE,
 )
+#: A dotted name followed by a path is a host whatever its TLD (`wget
+#: site.es/x`). A path's own dotted parts (/etc/rc.d/...) start after a slash.
+_HOST_BEFORE_PATH = re.compile(r"(?<![\w./@:-])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?=/)")
 _RESERVED_NAMES = ("example.com", "example.net", "example.org", ".example", ".test", ".invalid", ".localhost")
 _SSH_KEY = re.compile(r"((?:ssh-(?:rsa|dss|ed25519)|ecdsa-sha2-nistp\d+|sk-ssh-ed25519@openssh\.com)\s+)AAAA[0-9A-Za-z+/]+=*")
 _ENCODED_BLOB = re.compile(r"[A-Za-z0-9+/]{100,}=*")
@@ -272,6 +275,7 @@ def scrub(command: str) -> str:
     command = _HEX_ESCAPES.sub(lambda m: f"{m.group()[:32]}_TRUNCATED_{len(m.group()) // 4}", command)
     command = _URL_HOST.sub(lambda m: m.group("lead") + _scrub_name(m.group("host")), command)
     command = _DOMAIN.sub(lambda m: _scrub_name(m.group()), command)
+    command = _HOST_BEFORE_PATH.sub(lambda m: _scrub_name(m.group()), command)
     return _IPV4.sub(_scrub_address, command)
 
 

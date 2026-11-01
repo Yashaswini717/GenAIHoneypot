@@ -35,17 +35,21 @@ from ml.intent_classification.pipeline import DEFAULT_MODEL_TYPE, MODEL_PATH, st
 #:   hybrid, stateless                             0.922 / 0.943
 #:   model alone                                   0.935 / 0.830
 #: Test now holds both retired holdouts: v1 (0.844 stateless, 32 windows) and
-#: v2 (0.841 stateless, 0.861 with session context, 151 windows). There is no
-#: holdout floor until a fresh holdout has been scored; it gets one then, set
-#: just under what it measured. The original classifier scored 0.481 dev and
-#: 0.522 test on the first sets.
+#: v2 (0.841 stateless, 0.861 with session context, 151 windows). Holdout v3
+#: is 30 real SSH sessions from the CyberLab honeynet (captured_sessions.json,
+#: 509 windows), labelled by the rules' author before it was scored once:
+#: session 0.768, hybrid 0.758, model 0.668 (0.815 traffic-weighted). The
+#: original classifier scored 0.481 dev and 0.522 test on the first sets.
 FLOORS = {
     ("dev", "session"): 0.90,
     ("test", "session"): 0.95,
+    ("holdout", "session"): 0.75,
     ("dev", "hybrid"): 0.90,
     ("test", "hybrid"): 0.93,
+    ("holdout", "hybrid"): 0.74,
     ("dev", "ml"): 0.90,
     ("test", "ml"): 0.82,
+    ("holdout", "ml"): 0.65,
 }
 
 
