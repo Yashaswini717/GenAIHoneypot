@@ -408,8 +408,9 @@ Geo enrichment silently no-ops without a GeoLite2 database. Drop
 - Sessions uploaded through Ingest Logs **before** uploads were tagged cannot
   be told apart from sensor sessions, so they still count toward retention.
   Only clearing that data removes them.
-- Nothing is internet-exposed yet. See the pre-launch checklist in the build
-  plan before that changes.
+- Nothing is internet-exposed yet. `deploy/aws/README.md` walks through doing
+  it safely: the honeypot on port 22, the hub private, attacker nodes under
+  gVisor, and a `check` that verifies all of it on the server.
 
 ---
 
