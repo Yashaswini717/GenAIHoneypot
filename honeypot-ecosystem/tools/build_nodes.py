@@ -20,7 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 #: Extra apt packages per node. The base image deliberately ships no compiler,
 #: so nothing here should reintroduce one.
 EXTRA_PACKAGES = {
-    "node-01-jump": "",
+    # node-01's identity declares a metrics exporter on :9100 and its seeded
+    # syslog records the exporter starting. Nothing was listening there, so
+    # `ss -tlnp` contradicted the logs in one command. Installing the real
+    # Debian package is cheaper than maintaining a convincing fake: a genuine
+    # Go binary, genuine /proc-derived metrics, genuine port.
+    "node-01-jump": "prometheus-node-exporter",
     # mariadb-client is not optional: this node's whole role is talking to
     # db-01, and its own settings.py names the host. An app server with no
     # database client is a contradiction an attacker sees the moment they

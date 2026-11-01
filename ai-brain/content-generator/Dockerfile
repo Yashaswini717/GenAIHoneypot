@@ -12,7 +12,9 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 
 # Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# --timeout/--retries because the build failed on a transient PyPI read
+# timeout, which on a slow link is the normal case rather than the rare one.
+RUN pip install --no-cache-dir --timeout 120 --retries 10 -r requirements.txt
 
 # Copy application code
 COPY . .

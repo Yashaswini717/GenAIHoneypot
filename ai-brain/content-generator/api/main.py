@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -6,16 +7,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.middleware import RequestLoggingMiddleware, error_handler
 from api.routes import adaptive, decoys, generate, health, honeytokens, populate
 from api.routes.intent_classification import router as intent_classification_router
-from config.logging_config import setup_logging
+from config.logging_config import get_logger, setup_logging
 from config.settings import settings
 from core.exceptions import ContentGeneratorError
 from api.intent import router as intent_router
+from ml.intent_classification.predict import get_intent_classifier
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     # Startup
     setup_logging()
+    # Load the intent model now rather than inside the first attacker's
+    # classification. Failure is logged, not fatal: the route retries the load.
+    try:
+        await asyncio.to_thread(get_intent_classifier)
+    except Exception as exc:  # pragma: no cover - surfaced in the log
+        get_logger(__name__).error("intent_model_warmup_failed", error=str(exc))
     yield
     # Shutdown
     pass

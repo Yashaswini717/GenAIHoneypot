@@ -1,0 +1,20 @@
+# Linux containers are built from this tree on Windows workstations, and CRLF
+# has already cost this project a day once: a CRLF shebang makes the kernel
+# look for an interpreter named "/bin/bash\r", and the container dies with
+# exit 127 and an error that points at the script rather than its line endings.
+#
+# Nothing here has a shebang today. This exists so that the first shell script
+# somebody adds does not reintroduce it.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.jsx   text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.sql   text eol=lf
+*.sh    text eol=lf
+Dockerfile text eol=lf
+
+*.png   binary
+*.mmdb  binary

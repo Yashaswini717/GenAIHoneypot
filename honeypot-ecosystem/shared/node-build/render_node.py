@@ -22,6 +22,7 @@ Run at image build time:
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import random
@@ -34,6 +35,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from ambient import AMBIENT_JOBS, Schedule, as_mysqldump  # noqa: E402
 from seed_history import (  # noqa: E402
     LoginRecord,
     scatter_events,
@@ -46,6 +48,19 @@ from seed_history import (  # noqa: E402
 #: change every build is one whose "history" is obviously synthetic to anyone
 #: who sees two versions of it.
 SEED = 0x9E3779B9
+
+#: The proxy's public key, staged by the node Dockerfile for the build only.
+BACKEND_PUBKEY = Path("/tmp/build/backend_key.pub")
+
+#: Root-owned keys sshd reads as well as each user's own ~/.ssh/authorized_keys.
+#: The proxy's key lives here, where the account it logs in as cannot touch it.
+CENTRAL_KEYS_DIR = "/etc/ssh/authorized_keys"
+
+#: Bytes nginx logs for a GET / against the portal. Measured against the
+#: running node rather than guessed: the seeded availability-probe lines carry
+#: this size, and a response size in the access log that does not match what
+#: the portal actually serves is checkable with one curl.
+_PORTAL_INDEX_BYTES = 386
 
 
 class NodeRenderer:
@@ -73,6 +88,76 @@ class NodeRenderer:
 
     # -- helpers -----------------------------------------------------------
 
+    #: Filled by measure(), which reads the build host's filesystem once.
+    _facts: dict[str, int] | None = None
+
+    def measure(self) -> dict[str, int]:
+        """Facts about the filesystem this image is being built on.
+
+        Three places used to state the disk usage of / and all three disagreed:
+        the motd said 61.4%, the seeded monitoring log said 44%, and `df` on the
+        running container said 2%. The last one is the only one an attacker can
+        check against the others, and the live monitoring job reports it -- so
+        the first line after boot stepped from 44% to 2% in a log whose whole
+        purpose is having no seam at the boot.
+
+        Measured once here and used everywhere, so all three agree on whatever
+        host the image is built on. On a container over a nearly empty host
+        disk that means the box reads as nearly empty, which is honest; on the
+        VPS this deploys to it will read as that disk.
+        """
+        if self._facts is None:
+            self._facts = {
+                "disk_used_pct": self._df_percent(["df", "-P", "/"]),
+                "inodes_used_pct": self._df_percent(["df", "-Pi", "/"]),
+                "disk_total_gb": self._df_total_gb(),
+                "memory_used_pct": self._memory_percent(),
+            }
+        return self._facts
+
+    @staticmethod
+    def _df_total_gb() -> float:
+        """Size of / in GB, for the banner that used to claim a fixed 78.21."""
+        try:
+            output = subprocess.run(
+                ["df", "-PBM", "/"], check=True, capture_output=True, text=True
+            ).stdout
+            return int(output.splitlines()[1].split()[1].rstrip("M")) / 1024
+        except (subprocess.CalledProcessError, IndexError, ValueError, OSError):
+            return 78.21
+
+    @staticmethod
+    def _memory_percent() -> int:
+        """Used memory as a percentage, from /proc/meminfo.
+
+        A frozen figure in a static banner drifts from reality the moment the
+        box does anything -- on a real Ubuntu host this line is recomputed by
+        update-motd at every login, and ours cannot be because those scripts
+        were removed for printing the host kernel. Measured at build is the
+        floor: it is at least the right order of magnitude for this machine
+        rather than a number typed into a template.
+        """
+        try:
+            values: dict[str, int] = {}
+            with open("/proc/meminfo", encoding="utf-8") as handle:
+                for line in handle:
+                    key, _, rest = line.partition(":")
+                    values[key] = int(rest.strip().split()[0])
+            total = values["MemTotal"]
+            available = values.get("MemAvailable", values.get("MemFree", 0))
+            return max(1, min(99, round((total - available) * 100 / total)))
+        except (OSError, KeyError, IndexError, ValueError, ZeroDivisionError):
+            return 34
+
+    @staticmethod
+    def _df_percent(command: list[str]) -> int:
+        """The Use% column, or a plausible default if df cannot be read."""
+        try:
+            output = subprocess.run(command, check=True, capture_output=True, text=True).stdout
+            return int(output.splitlines()[1].split()[4].rstrip("%"))
+        except (subprocess.CalledProcessError, IndexError, ValueError, OSError):
+            return 41
+
     def path(self, *parts: str) -> Path:
         return self.root.joinpath(*[p.lstrip("/") for p in parts])
 
@@ -84,6 +169,22 @@ class NodeRenderer:
         if when is not None:
             self.set_time(destination, when)
         return destination
+
+    def own(self, target: str, owner: str) -> None:
+        """chown a rendered file, for the daemons that cannot write as root.
+
+        rsyslogd drops privileges to the `syslog` user and only then opens its
+        log files, so a seeded log left at root:root 0640 locks it out and
+        every live line is silently discarded -- no error, no fallback, the
+        box simply stops logging the moment it boots.
+
+        Note that nginx does not need this: its master stays root, opens the
+        log files itself, and hands the descriptors to workers that have
+        already dropped to www-data. Same-looking ownership, different
+        outcome, which is why this is applied per daemon rather than to
+        everything under /var/log.
+        """
+        self.run("chown", owner, str(self.path(target)))
 
     def set_time(self, target: Path, when: datetime) -> None:
         stamp = when.timestamp()
@@ -161,8 +262,11 @@ class NodeRenderer:
             f"  System information as of {self.now.strftime('%a %d %b %Y %I:%M:%S %p IST')}\n"
             "\n"
             "  System load:  0.08              Processes:             118\n"
-            f"  Usage of /:   61.4% of 78.21GB  Users logged in:       0\n"
-            "  Memory usage: 34%               IPv4 address for eth0: 10.60.0.11\n"
+            # Measured, not stated. This read 61.4% while the seeded
+            # monitoring log said 44% and df on the running box said 2%:
+            # three numbers for one filesystem, one of them checkable.
+            f"  Usage of /:   {self.measure()['disk_used_pct']}.{self.rng.randint(1, 9)}% of {self.measure()['disk_total_gb']:.2f}GB  Users logged in:       0\n"
+            f"  Memory usage: {self.measure()['memory_used_pct']}%               IPv4 address for eth0: 10.60.0.11\n"
             "  Swap usage:   0%\n"
             "\n"
             # ASCII only. The motd is rendered by a terminal whose encoding we
@@ -179,8 +283,9 @@ class NodeRenderer:
     # -- accounts ----------------------------------------------------------
 
     def render_users(self) -> None:
-        pubkey = Path("/tmp/build/backend_key.pub")
+        pubkey = BACKEND_PUBKEY
         authorized = pubkey.read_text(encoding="utf-8").strip() if pubkey.exists() else ""
+        keys_written: list[datetime] = []
 
         for user in self.identity["users"]:
             name, uid, shell = user["name"], user["uid"], user["shell"]
@@ -236,12 +341,23 @@ class NodeRenderer:
                 self.run("usermod", "-aG", "sudo", name)
 
             if user.get("login") and authorized:
-                ssh_dir = self.path(home, ".ssh")
-                ssh_dir.mkdir(parents=True, exist_ok=True)
-                ssh_dir.chmod(0o700)
-                keys = ssh_dir / "authorized_keys"
-                keys.write_text(authorized + "\n", encoding="utf-8")
-                keys.chmod(0o600)
+                # The key the proxy opens every inner session with. Root-owned
+                # and outside the home directory, because the account it logs
+                # in as is the attacker's.
+                #
+                # It used to be ~/.ssh/authorized_keys, which that account owns
+                # -- and replacing that file is the single most common thing an
+                # SSH bot does (`rm -rf ~/.ssh && mkdir ~/.ssh && echo "ssh-rsa
+                # ..." >> ~/.ssh/authorized_keys`). That deleted the proxy's key
+                # with it: every later login passed at the perimeter, then
+                # dropped with "Connection to host closed", and the attacker was
+                # locked out of their own container until the reaper deleted it.
+                #
+                # Root can still edit /etc. That is a much rarer move, and what
+                # bounds root is the container's containment, not this file.
+                provisioned = self.random_moment(120, 400)
+                self.write(f"{CENTRAL_KEYS_DIR}/{name}", authorized + "\n", mode=0o644, when=provisioned)
+                keys_written.append(provisioned)
 
             # Ubuntu 22.04 creates homes 0750, which would hide devuser's
             # home from every account without sudo -- and those are exactly
@@ -250,6 +366,11 @@ class NodeRenderer:
             # distro default.
             self.path(home).chmod(int(str(user.get("home_mode", "0750")), 8))
             self.run("chown", "-R", f"{name}:{name}", home)
+
+        # A directory's mtime is when an entry was last added to it. Left alone
+        # it would carry the build date, the one fresh stamp in /etc/ssh.
+        if keys_written:
+            self.set_time(self.path(CENTRAL_KEYS_DIR), max(keys_written))
 
         # Age the passwords so `chage -l` does not say every account was
         # created today.
@@ -285,7 +406,9 @@ class NodeRenderer:
             "LogLevel INFO\n"
             "\n"
             f"{policy_text}\n"
-            "AuthorizedKeysFile     .ssh/authorized_keys\n"
+            # Users' own keys, then the centrally managed ones (see
+            # render_users) -- the usual layout where ops pushes keys.
+            f"AuthorizedKeysFile     .ssh/authorized_keys {CENTRAL_KEYS_DIR}/%u\n"
             "ChallengeResponseAuthentication no\n"
             "UsePAM yes\n"
             "PrintMotd no\n"
@@ -418,6 +541,9 @@ class NodeRenderer:
             f"{when.strftime('%b %e %H:%M:%S')} {self.hostname} {text}\n" for when, text in lines
         )
         self.write("/var/log/auth.log", rendered, mode=0o640, when=self.now - timedelta(minutes=12))
+        # syslog:adm is what a real Ubuntu install has here, and rsyslogd must
+        # be able to append or the node stops recording logins at boot.
+        self.own("/var/log/auth.log", "syslog:adm")
 
     def _render_syslog(self) -> None:
         lines: list[tuple[datetime, str]] = []
@@ -446,6 +572,7 @@ class NodeRenderer:
             f"{when.strftime('%b %e %H:%M:%S')} {self.hostname} {text}\n" for when, text in lines
         )
         self.write("/var/log/syslog", rendered, mode=0o640, when=self.now - timedelta(minutes=3))
+        self.own("/var/log/syslog", "syslog:adm")
 
     def _render_shell_histories(self) -> None:
         """Per-user shell history that reads like work, not like a script.
@@ -982,18 +1109,41 @@ class NodeRenderer:
             workday_end=self.workday[1],
             rng=self.rng,
         )
-        lines = []
+        entries: list[tuple[datetime, str]] = []
         for when in moments:
             client = f"10.60.{self.rng.randint(12, 18)}.{self.rng.randint(2, 250)}"
             path = self.rng.choice(paths)
             status = self.rng.choices([200, 200, 200, 304, 404, 401], weights=[60, 15, 10, 8, 5, 2])[0]
             size = self.rng.randint(180, 9400)
             stamp = when.strftime("%d/%b/%Y:%H:%M:%S +0530")
-            lines.append(
+            entries.append((
+                when,
                 f'{client} - - [{stamp}] "GET {path} HTTP/1.1" {status} {size} '
-                f'"-" "{self.rng.choice(agents)}"'
-            )
-        self.write("/var/log/nginx/erp-access.log", "\n".join(lines) + "\n", mode=0o640)
+                f'"-" "{self.rng.choice(agents)}"',
+            ))
+
+        # The availability probe goes through nginx, so its requests belong
+        # in this log too -- and if they appear only from boot onwards, the
+        # log says the monitoring was installed the moment the attacker
+        # arrived. Seeded from this node's own schedule rather than a second
+        # copy of the interval, so the cadence is the same either side of
+        # the boot.
+        probe = self._ambient_schedule("portal-healthcheck")
+        if probe is not None:
+            for when in probe.occurrences(self.now - timedelta(days=6), self.now):
+                stamp = when.strftime("%d/%b/%Y:%H:%M:%S +0530")
+                entries.append((
+                    when,
+                    f'127.0.0.1 - - [{stamp}] "GET / HTTP/1.1" 200 {_PORTAL_INDEX_BYTES} '
+                    f'"-" "curl/7.81.0"',
+                ))
+
+        entries.sort(key=lambda item: item[0])
+        self.write(
+            "/var/log/nginx/erp-access.log",
+            "\n".join(line for _, line in entries) + "\n",
+            mode=0o640,
+        )
         self.write(
             "/var/log/nginx/erp-error.log",
             "\n".join(
@@ -1072,6 +1222,166 @@ class NodeRenderer:
 
     # -- filesystem realism ------------------------------------------------
 
+    # -- ambient activity ---------------------------------------------------
+
+    def _ambient_schedule(self, job_name: str) -> "Schedule | None":
+        """This node's schedule for one job, or None if it does not run it.
+
+        Exists so nothing rebuilds a schedule from a second copy of the
+        numbers. The nginx access log has to be seeded with the health check's
+        own cadence, and a hardcoded five minutes there would drift silently
+        the first time an identity.yaml changed.
+        """
+        for entry in self.identity.get("ambient") or []:
+            if entry.get("job") == job_name:
+                return Schedule(
+                    every_minutes=entry.get("every_minutes"),
+                    at=entry.get("at"),
+                    hours=entry.get("hours"),
+                    days=entry.get("days"),
+                )
+        return None
+
+    def render_ambient(self) -> None:
+        """Install the cron jobs that keep this box doing something.
+
+        Everything else here is history: true when the image was built and
+        frozen from then on. These are the part that is still happening while
+        somebody watches, which is the difference between a box that survives
+        a glance and one that survives a stakeout.
+
+        Runs after render_role() because the database node's backup job seeds
+        real dumps of the schema that render_role() writes.
+        """
+        entries = self.identity.get("ambient") or []
+        if not entries:
+            return
+
+        window_start = self.now - timedelta(days=7)
+        # Two minutes back, not self.now: a monitoring log whose last line is
+        # the same second the image finished building says what it is.
+        window_end = self.now - timedelta(minutes=2)
+
+        lines = [
+            "# Departmental monitoring and housekeeping. Managed by ITS;",
+            "# see /opt/deploy/CHANGELOG before editing.",
+            "SHELL=/bin/sh",
+            "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin",
+            "",
+        ]
+
+        for entry in entries:
+            name = entry["job"]
+            # KeyError on purpose. A node asking for a job that does not exist
+            # is a typo in its identity.yaml, and failing the build is how it
+            # gets noticed rather than shipping a node missing its activity.
+            job = AMBIENT_JOBS[name]
+            schedule = self._ambient_schedule(name)
+            assert schedule is not None  # it came from this very list
+            user = entry.get("user", "root")
+
+            # Backdated: a monitoring script whose mtime is the build is a
+            # script installed the day the box appeared.
+            self.write(job.script, job.body, mode=0o755, when=self.random_moment(30, 120))
+            occurrences = schedule.occurrences(window_start, window_end)
+            self._seed_ambient_log(job, occurrences)
+            lines.append(f"{schedule.to_cron()}  {user}  {job.script} >/dev/null 2>&1")
+
+        lines.append("")
+        # No dot in the filename: cron silently ignores files under cron.d
+        # whose names contain one, which would leave the scripts and the
+        # seeded logs in place and nothing running.
+        self.write("/etc/cron.d/cs-monitoring", "\n".join(lines))
+
+    def _seed_ambient_log(self, job, occurrences: list[datetime]) -> None:
+        """Give a job's log the history it would have, at its own cadence."""
+        if not occurrences:
+            return
+
+        # The backup job is the one that leaves files rather than only lines,
+        # and its log states each file's size -- so the files have to be
+        # written first and the sizes read back from them. A log claiming
+        # 5,412 bytes next to a file of a different size is worse than either
+        # alone, because it proves neither was produced by the other.
+        sizes: dict[datetime, int] = {}
+        if job.script.endswith("/db-backup"):
+            sizes = self._seed_db_backups(occurrences)
+
+        rendered = []
+        for when in occurrences:
+            if when in sizes:
+                tail = f"ok erp-{when.strftime('%Y%m%d-%H%M')}.sql.gz {sizes[when]} bytes"
+            else:
+                # Older than the retention window, so the file it names is
+                # genuinely gone. Nothing can contradict the size.
+                tail = job.seed_tail(self.rng, when, self.measure())
+            rendered.append(f"{when.strftime('%Y-%m-%d %H:%M:%S')} {tail}\n")
+
+        self.write(job.log, "".join(rendered), mode=job.log_mode, when=occurrences[-1])
+        if job.log_owner != "root:root":
+            self.own(job.log, job.log_owner)
+
+    def _seed_db_backups(self, occurrences: list[datetime]) -> dict[datetime, int]:
+        """Write the dumps the backup job's retention would still be holding.
+
+        Real gzip of the real schema, so an attacker who finds these can
+        gunzip them and read the data they came for. That is the point: a
+        directory of genuine dumps is a better reason to keep digging than any
+        log line, and it costs nothing we were not already shipping.
+        """
+        source = self.path("/opt/db/seed.sql")
+        if not source.exists():
+            return {}
+
+        destination = self.path("/var/backups/mysql")
+        destination.mkdir(parents=True, exist_ok=True)
+        schema = source.read_text(encoding="utf-8")
+
+        sizes: dict[datetime, int] = {}
+        # RETENTION in the script keeps 8; seeding more would leave files the
+        # job itself would have deleted.
+        for when in occurrences[-8:]:
+            target = destination / f"erp-{when.strftime('%Y%m%d-%H%M')}.sql.gz"
+            # mtime inside the gzip header as well as on the file, because
+            # `gunzip -l` prints the header one and a dump stamped with the
+            # build time inside a file stamped three days ago is a mismatch
+            # that only exists in fabricated archives.
+            with gzip.GzipFile(
+                filename=target.name[:-3], mode="wb", fileobj=target.open("wb"),
+                mtime=int(when.timestamp()),
+            ) as handle:
+                # Completion is a few seconds after cron fired it, which is
+                # what the footer of a real dump records -- and is why no two
+                # of these compress to the same length. Seven backups listing
+                # at identical byte counts is its own small tell.
+                completed = when + timedelta(seconds=self.rng.randint(1, 9))
+                handle.write(as_mysqldump(schema, completed).encode("utf-8"))
+            target.chmod(0o600)
+            self.set_time(target, when)
+            sizes[when] = target.stat().st_size
+        self.run("chown", "-R", "root:root", str(destination))
+        self.path("/var/backups/mysql").chmod(0o700)
+        return sizes
+
+    def date_apt_metadata(self) -> None:
+        """Age /var/lib/apt/lists to match the motd's last-patched date.
+
+        `ls -l /var/lib/apt/lists` against a banner claiming a patch date is a
+        cheap check, and at build time the directory carries the moment the
+        image was assembled.
+
+        Done here rather than in the boot script, where it used to live. Once
+        that script's internal comments stopped shipping, a bare `touch -d '37
+        days ago' /var/lib/apt/lists` was left in an installed boot script with
+        nothing explaining it -- a line whose only conceivable purpose is
+        backdating evidence. It also belongs at build time on its own merits:
+        the motd is rendered here from the same clock, so the two age together
+        instead of drifting apart every time a container starts.
+        """
+        target = self.path("/var/lib/apt/lists")
+        if target.exists():
+            self.set_time(target, self.now - timedelta(days=37))
+
     def scatter_mtimes(self) -> None:
         """Spread modification times across the seeded period.
 
@@ -1109,7 +1419,6 @@ _SYSLOG_LINES = [
     "rsyslogd[{pid}]: rsyslogd was HUPed",
     "systemd-logind[{pid}]: New session {pid} of user ta_miller.",
     "kernel: [UFW BLOCK] IN=eth0 OUT= SRC=45.155.205.233 DST=10.60.0.11 PROTO=TCP DPT=23",
-    "node_exporter[{pid}]: level=info msg=\"Listening on\" address=:9100",
 ]
 
 _HISTORY = {
@@ -1423,6 +1732,8 @@ def main() -> int:
     renderer.render_homes()
     renderer.render_environment()
     renderer.render_role()
+    renderer.render_ambient()
+    renderer.date_apt_metadata()
     renderer.render_history()
     renderer.render_decoys()
     renderer.scatter_mtimes()

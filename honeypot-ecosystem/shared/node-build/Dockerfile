@@ -24,7 +24,8 @@
 # A separate stage purely so gcc never reaches the final image. The shim makes
 # uname() report the kernel we claim rather than the host's -- without it a
 # container on Docker Desktop answers "6.6.87.2-microsoft-standard-WSL2",
-# contradicting our own motd. See unamed.c.
+# contradicting our own motd, and /proc/uptime reports the host's uptime
+# rather than this container's. See nodeenv.c.
 
 FROM ubuntu:22.04 AS shimbuilder
 
@@ -34,11 +35,11 @@ ARG KERNEL_VERSION="#128-Ubuntu SMP Fri Jul 5 09:28:59 UTC 2026"
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY shared/node-build/unamed.c /tmp/unamed.c
+COPY shared/node-build/nodeenv.c /tmp/nodeenv.c
 RUN gcc -shared -fPIC -O2 -Wall \
         -DFAKE_RELEASE="\"${KERNEL_RELEASE}\"" \
         -DFAKE_VERSION="\"${KERNEL_VERSION}\"" \
-        -o /tmp/libnodeenv.so /tmp/unamed.c -ldl \
+        -o /tmp/libnodeenv.so /tmp/nodeenv.c -ldl \
     && test -s /tmp/libnodeenv.so
 
 
@@ -91,6 +92,18 @@ COPY nodes/${NODE}/ /tmp/build/
 RUN python3 /tmp/build/render_node.py --identity /tmp/build/identity.yaml --root / \
     && rm -rf /tmp/build
 
+# rsyslogd drops privileges to the syslog user before it opens its log
+# files, so a seeded log left at root:root 0640 silently discards every
+# live line -- the box stops logging the instant it boots, and the only
+# symptom is a syslog whose newest entry predates the current uptime.
+# Asserted here because it is invisible at build time and expensive to
+# notice later. nginx deliberately excluded: its master stays root and
+# hands open descriptors to its www-data workers, so root:root is fine
+# there.
+RUN for f in /var/log/syslog /var/log/auth.log; do owner="$(stat -c '%U:%G' "$f")"; [ "$owner" = 'syslog:adm' ] || { echo "FATAL: $f is $owner, expected syslog:adm" >&2; exit 1; }; done \
+    && su -s /bin/sh syslog -c 'printf "" >> /var/log/syslog' \
+    && echo 'rsyslog can append to its seeded logs'
+
 # --------------------------------------------------------------------------
 # Init and the uname shim
 # --------------------------------------------------------------------------
@@ -111,9 +124,41 @@ RUN chmod 0644 /lib/x86_64-linux-gnu/libnodeenv.so \
     && ldconfig \
     && test -z "$(/bin/echo -n 2>&1)" \
     && uname -r | grep -qv microsoft \
-    && echo "uname now reports: $(uname -r)"
+    && echo "uname now reports: $(uname -r)" \
+    && PROC_UP="$(cut -d' ' -f1 /proc/uptime)" \
+    && awk -v u="$PROC_UP" 'BEGIN { if (u+0 <= 0 || u+0 > 86400) { print "FATAL: /proc/uptime reads " u "s, which is the host, not this " "container" > "/dev/stderr"; exit 1 } }' \
+    && echo "/proc/uptime now reports ${PROC_UP}s: this container, not the host"
 
-COPY --chmod=0755 nodes/${NODE}/entrypoint.sh /usr/local/sbin/node-init
+# The boot script, with its internal narration removed and readable only by
+# root.
+#
+# It shipped 0755 and fully commented, which meant `student` -- the weakest
+# account on the box, whose password is three characters past guessable --
+# could read a file that said "that is the whole disguise", listed the
+# container tells by name, and showed the /.dockerenv removal. One command,
+# on the first account an attacker gets, and the entire estate is explained.
+#
+# `##` marks a comment for whoever maintains this; `#` marks one the box is
+# content for root to read. Only the second kind survives the install, so the
+# reasoning stays in git where the team needs it rather than on the node where
+# an attacker does.
+#
+# 0700 as well, because the decoy chain deliberately hands out sudo: the
+# stripping is what protects the script from the attacker who succeeds, and
+# the mode is what protects it from the one who has not yet.
+COPY nodes/${NODE}/entrypoint.sh /tmp/entrypoint.sh
+RUN sed -E '/^[[:space:]]*##/d' /tmp/entrypoint.sh | cat -s > /usr/local/sbin/node-init \
+    && rm -f /tmp/entrypoint.sh \
+    && chmod 0700 /usr/local/sbin/node-init \
+    && chown root:root /usr/local/sbin/node-init \
+    && bash -n /usr/local/sbin/node-init \
+    && if grep -Eiq 'honeypot|disguise|decoy|attacker|dockerenv|container tell' \
+            /usr/local/sbin/node-init; then \
+        echo 'FATAL: installed boot script still explains itself' >&2; \
+        grep -Ein 'honeypot|disguise|decoy|attacker|dockerenv|container tell' \
+            /usr/local/sbin/node-init >&2; exit 1; \
+    fi \
+    && echo "boot script installed: $(wc -l < /usr/local/sbin/node-init) lines, root-only"
 
 EXPOSE 22
 ENTRYPOINT ["/sbin/init", "-s", "--"]

@@ -5,6 +5,7 @@ export default function Sidebar({ activePage, setActivePage }) {
     { id: 'sessions',  label: 'Sessions' },
     { id: 'iocs',      label: 'IOC Intel' },
     { id: 'alerts',    label: 'Alerts' },
+    { id: 'retention', label: 'Retention' },
     { id: 'map',       label: 'Attack Map' },
     // NEW: Added Ingest Logs
     { id: 'ingest',    label: 'Ingest Logs' }, 

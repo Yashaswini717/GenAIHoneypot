@@ -24,19 +24,33 @@ class IntentClassificationRequest(BaseModel):
     )
     source_ip: Optional[str] = Field(default=None, description="Source IP for the activity")
     session_id: Optional[str] = Field(default=None, description="Session or trace identifier")
+    previous_intent: Optional[str] = Field(
+        default=None,
+        description="The intent this endpoint returned for the session's previous window. "
+        "Context for the model when no command in this window is evidence of anything "
+        "(cd, chmod +x, heredoc lines), so the attacker's stage is kept rather than guessed.",
+    )
     metadata: dict[str, Any] = Field(default_factory=dict, description="Additional contextual attributes")
     model_type: str = Field(
-        default="random_forest",
-        description="Classifier backend. Supports random_forest and xgboost when available",
+        default="gradient_boosting",
+        description="Classifier backend: gradient_boosting (default, the committed model), "
+        "random_forest, or xgboost when installed. Non-default backends are trained on first use.",
     )
 
     @field_validator("model_type")
     @classmethod
     def validate_model_type(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if normalized not in {"random_forest", "xgboost"}:
-            raise ValueError("model_type must be 'random_forest' or 'xgboost'")
+        if normalized not in {"gradient_boosting", "random_forest", "xgboost"}:
+            raise ValueError("model_type must be 'gradient_boosting', 'random_forest' or 'xgboost'")
         return normalized
+
+    @field_validator("previous_intent")
+    @classmethod
+    def validate_previous_intent(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and value not in INTENT_CLASSES:
+            raise ValueError(f"previous_intent must be one of {', '.join(INTENT_CLASSES)}")
+        return value
 
     @field_validator("event_timestamps")
     @classmethod
@@ -53,7 +67,7 @@ class IntentClassificationResponse(BaseModel):
     intent: str = Field(description="Detected attacker intent")
     action: str = Field(description="Suggested decoy action for this intent")
     confidence: float = Field(description="Confidence score for the predicted intent", ge=0.0, le=1.0)
-    source: str = Field(description="Classification source: rule or ml")
+    source: str = Field(description="Classification source: rule or ml (the model, using previous_intent as context when given)")
     probabilities: dict[str, float] = Field(description="Probability distribution across supported intents")
     model_name: str = Field(description="Underlying model used for inference")
     inference_time_ms: float = Field(description="Inference latency in milliseconds")

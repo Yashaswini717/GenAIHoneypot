@@ -36,7 +36,7 @@ reorder, or drop what reaches the hub.
 
 Working without an LLM key
 --------------------------
-Intent classification does not need one — it is rules plus a RandomForest, so
+Intent classification does not need one — it is rules plus a gradient-boosted model, so
 `/api/v1/intent-classify` works keyless and the adaptive loop is fully
 demonstrable. Only content *generation* needs a model, so decoy bodies come
 from the brain when it can produce them and from local bundles when it cannot.
@@ -93,6 +93,20 @@ MIN_CLASSIFY_INTERVAL = 1.5
 #: ambiguous line.
 CLASSIFY_WINDOW = 3
 
+#: How long an attacker needs to plausibly have seen a decoy before its
+#: absence of effect means anything.
+#:
+#: A decoy is written into the filesystem; the attacker only encounters it if
+#: they look. When a session ends seconds after a plant, nothing was learned
+#: about that action -- but the bandit was being told the action FAILED, which
+#: is a different and much stronger claim. `serve_fake_network_map` fell to a
+#: 0.300 posterior over four trials that way, having never actually been shown
+#: to anyone long enough to matter.
+#:
+#: Below this, the decision is left pending instead: unresolved means no
+#: observation, which is what actually happened.
+OBSERVATION_GRACE = 25.0
+
 #: Sessions we stop tracking after this long idle, so a long-running sidecar
 #: does not accumulate state for every attacker it has ever seen.
 SESSION_TTL = 3600
@@ -114,12 +128,20 @@ class SessionState:
     session_id: str
     src_ip: str
     sensor: str
+    #: Which experimental arm this attacker is in, as decided by the proxy and
+    #: carried on the event. Read rather than recomputed here so the arm the
+    #: hub records and the arm the courier acts on can never disagree -- two
+    #: independent computations of the same split is a bug waiting to happen.
+    adaptive: bool = True
     commands: list[str] = field(default_factory=list)
     timestamps: list[str] = field(default_factory=list)
     unclassified: int = 0
     last_classified: float = 0.0
     last_seen: float = field(default_factory=time.time)
     pending_decision: str | None = None
+    #: When the pending decision's decoy was planted, so session close can
+    #: tell an action that failed from one that was never seen.
+    pending_since: float = 0.0
     last_intent: str | None = None
     deployed_actions: set[str] = field(default_factory=set)
     #: Decoy values this session has already been caught using. Reported once
@@ -247,8 +269,21 @@ class BrainCourier:
                 session_id=session_id,
                 src_ip=event.get("src_ip", ""),
                 sensor=event.get("sensor", ""),
+                adaptive=bool(event.get("adaptive", True)),
             )
             self.sessions[session_id] = state
+
+        # A control-arm attacker gets a static honeypot: the same three nodes,
+        # the same seeded decoys baked into the images, the same credentials,
+        # the same traffic. Nothing is generated or planted for them
+        # mid-session. That difference, and only that difference, is what the
+        # retention comparison measures.
+        #
+        # Tracked from the first event rather than re-derived, because the
+        # event already carries the arm the hub will record the session under.
+        if not state.adaptive:
+            state.last_seen = time.time()
+            return
 
         state.commands.append(command)
         state.timestamps.append(event.get("timestamp", ""))
@@ -283,6 +318,7 @@ class BrainCourier:
         action = decision.get("action")
         state.last_intent = intent
         state.pending_decision = decision.get("decision_id")
+        state.pending_since = time.time()
 
         log.info(
             "session %s: intent=%s action=%s confidence=%.2f (%s)",
@@ -313,6 +349,12 @@ class BrainCourier:
             "session_id": state.session_id,
             "metadata": {"honeypot_id": state.honeypot_id},
         }
+        # What the brain said last time. A window can be nothing but `cd`,
+        # `chmod +x` and the lines of a heredoc -- no evidence of any stage --
+        # and the attacker has not changed stage by typing them. With this the
+        # brain carries the stage forward instead of guessing from nothing.
+        if state.last_intent:
+            payload["previous_intent"] = state.last_intent
         try:
             response = await self.client.post(
                 f"{self.brain_url}/api/v1/intent-classify",
@@ -346,42 +388,45 @@ class BrainCourier:
             log.debug("no decoy bundle defined for action %r", action)
             return
 
-        # The bundle goes in now, and the generated profile follows in the
-        # background if the brain can produce one.
-        #
-        # Not the other way round, and not "wait and plant only the better one":
-        # a full profile is several sequential model calls, so waiting would
-        # stall adaptation for every other attacker behind this one in the queue
-        # and leave this attacker looking at an empty home directory in the
-        # meantime. The bundle is instant and works with no API key at all, so
-        # it is the floor; generated content is the improvement on top.
-        self._spawn(self._generate_and_plant(state, action, intent))
-
-        try:
-            response = await self.client.post(
-                f"{self.broker_url}/session/decoys",
-                json={
-                    "src_ip": state.src_ip,
-                    "action": action,
-                    "intent": intent,
-                    "files": [
-                        {"path": path, "content": body, "mode": mode}
-                        for path, body, mode in files
-                    ],
-                },
-            )
-            response.raise_for_status()
-            self.deployed += 1
-            log.info(
-                "planted %r for %s (intent=%s, %d file(s))",
-                action,
-                state.src_ip,
-                intent,
-                len(files),
-            )
-        except Exception as exc:
-            log.warning("could not plant decoys for %s: %s", state.src_ip, exc)
+        outcome = await self._plant_files(
+            state,
+            action,
+            intent,
+            [{"path": path, "content": body, "mode": mode} for path, body, mode in files],
+        )
+        if outcome is None:
             return
+        status = outcome.get("status", "ok")
+        if status == "already-planted":
+            # This attacker's environment got these decoys on an earlier visit.
+            # The broker refuses to plant them twice -- that would restore what
+            # the attacker deleted and revert what they edited -- and generating
+            # the profile again would pay for content nothing will place.
+            log.info("%r is already in %s's environment; left as they left it", action, state.src_ip)
+            return
+        if status != "ok":
+            log.info("did not plant %r for %s: %s", action, state.src_ip, status)
+            return
+
+        self.deployed += 1
+        log.info(
+            "planted %r for %s (intent=%s, %d file(s))",
+            action,
+            state.src_ip,
+            intent,
+            outcome.get("planted", len(files)),
+        )
+
+        # The generated profile follows in the background, if the brain can
+        # produce one. Not "wait and plant only the better one": a full profile
+        # is several sequential model calls, so waiting would stall adaptation
+        # for every other attacker behind this one in the queue and leave this
+        # attacker looking at an empty home directory in the meantime. The
+        # bundle is instant and works with no API key at all, so it is the
+        # floor; generated content is the improvement on top. Started only once
+        # the bundle has landed, so a refused or failed plant costs no model
+        # calls.
+        self._spawn(self._generate_and_plant(state, action, intent))
 
         # Only after the files are actually in place. Declaring bait we failed
         # to plant would leave the store claiming an exposure that does not
@@ -445,20 +490,26 @@ class BrainCourier:
             if value and len(value) >= 10:
                 state.extra_tokens.append((token.get("token_type", "generated"), value))
 
-        planted = await self._plant_files(state, f"{action}:generated", intent, files)
-        if planted:
+        outcome = await self._plant_files(state, f"{action}:generated", intent, files)
+        if outcome and outcome.get("status", "ok") == "ok":
             log.info(
-                "planted generated %s for %s (%d file(s), %d tracked credential(s))",
+                "planted generated %s for %s (%d of %d file(s); the rest already existed; "
+                "%d tracked credential(s))",
                 body.get("profile", "?"),
                 state.src_ip,
+                outcome.get("planted", len(files)),
                 len(files),
                 len(body.get("tokens") or []),
             )
 
     async def _plant_files(
         self, state: SessionState, action: str, intent: str, files: list[dict[str, Any]]
-    ) -> bool:
-        """POST a set of files to the broker for placement. Never raises."""
+    ) -> dict[str, Any] | None:
+        """POST a set of files to the broker for placement. Never raises.
+
+        Returns the broker's answer -- `status` is "ok", "already-planted" or
+        "no-active-session" -- or None when the request itself failed.
+        """
         try:
             response = await self.client.post(
                 f"{self.broker_url}/session/decoys",
@@ -470,10 +521,10 @@ class BrainCourier:
                 },
             )
             response.raise_for_status()
-            return True
+            return response.json()
         except Exception as exc:
             log.warning("could not plant %s for %s: %s", action, state.src_ip, exc)
-            return False
+            return None
 
     # -- tripwire ----------------------------------------------------------
 
@@ -632,6 +683,29 @@ class BrainCourier:
             return
 
         engaged = state.unclassified > 0
+        # Unknown plant time resolves as before. Treating it as 'just planted'
+        # would silence the feedback for every state that predates this field,
+        # including a session expiring after an hour idle -- which is the one
+        # case where we are most certain the decoy was there to be seen.
+        shown_for = (
+            time.time() - state.pending_since if state.pending_since else float("inf")
+        )
+
+        # An attacker who did nothing after the decoy and left within the grace
+        # window never encountered it. Reporting that as a failure teaches the
+        # bandit that the action does not work, when nothing was observed at
+        # all. Leaving the decision pending is the honest record: the arm keeps
+        # its selection count and its posterior is left untouched.
+        if not engaged and shown_for < OBSERVATION_GRACE:
+            log.info(
+                "session %s %s: decision left unresolved - decoy was planted "
+                "%.1fs before the session ended, so nothing was observed",
+                state.session_id,
+                reason,
+                shown_for,
+            )
+            return
+
         signal = "session_continued" if engaged else "session_terminated"
 
         try:

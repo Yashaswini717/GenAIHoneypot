@@ -45,3 +45,24 @@ services:
   - name: ssh
     unit: ssh.service
     port: 22
+
+# Ambient activity: the cron jobs that keep this box doing something while
+# somebody is watching it. Everything else in this file is history, true when
+# the image was built and frozen after it; these are what an attacker sees
+# change if they tail a log or run the same command twice ten minutes apart.
+#
+# The schedule is written in structured fields rather than a cron expression
+# because the same fields generate the crontab line AND the seeded history --
+# a fixed-interval job whose log has irregular gaps before this boot and
+# regular ones after it is a sharper tell than no monitoring at all.
+#
+# Job names come from AMBIENT_JOBS in shared/node-build/ambient.py; asking for
+# one that does not exist fails the build.
+ambient:
+  - job: disk-report
+    every_minutes: 20
+    hours: "8-20"
+  # 02:15, just before the ERP sync at 02:17 that reads from it. Leaves real
+  # gzipped dumps in /var/backups/mysql that an attacker can gunzip and read.
+  - job: db-backup
+    at: "02:15"

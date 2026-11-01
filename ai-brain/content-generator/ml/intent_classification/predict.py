@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
-from .pipeline import IntentClassifier, PredictionResult
+from core.intent_taxonomy import INTENT_CLASSES
+
 from .feature_engineering import extract_features
-from .rules import detect_intent_by_rules
+from .pipeline import DEFAULT_MODEL_TYPE, IntentClassifier
+from .rules import detect_intent_by_rules, evidenced_intents
 
 
 @dataclass
@@ -28,84 +30,49 @@ class IntentClassificationResult:
     source: str
 
 
-INTENT_PRIORITY = {
-    "data_exfiltration": 0,
-    "privilege_escalation": 1,
-    "lateral_movement": 2,
-    "persistence": 3,
-    "reconnaissance": 4,
-}
+_classifiers: dict[str, IntentClassifier] = {}
+_classifiers_lock = threading.Lock()
 
 
-def _sort_intents_by_priority(intents: set[str]) -> list[str]:
-    return sorted(intents, key=lambda intent: INTENT_PRIORITY[intent])
+def get_intent_classifier(model_type: str = DEFAULT_MODEL_TYPE) -> IntentClassifier:
+    """One classifier per model type, built once.
+
+    Locked rather than lru_cached: the route runs in FastAPI's threadpool, and
+    two first requests arriving together would otherwise both load -- or, for a
+    stale model, both train -- the same model at once.
+    """
+    with _classifiers_lock:
+        if model_type not in _classifiers:
+            _classifiers[model_type] = IntentClassifier(model_type=model_type)
+        return _classifiers[model_type]
 
 
-def rule_based_intent(activity: dict[str, Any]) -> list[str]:
-    """Return all direct intent matches for obvious command patterns."""
-    commands = " \n".join(str(command).lower() for command in activity.get("commands", []) if command)
-    detected_intents: set[str] = set()
+def predict_intent_realtime(activity: dict[str, Any], model_type: str = DEFAULT_MODEL_TYPE) -> HybridPredictionResult:
+    """Rules first; the model when no command in the window is evidence.
 
-    if "nmap" in commands:
-        detected_intents.add("reconnaissance")
-    if "scan" in commands or "scanning" in commands:
-        detected_intents.add("reconnaissance")
-    if "sudo" in commands or "chmod" in commands:
-        detected_intents.add("privilege_escalation")
-    if any(
-        term in commands
-        for term in (
-            "cron",
-            "crontab",
-            ".bashrc",
-            ".bash_profile",
-            "/etc/profile",
-            "/etc/profile.d/",
-            "startup",
-            "rc.local",
-            "launchctl",
-            "schtasks",
-            "authorized_keys",
-            "systemctl enable",
-        )
-    ):
-        detected_intents.add("persistence")
-    if "ssh " in commands or "psexec" in commands:
-        detected_intents.add("lateral_movement")
-    if any(term in commands for term in ("scp", "curl", "ftp", "upload")):
-        detected_intents.add("data_exfiltration")
-
-    return _sort_intents_by_priority(detected_intents)
-
-
-@lru_cache(maxsize=1)
-def get_intent_classifier(model_type: str = "random_forest") -> IntentClassifier:
-    return IntentClassifier(model_type=model_type)
-
-
-def predict_intent_realtime(activity: dict[str, Any], model_type: str = "random_forest") -> HybridPredictionResult:
+    The model also sees `previous_intent` -- what this endpoint returned for
+    the session's last window, sent by the sidecar. A window can hold nothing
+    at all to go on (`cd`, `chmod +x`, heredoc lines), and the attacker has not
+    changed stage by typing those, so the model learns to keep the previous
+    stage there. It is context rather than an override: carrying the old stage
+    forward unconditionally scored no better, because it also overruled the
+    windows where the model correctly saw a change the rules cannot name -- an
+    exploit compiled and run, an app patched with `sed -i`.
+    """
     rule_match = detect_intent_by_rules(activity)
     if rule_match is not None:
-        feature_values = extract_features(activity)
         return HybridPredictionResult(
             intent=rule_match.intent,
             confidence=rule_match.confidence,
             source="rule",
-            probabilities={
-                "reconnaissance": 1.0 if rule_match.intent == "reconnaissance" else 0.0,
-                "privilege_escalation": 1.0 if rule_match.intent == "privilege_escalation" else 0.0,
-                "persistence": 1.0 if rule_match.intent == "persistence" else 0.0,
-                "lateral_movement": 1.0 if rule_match.intent == "lateral_movement" else 0.0,
-                "data_exfiltration": 1.0 if rule_match.intent == "data_exfiltration" else 0.0,
-            },
-            feature_values=feature_values,
+            probabilities={intent: 1.0 if intent == rule_match.intent else 0.0 for intent in INTENT_CLASSES},
+            feature_values=dict(extract_features(activity)),
             inference_time_ms=0.0,
             model_name="rule_engine",
             matched_rules=rule_match.matched_rules,
         )
 
-    classifier = get_intent_classifier(model_type=model_type)
-    ml_result = classifier.predict(activity)
+    ml_result = get_intent_classifier(model_type=model_type).predict(activity)
     return HybridPredictionResult(
         intent=ml_result.predicted_intent,
         confidence=ml_result.confidence,
@@ -118,27 +85,18 @@ def predict_intent_realtime(activity: dict[str, Any], model_type: str = "random_
     )
 
 
-def classify_intent(activity: dict[str, Any], model_type: str = "random_forest") -> IntentClassificationResult:
-    """Classify intent with rule-first hybrid logic for the legacy API endpoint."""
-    direct_rule_intents = rule_based_intent(activity)
-    if direct_rule_intents:
-        return IntentClassificationResult(
-            primary_intent=direct_rule_intents[0],
-            all_intents=direct_rule_intents,
-            source="rule",
-        )
+def classify_intent(activity: dict[str, Any], model_type: str = DEFAULT_MODEL_TYPE) -> IntentClassificationResult:
+    """The legacy /classify endpoint, answered by the same classifier as /intent-classify.
 
-    rule_match = detect_intent_by_rules(activity)
-    if rule_match is not None:
-        return IntentClassificationResult(
-            primary_intent=rule_match.intent,
-            all_intents=[rule_match.intent],
-            source="rule",
-        )
-
-    ml_result = predict_intent_realtime(activity, model_type=model_type)
+    It used to run a second, looser rule set of its own -- any `curl` meant
+    exfiltration, any `chmod` meant privilege escalation -- so the two
+    endpoints could disagree about the same commands. `all_intents` keeps its
+    meaning: every intent with evidence in the window, after the primary one.
+    """
+    result = predict_intent_realtime(activity, model_type=model_type)
+    others = [intent for intent in evidenced_intents(activity) if intent != result.intent]
     return IntentClassificationResult(
-        primary_intent=ml_result.intent,
-        all_intents=[ml_result.intent],
-        source="ml",
+        primary_intent=result.intent,
+        all_intents=[result.intent] + others,
+        source=result.source,
     )

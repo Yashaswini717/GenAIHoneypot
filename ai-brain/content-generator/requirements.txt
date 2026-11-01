@@ -35,6 +35,13 @@ black==24.1.1
 ruff==0.1.14
 mypy==1.8.0
 
+# Intent model. Pinned to the versions the committed intent_model.joblib was
+# trained with: a pickle from another scikit-learn version may load and
+# quietly mispredict. Bump these together with a retrain
+# (python -m ml.intent_classification.train) -- the model records the version
+# it was built with and is retrained in memory on any mismatch.
+scikit-learn==1.9.1
+joblib==1.6.0
+numpy==2.4.6
+# Only the legacy ml/train.py imports pandas; the live classifier does not.
 pandas
-scikit-learn
-joblib

@@ -9,6 +9,9 @@ export default function IngestLogs() {
   const [progress, setProgress] = useState(0)
   const [done, setDone]         = useState(false)
   const [dragOver, setDragOver] = useState(false)
+  // The hub's OPERATOR_TOKEN. Held in memory only: it is the one credential
+  // that lets events in without a signature, so it is not written to storage.
+  const [token, setToken]       = useState('')
   const fileRef = useRef()
 
   const handleFile = (file) => {
@@ -57,17 +60,24 @@ export default function IngestLogs() {
       setProgress(pct)
 
       try {
-        const res = await fetch('http://localhost:8000/ingest/batch', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body,
-        })
+        // Through the Vite proxy like every other call, not straight at
+        // :8000 -- which only worked when the browser and the backend
+        // happened to share a host.
+        const headers = { 'Content-Type': 'application/x-ndjson' }
+        if (token.trim()) headers.Authorization = `Bearer ${token.trim()}`
+        const res = await fetch('/api/ingest/batch', { method: 'POST', headers, body })
 
         let data
         try { data = await res.json() }
         catch { data = {} }
 
-        if (!res.ok) {
+        if (res.status === 401 || res.status === 403) {
+          // Every remaining batch would be refused the same way.
+          err += lines.length - i
+          addLog(`HTTP ${res.status} — ${data.detail || res.statusText}`, 'err')
+          setCounts({ ok, err })
+          break
+        } else if (!res.ok) {
           err += chunk.length
           addLog(
             `Batch ${i + 1}–${Math.min(i + BATCH, lines.length)}: HTTP ${res.status} — ${data.detail || res.statusText}`,
@@ -113,7 +123,28 @@ export default function IngestLogs() {
         <h1 style={{ fontSize: 22, fontWeight: 700, color: '#f1f5f9' }}>Ingest Logs</h1>
         <div style={{ fontSize: 12, color: '#64748b', marginTop: 4 }}>
           Upload a Cowrie JSONL file · each line is one JSON event · sent to /ingest/batch
+          as an operator upload, tagged <code>operator_upload</code> and left out of the
+          retention figures
         </div>
+      </div>
+
+      {/* Operator token */}
+      <div style={{ marginBottom: 16 }}>
+        <label style={{ display: 'block', fontSize: 12, color: '#94a3b8', marginBottom: 6 }}>
+          Operator token <span style={{ color: '#64748b' }}>(OPERATOR_TOKEN in the hub's .env)</span>
+        </label>
+        <input
+          type="password"
+          autoComplete="off"
+          value={token}
+          onChange={e => setToken(e.target.value)}
+          disabled={running}
+          placeholder="Required to upload"
+          style={{
+            width: '100%', boxSizing: 'border-box', padding: '8px 12px', fontSize: 13,
+            borderRadius: 6, border: '1px solid #2d3148', background: '#13151f', color: '#e2e8f0',
+          }}
+        />
       </div>
 
       {/* Drop zone */}

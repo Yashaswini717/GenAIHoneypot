@@ -49,6 +49,7 @@ from config import config  # noqa: E402
 from cowrie_events import SessionEventFactory  # noqa: E402
 from credentials import CredentialStore  # noqa: E402
 from emitter import EventEmitter  # noqa: E402
+from experiment import describe as describe_experiment, is_adaptive  # noqa: E402
 from hassh import HandshakeSniffer  # noqa: E402
 from peer_gateway import PeerGateway  # noqa: E402
 from recorder import CommandReconstructor, TranscriptWriter  # noqa: E402
@@ -133,6 +134,10 @@ class HoneypotServer(asyncssh.SSHServer):
             # internal bind port.
             dst_port=config.advertised_port,
             sensor=config.sensor_id,
+            # Stable per attacker: a returning attacker stays in the arm they
+            # were first assigned to, or one visit would mix both treatments
+            # and return rate is one of the metrics being compared.
+            adaptive=is_adaptive(peer[0]),
         )
         conn._honeypot_events = self.events  # noqa: SLF001 - handed to the session
         _schedule(emitter.emit(self.events.connect()))
@@ -514,6 +519,7 @@ async def main() -> None:
     gateway.algorithms = algorithms
     await gateway.start()
 
+    log.info("%s", describe_experiment())
     log.info(
         "listening on %s:%d as %s | sensor=%s | hassh=%s",
         config.listen_host,
