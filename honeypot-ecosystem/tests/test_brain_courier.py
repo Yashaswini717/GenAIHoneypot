@@ -576,6 +576,31 @@ def test_classification_sees_a_sliding_window_not_the_whole_session():
         )
 
 
+def test_the_previous_intent_goes_with_the_next_classification():
+    """The brain keeps an attacker's stage through a window of nothing but `cd`
+    and `chmod +x` only if it is told what that stage was."""
+    rec = Recorder(intent="persistence", action="simulate_cron_jobs")
+    courier = build_courier(rec)
+    state = SessionState(session_id="pi1", src_ip="10.0.0.5", sensor="node-01-jump")
+
+    # Driven directly, like the window tests above: MIN_CLASSIFY_INTERVAL would
+    # otherwise collapse a scripted session into a single classification.
+    async def run() -> None:
+        for batch in (["crontab -e", "ls"], ["cd /tmp", "chmod +x x"]):
+            for c in batch:
+                state.commands.append(c)
+                state.timestamps.append("2026-09-09T03:14:00.000000Z")
+            await courier._classify_and_adapt(state)
+        await asyncio.gather(*list(courier._tasks), return_exceptions=True)
+        await courier.client.aclose()
+
+    asyncio.run(run())
+
+    first, second = rec.classifies()
+    assert "previous_intent" not in first, "nothing to carry on the first classification"
+    assert second["previous_intent"] == "persistence"
+
+
 def test_the_window_is_narrow_enough_to_track_a_changing_attacker():
     """Guards the constant itself.
 
@@ -686,6 +711,80 @@ def test_generation_failure_never_disturbs_the_bundle():
     drive(courier, [command("g5", "whoami"), command("g5", "ls -la ~")])
 
     assert courier.deployed == 1, "the bundle still went in"
+
+
+# --------------------------------------------------------------------------
+# return visits
+# --------------------------------------------------------------------------
+
+
+class StatefulBroker(Recorder):
+    """A broker that remembers what it planted per source IP, as the real one does."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.planted: dict[str, set[str]] = {}
+        self.broken = False
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/session/decoys"):
+            return super().handler(request)
+        body = json.loads(request.content)
+        self.calls.append((request.url.path, body))
+        if self.broken:
+            return httpx.Response(500, json={"detail": "docker went away"})
+        done = self.planted.setdefault(body["src_ip"], set())
+        if body["action"] in done:
+            return httpx.Response(200, json={"status": "already-planted", "planted": 0})
+        done.add(body["action"])
+        return httpx.Response(200, json={"status": "ok", "planted": len(body["files"])})
+
+    def generations(self) -> list[dict]:
+        return [b for p, b in self.calls if p.endswith("/decoys/generate")]
+
+
+def two_visits(session_a: str, session_b: str) -> list[dict]:
+    """The same address twice: separate sessions, one environment."""
+    return [
+        command(session_a, "whoami"), command(session_a, "ls -la ~"), closed(session_a),
+        command(session_b, "whoami"), command(session_b, "ls -la ~"),
+    ]
+
+
+def test_a_returning_attacker_does_not_get_the_same_decoys_twice():
+    """The second visit used to plant the bundle and generate the profile again,
+    restoring what the attacker had deleted and paying for content the broker
+    would now refuse to place."""
+    rec = StatefulBroker(action="populate_developer_workstation", generated=GENERATED)
+    courier = build_courier(rec)
+
+    drive(courier, two_visits("r1", "r2"))
+
+    assert len(rec.generations()) == 1, "the profile is generated once, on the first visit"
+    assert courier.deployed == 1
+    second_visit = [p["action"] for p in rec.plants()][2:]
+    assert second_visit == ["populate_developer_workstation"], "one bundle attempt, refused, nothing more"
+
+
+def test_a_refused_plant_does_not_register_its_tokens_again():
+    rec = StatefulBroker(action="plant_honeytoken_credentials")
+    courier = build_courier(rec)
+
+    drive(courier, two_visits("r3", "r4"))
+
+    expected = len(BUNDLE_TOKENS["plant_honeytoken_credentials"])
+    assert len(rec.registrations()) == expected, "registered on the visit that planted them, not again"
+
+
+def test_a_plant_that_did_not_land_costs_no_model_calls():
+    rec = StatefulBroker(action="populate_developer_workstation", generated=GENERATED)
+    rec.broken = True
+    courier = build_courier(rec)
+
+    drive(courier, [command("r5", "whoami"), command("r5", "ls -la ~")])
+
+    assert rec.generations() == []
+    assert courier.deployed == 0
 
 
 if __name__ == "__main__":

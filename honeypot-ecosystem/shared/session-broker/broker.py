@@ -19,9 +19,10 @@ fake; keeping their container means their persistence genuinely persists,
 which is both more convincing and what makes the "persistence" intent class
 meaningful. They still never see another attacker's changes.
 
-Containers are reaped after an idle TTL. On reap we record the changed paths
-from `docker diff` into the event stream, so what an attacker modified is
-preserved even though the container is not.
+Containers are reaped after an idle TTL, together with any pivot targets the
+attacker reached. On reap we log the changed paths from `docker diff` (the
+broker's own log, not the hub's event stream), so what an attacker modified is
+recorded even though the container is not.
 """
 
 from __future__ import annotations
@@ -118,6 +119,12 @@ class Backend:
     created_at: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
     session_count: int = 0
+    #: Decoy actions already planted into this container. Each lands once per
+    #: environment: a return visit must find the decoys the way the attacker
+    #: left them -- edited, deleted -- not freshly restored. In memory only, so
+    #: a broker restart forgets it; the no-clobber rule in _write_files still
+    #: protects every file that exists, leaving only deleted decoys to return.
+    planted: set[str] = field(default_factory=set)
 
     def touch(self) -> None:
         self.last_seen = time.time()
@@ -345,29 +352,71 @@ async def plant_decoys(request: DecoyRequest) -> dict[str, Any]:
         # Their session ended before the brain answered. Normal, not an error.
         return {"status": "no-active-session", "planted": 0}
 
+    # Once per environment, not once per session. The sidecar only remembers
+    # what it planted within one session, so every return visit used to plant
+    # the same action again: decoys the attacker had deleted came back, and
+    # ones they had edited were silently reverted.
+    if request.action in backend.planted:
+        return {"status": "already-planted", "planted": 0, "skipped": len(request.files)}
+    # Claimed before the write, so two sessions planting the same action at
+    # once cannot both get past the check while the first is still writing.
+    backend.planted.add(request.action)
+
     try:
-        planted = await asyncio.to_thread(
+        planted, skipped = await asyncio.to_thread(
             _write_files,
             backend.container_id,
             [(f.path, f.content, f.mode) for f in request.files],
         )
     except Exception as exc:
+        backend.planted.discard(request.action)
         log.error("could not plant decoys into %s", backend.container_name, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     backend.touch()
     log.info(
-        "planted %s (intent=%s) into %s: %d file(s)",
+        "planted %s (intent=%s) into %s: %d file(s), %d left alone because they already exist",
         request.action,
         request.intent,
         backend.container_name,
         planted,
+        skipped,
     )
-    return {"status": "ok", "planted": planted, "container": backend.container_name}
+    return {"status": "ok", "planted": planted, "skipped": skipped, "container": backend.container_name}
 
 
-def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> int:
+#: Prints which of its arguments already exist, and creates the parent
+#: directory of each one that does not. One exec per plant, in place of the
+#: `mkdir -p` this used to run once per directory.
+_PREPARE_SCRIPT = (
+    'for p in "$@"; do '
+    'if [ -e "$p" ] || [ -L "$p" ]; then printf \'%s\\n\' "$p"; '
+    'else d="${p%/*}"; if [ -n "$d" ]; then mkdir -p "$d"; fi; fi; '
+    "done"
+)
+
+
+def _prepare_paths(container: Any, paths: list[str]) -> set[str]:
+    """Which of `paths` already exist in the container; parents made for the rest."""
+    if not paths:
+        return set()
+    exit_code, output = container.exec_run(["sh", "-c", _PREPARE_SCRIPT, "sh", *paths], user="root")
+    if exit_code != 0:
+        raise RuntimeError(f"could not prepare decoy paths (exit {exit_code}): {output!r}")
+    requested = set(paths)
+    return {line for line in (output or b"").decode("utf-8", "replace").splitlines() if line in requested}
+
+
+def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> tuple[int, int]:
     """Place files inside a running container via the archive API.
+
+    Returns (written, skipped). A path that already exists is never
+    overwritten: it is either something the attacker made or changed, a real
+    file the node depends on, or a decoy planted earlier -- and replacing any
+    of those is visible. Generated profiles used to overwrite `.bashrc`,
+    `.bash_history`, `/etc/crontab` and the live `/var/log/auth.log`, so the
+    attacker's own history vanished and rsyslog went on writing to an unlinked
+    file while `tail` showed model-written lines.
 
     put_archive is used rather than `exec` because it leaves no process behind
     in the container's own process table. An attacker running `ps` while a
@@ -383,16 +432,17 @@ def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> int:
     # Read once: every decoy in this container hangs off the same fixed point.
     anchor = _container_epoch(container)
 
+    # Also creates any missing directories (.aws, /srv/exports and so on).
+    present = _prepare_paths(container, [path for path, _, _ in files])
+    fresh = [(path, content, mode) for path, content, mode in files if path not in present]
+
     # Group by directory: put_archive extracts a tar relative to one path.
     by_dir: dict[str, list[tuple[str, str, int]]] = {}
-    for path, content, mode in files:
+    for path, content, mode in fresh:
         directory, _, name = path.rpartition("/")
         by_dir.setdefault(directory or "/", []).append((name, content, mode))
 
     for directory, entries in by_dir.items():
-        # The directory may not exist yet (.aws, /srv/exports and so on).
-        container.exec_run(["mkdir", "-p", directory], user="root")
-
         # Ownership must match the directory the file lands in. put_archive
         # defaults to root:root, so decoys dropped into /home/devuser arrived
         # owned by root while every neighbouring file was devuser:devuser --
@@ -441,7 +491,7 @@ def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> int:
                         user="root",
                     )
 
-    return written
+    return written, len(files) - len(fresh)
 
 
 #: Decoys are dated between these two bounds, in days before now.
@@ -1023,6 +1073,11 @@ async def _reap_oldest_locked() -> None:
     await _destroy(key)
 
 
+def _log_changes(changes: list[dict[str, Any]]) -> None:
+    for change in changes[:200]:
+        log.info("  changed: %s %s", change.get("Kind"), change.get("Path"))
+
+
 async def _destroy(key: str) -> None:
     backend = state.backends.pop(key, None)
     if backend is None:
@@ -1035,15 +1090,76 @@ async def _destroy(key: str) -> None:
         backend.session_count,
         len(changes),
     )
-    for change in changes[:200]:
-        log.info("  changed: %s %s", change.get("Kind"), change.get("Path"))
+    _log_changes(changes)
     try:
         await asyncio.to_thread(_force_remove, backend.container_id)
         # The network goes with it, or we leak one per attacker we ever saw
         # and eventually exhaust Docker's address pool.
         await asyncio.to_thread(_detach_proxy, _network_name(key))
+        await asyncio.to_thread(_destroy_peers, key)
     except Exception:
         log.error("failed to remove %s", backend.container_name, exc_info=True)
+
+
+def _destroy_peers(key: str) -> None:
+    """Remove the pivot targets one attacker reached, and the network they sat on.
+
+    These used to outlive the jump host. Reaping removed node-01 only, so
+    node-02 and node-03 stayed up forever: up to 640 MB each, uncounted by
+    MAX_CONTAINERS, and still holding an attacker's old changes after their
+    jump host had been replaced with a fresh one -- a world where the box they
+    came in through had forgotten them and the boxes behind it had not.
+    """
+    for spec in PEER_PLAN.values():
+        name = _peer_container_name(key, spec["node"])
+        if not _peer_exists(name):
+            continue
+        changes = _collect_changes(name)
+        log.info("reaping peer %s (%s) for %s; %d changed path(s)", name, spec["node"], key, len(changes))
+        _log_changes(changes)
+        try:
+            _force_remove(name)
+        except DockerException:
+            log.warning("could not remove peer %s", name, exc_info=True)
+    _detach_proxy(_back_network_name(key))
+
+
+def _reap_orphans(owners: set[str]) -> int:
+    """Remove what departed attackers left behind: pivot targets and networks.
+
+    Left by pivot targets that `_destroy` did not remove before, or by a jump
+    host deleted out from under the broker -- which strands its peers, its back
+    network and its own network too, since only `_destroy` removes that. With
+    no jump host the owner can never reach any of it again. A network a node
+    is still attached to is refused by Docker, so this cannot pull one out from
+    under a live environment. Returns how many owners were cleaned up after.
+    """
+    if _docker is None:
+        return 0
+    orphans: set[str] = set()
+    for spec in PEER_PLAN.values():
+        try:
+            containers = _docker.containers.list(all=True, filters={"label": f"honeypot.node={spec['node']}"})
+        except DockerException:
+            log.warning("could not list %s containers", spec["node"], exc_info=True)
+            continue
+        for container in containers:
+            owner = container.labels.get("honeypot.key")
+            if owner and owner not in owners:
+                orphans.add(owner)
+    try:
+        networks = _docker.networks.list(filters={"label": "honeypot.role=attacker-net"})
+    except DockerException:
+        log.warning("could not list attacker networks", exc_info=True)
+        networks = []
+    for network in networks:
+        owner = (network.attrs.get("Labels") or {}).get("honeypot.key")
+        if owner and owner not in owners:
+            orphans.add(owner)
+    for owner in orphans:
+        _destroy_peers(owner)
+        _detach_proxy(_network_name(owner))
+    return len(orphans)
 
 
 def _force_remove(container_id: str) -> None:
@@ -1119,14 +1235,16 @@ async def _startup() -> None:
     async with state.lock:
         for backend in recovered:
             state.backends[backend.key] = backend
+    orphaned = await asyncio.to_thread(_reap_orphans, {b.key for b in recovered})
 
     log.info(
         "session broker up: image=%s network=%s idle_ttl=%ds max=%d | adopted %d "
-        "existing environment(s)",
+        "existing environment(s), cleaned up after %d departed attacker(s)",
         NODE_IMAGE,
         NODE_NETWORK,
         IDLE_TTL_SECONDS,
         MAX_CONTAINERS,
         len(recovered),
+        orphaned,
     )
     asyncio.create_task(_reaper())

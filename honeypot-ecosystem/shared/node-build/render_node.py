@@ -49,6 +49,13 @@ from seed_history import (  # noqa: E402
 #: who sees two versions of it.
 SEED = 0x9E3779B9
 
+#: The proxy's public key, staged by the node Dockerfile for the build only.
+BACKEND_PUBKEY = Path("/tmp/build/backend_key.pub")
+
+#: Root-owned keys sshd reads as well as each user's own ~/.ssh/authorized_keys.
+#: The proxy's key lives here, where the account it logs in as cannot touch it.
+CENTRAL_KEYS_DIR = "/etc/ssh/authorized_keys"
+
 #: Bytes nginx logs for a GET / against the portal. Measured against the
 #: running node rather than guessed: the seeded availability-probe lines carry
 #: this size, and a response size in the access log that does not match what
@@ -276,8 +283,9 @@ class NodeRenderer:
     # -- accounts ----------------------------------------------------------
 
     def render_users(self) -> None:
-        pubkey = Path("/tmp/build/backend_key.pub")
+        pubkey = BACKEND_PUBKEY
         authorized = pubkey.read_text(encoding="utf-8").strip() if pubkey.exists() else ""
+        keys_written: list[datetime] = []
 
         for user in self.identity["users"]:
             name, uid, shell = user["name"], user["uid"], user["shell"]
@@ -333,12 +341,23 @@ class NodeRenderer:
                 self.run("usermod", "-aG", "sudo", name)
 
             if user.get("login") and authorized:
-                ssh_dir = self.path(home, ".ssh")
-                ssh_dir.mkdir(parents=True, exist_ok=True)
-                ssh_dir.chmod(0o700)
-                keys = ssh_dir / "authorized_keys"
-                keys.write_text(authorized + "\n", encoding="utf-8")
-                keys.chmod(0o600)
+                # The key the proxy opens every inner session with. Root-owned
+                # and outside the home directory, because the account it logs
+                # in as is the attacker's.
+                #
+                # It used to be ~/.ssh/authorized_keys, which that account owns
+                # -- and replacing that file is the single most common thing an
+                # SSH bot does (`rm -rf ~/.ssh && mkdir ~/.ssh && echo "ssh-rsa
+                # ..." >> ~/.ssh/authorized_keys`). That deleted the proxy's key
+                # with it: every later login passed at the perimeter, then
+                # dropped with "Connection to host closed", and the attacker was
+                # locked out of their own container until the reaper deleted it.
+                #
+                # Root can still edit /etc. That is a much rarer move, and what
+                # bounds root is the container's containment, not this file.
+                provisioned = self.random_moment(120, 400)
+                self.write(f"{CENTRAL_KEYS_DIR}/{name}", authorized + "\n", mode=0o644, when=provisioned)
+                keys_written.append(provisioned)
 
             # Ubuntu 22.04 creates homes 0750, which would hide devuser's
             # home from every account without sudo -- and those are exactly
@@ -347,6 +366,11 @@ class NodeRenderer:
             # distro default.
             self.path(home).chmod(int(str(user.get("home_mode", "0750")), 8))
             self.run("chown", "-R", f"{name}:{name}", home)
+
+        # A directory's mtime is when an entry was last added to it. Left alone
+        # it would carry the build date, the one fresh stamp in /etc/ssh.
+        if keys_written:
+            self.set_time(self.path(CENTRAL_KEYS_DIR), max(keys_written))
 
         # Age the passwords so `chage -l` does not say every account was
         # created today.
@@ -382,7 +406,9 @@ class NodeRenderer:
             "LogLevel INFO\n"
             "\n"
             f"{policy_text}\n"
-            "AuthorizedKeysFile     .ssh/authorized_keys\n"
+            # Users' own keys, then the centrally managed ones (see
+            # render_users) -- the usual layout where ops pushes keys.
+            f"AuthorizedKeysFile     .ssh/authorized_keys {CENTRAL_KEYS_DIR}/%u\n"
             "ChallengeResponseAuthentication no\n"
             "UsePAM yes\n"
             "PrintMotd no\n"
