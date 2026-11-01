@@ -80,18 +80,31 @@ def test_clean_single_signal_is_unchanged():
     assert not any("tiebreak" in rule for rule in match.matched_rules)
 
 
-def test_clear_majority_is_unchanged():
-    """Two hits for one intent and one for another still takes the majority,
-    even though the majority is the shallower stage.
+def test_newest_evidence_beats_an_older_majority():
+    """The newest command with evidence decides, even against two older ones.
 
-    Note the commands: `nmap` and `whoami` trip two *different* recon rules.
-    Scoring counts rule groups, not commands, so `whoami` plus `netstat`
-    would have scored one between them and tied with the ssh.
+    This used to pin the opposite: two recon hits outvoted the `ssh` that
+    followed them. But the window slides, and its label is what the attacker
+    is doing now -- they have finished looking around and are moving. Measured
+    on the labelled transcripts (ml/intent_classification/eval_transcripts.py),
+    majority voting got 29 of 77 dev windows right; most of its misses were an
+    older command outvoting the newest one.
+
+    The older evidence is not discarded: it marks the call as contested, which
+    keeps its confidence below an uncontested one.
     """
     match = detect_intent_by_rules(activity("nmap -sV 10.0.0.1", "whoami", "ssh host"))
     assert match is not None
+    assert match.intent == "lateral_movement"
+    assert any("tiebreak:recency" in rule for rule in match.matched_rules)
+    assert match.confidence < detect_intent_by_rules(activity("ssh host")).confidence
+
+
+def test_older_evidence_decides_when_the_newest_commands_are_neutral():
+    """`cd` and `chmod +x` say nothing, so the stage comes from what preceded them."""
+    match = detect_intent_by_rules(activity("nmap -sV 10.0.0.1", "cd /tmp", "chmod +x run.sh"))
+    assert match is not None
     assert match.intent == "reconnaissance"
-    assert not any("tiebreak" in rule for rule in match.matched_rules)
 
 
 def test_no_evidence_still_abstains():

@@ -1,6 +1,6 @@
 {
-  "model_name": "RandomForestClassifier",
-  "model_type": "random_forest",
+  "model_name": "HistGradientBoostingClassifier",
+  "model_type": "gradient_boosting",
   "labels": [
     "reconnaissance",
     "privilege_escalation",
@@ -8,13 +8,111 @@
     "lateral_movement",
     "data_exfiltration"
   ],
-  "feature_count": 149,
-  "training_samples": 600,
+  "training_samples": 32740,
   "class_balance": {
-    "lateral_movement": 120,
-    "data_exfiltration": 120,
-    "privilege_escalation": 120,
-    "persistence": 120,
-    "reconnaissance": 120
+    "persistence": 4169,
+    "reconnaissance": 15092,
+    "lateral_movement": 4479,
+    "data_exfiltration": 4490,
+    "privilege_escalation": 4510
+  },
+  "sklearn_version": "1.9.1",
+  "dataset_version": "9",
+  "feature_names_sha256": "87b973586018d2fb926ba6fc53e53fd88879583bc17b999e90c2fa26b1910527",
+  "feature_count": 398,
+  "evaluation": {
+    "note": "Measured on ml/intent_classification/eval_transcripts.py, never on generated data.",
+    "dev": {
+      "rules": {
+        "windows": 77,
+        "accuracy": 0.896,
+        "accuracy_ci95": [
+          0.808,
+          0.946
+        ],
+        "informative_accuracy": 0.972,
+        "macro_f1": 0.926,
+        "coverage": 0.935
+      },
+      "ml": {
+        "windows": 77,
+        "accuracy": 0.935,
+        "accuracy_ci95": [
+          0.857,
+          0.972
+        ],
+        "informative_accuracy": 0.972,
+        "macro_f1": 0.944,
+        "coverage": 1.0
+      },
+      "hybrid": {
+        "windows": 77,
+        "accuracy": 0.922,
+        "accuracy_ci95": [
+          0.84,
+          0.964
+        ],
+        "informative_accuracy": 0.972,
+        "macro_f1": 0.927,
+        "coverage": 1.0
+      },
+      "session": {
+        "windows": 77,
+        "accuracy": 0.922,
+        "accuracy_ci95": [
+          0.84,
+          0.964
+        ],
+        "informative_accuracy": 0.972,
+        "macro_f1": 0.927,
+        "coverage": 1.0
+      }
+    },
+    "test": {
+      "rules": {
+        "windows": 229,
+        "accuracy": 0.939,
+        "accuracy_ci95": [
+          0.9,
+          0.963
+        ],
+        "informative_accuracy": 0.986,
+        "macro_f1": 0.965,
+        "coverage": 0.952
+      },
+      "ml": {
+        "windows": 229,
+        "accuracy": 0.83,
+        "accuracy_ci95": [
+          0.776,
+          0.873
+        ],
+        "informative_accuracy": 0.867,
+        "macro_f1": 0.811,
+        "coverage": 1.0
+      },
+      "hybrid": {
+        "windows": 229,
+        "accuracy": 0.943,
+        "accuracy_ci95": [
+          0.905,
+          0.967
+        ],
+        "informative_accuracy": 0.986,
+        "macro_f1": 0.942,
+        "coverage": 1.0
+      },
+      "session": {
+        "windows": 229,
+        "accuracy": 0.961,
+        "accuracy_ci95": [
+          0.927,
+          0.979
+        ],
+        "informative_accuracy": 0.986,
+        "macro_f1": 0.963,
+        "coverage": 1.0
+      }
+    }
   }
 }

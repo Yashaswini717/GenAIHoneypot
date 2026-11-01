@@ -3,11 +3,14 @@ from __future__ import annotations
 import math
 import re
 import statistics
-from collections import OrderedDict
-from datetime import datetime
+from collections import Counter, OrderedDict
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from core.intent_taxonomy import COMMAND_KEYWORDS, DB_QUERY_KEYWORDS, HTTP_PATH_KEYWORDS
+from core.intent_taxonomy import COMMAND_KEYWORDS, DB_QUERY_KEYWORDS, HTTP_PATH_KEYWORDS, INTENT_CLASSES
+
+from .rules import is_external_host
+from .shell import segments
 
 
 HTTP_METHOD_PATTERN = re.compile(r"\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b", re.IGNORECASE)
@@ -178,27 +181,33 @@ INTENT_SIGNATURES: dict[str, dict[str, tuple[str, ...]]] = {
 
 
 def _normalize_text(values: Iterable[str]) -> str:
-    return " \n".join(value.strip().lower() for value in values if value and value.strip())
+    # Plain newlines. This joined on " \n", which put a space after every
+    # command, so the keyword "ssh " matched any command ending in `~/.ssh`.
+    return "\n".join(value.strip().lower() for value in values if value and value.strip())
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
-    if value is None:
-        return None
+    """Parse to an aware UTC datetime, whatever shape the timestamp arrived in.
+
+    Everything is made aware: a naive and an aware datetime cannot be compared,
+    so one epoch-seconds value among ISO strings used to crash the sort.
+    """
+    parsed: datetime | None = None
     if isinstance(value, datetime):
-        return value
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value)
-    if isinstance(value, str):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        parsed = datetime.fromtimestamp(value, tz=timezone.utc)
+    elif isinstance(value, str):
         raw = value.strip()
-        if not raw:
-            return None
         if raw.endswith("Z"):
             raw = raw[:-1] + "+00:00"
         try:
-            return datetime.fromisoformat(raw)
+            parsed = datetime.fromisoformat(raw) if raw else None
         except ValueError:
-            return None
-    return None
+            parsed = None
+    if parsed is not None and parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _interval_stats(event_timestamps: list[Any]) -> dict[str, float]:
@@ -305,8 +314,12 @@ def _command_features(commands: list[str]) -> OrderedDict[str, float]:
     features["command_avg_length"] = (
         statistics.fmean(len(command) for command in commands) if commands else 0.0
     )
+    # Summed over a Counter, in first-seen order, not over a set: set order
+    # changes with each process's hash seed, the float sum changed with it, and
+    # retraining on identical data produced a different model every time.
+    token_counts = Counter(tokens)
     features["command_entropy"] = (
-        -sum((tokens.count(token) / len(tokens)) * math.log2(tokens.count(token) / len(tokens)) for token in unique_tokens)
+        -sum((count / len(tokens)) * math.log2(count / len(tokens)) for count in token_counts.values())
         if tokens
         else 0.0
     )
@@ -394,6 +407,156 @@ def _cross_source_features(command_text: str, http_text: str, db_text: str, timi
     return features
 
 
+#: Programs that get a feature of their own. A program outside this list
+#: contributes nothing here, which is the honest default: the model cannot
+#: know what an unfamiliar binary does any better than a reader could.
+PROGRAM_VOCABULARY: tuple[str, ...] = tuple(sorted({
+    # looking around
+    "whoami", "id", "w", "who", "last", "lastlog", "users", "groups", "uname", "hostname", "hostnamectl",
+    "lsb_release", "uptime", "ps", "top", "htop", "pstree", "netstat", "ss", "ifconfig", "ip", "arp", "route",
+    "lscpu", "nproc", "free", "df", "lsblk", "lsof", "env", "printenv", "which", "whereis", "getent", "dmesg",
+    "lspci", "journalctl", "iptables", "dpkg", "rpm", "systemctl", "service", "docker", "kubectl", "ls", "find",
+    "locate", "du", "stat", "tree", "file", "cat", "head", "tail", "less", "more", "grep", "egrep", "awk", "sed",
+    "strings", "history", "nmap", "masscan", "ping", "fping", "dig", "nslookup", "traceroute", "nc", "ncat",
+    "netcat", "socat", "curl", "wget", "aws", "crontab", "mount", "date", "timedatectl", "lsmod", "showmount",
+    "apt", "pip", "pip3", "snap", "gcloud", "az", "podman", "crictl", "oc", "column",
+    # escalating
+    "sudo", "su", "pkexec", "doas", "getcap", "setcap", "chmod", "chown", "unshadow", "john", "hashcat", "gcc",
+    "cc", "make", "searchsploit", "python", "python3", "perl", "visudo", "nsenter",
+    # staying
+    "useradd", "adduser", "usermod", "chpasswd", "passwd", "chage", "chattr", "lockr", "update-rc.d", "chkconfig",
+    "at", "ln", "cp", "mv", "install", "tee", "echo", "printf", "nano", "vi", "vim", "insmod", "modprobe",
+    # moving
+    "ssh", "sshpass", "scp", "rsync", "sftp", "ssh-copy-id", "smbclient", "proxychains", "telnet", "ansible",
+    "ansible-playbook", "salt", "pssh", "pdsh",
+    # taking
+    "tar", "zip", "gzip", "bzip2", "xz", "7z", "split", "base64", "xxd", "mysqldump", "pg_dump", "pg_dumpall",
+    "mongodump", "mongoexport", "mysql", "psql", "sqlite3", "rclone", "gsutil", "gpg", "openssl", "ccrypt", "dd",
+    "tftp", "lftp", "ncftpput", "redis-cli",
+    # neither
+    "cd", "pwd", "clear", "exit", "bash", "sh", "export", "unset", "rm", "mkdir", "touch", "kill", "pkill",
+    "sleep", "busybox",
+}))
+
+#: Where a command reaches, as (feature name, pattern on the raw command).
+PATH_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (name, re.compile(pattern)) for name, pattern in (
+        ("authorized_keys", r"authorized_keys"),
+        ("shadow", r"/etc/(shadow|gshadow)"),
+        ("sudoers", r"sudoers"),
+        ("cron", r"cron"),
+        ("boot_script", r"rc\.local|/etc/init\.d/"),
+        ("shell_profile", r"\.bashrc|\.bash_profile|\.profile\b|/etc/profile"),
+        ("systemd_unit", r"/systemd/(system|user)/|\.service\b"),
+        ("ssh_dir", r"\.ssh/|known_hosts"),
+        ("proc", r"/proc/"),
+        ("passwd_file", r"/etc/(passwd|group)"),
+        ("secrets_file", r"credentials|\.netrc|\.pgpass|\.my\.cnf|\.env\b|wp-config|settings\.|config\.(php|ya?ml|json|ini)"),
+        ("dev_tcp", r"/dev/tcp/"),
+        ("staging_dir", r"/tmp/|/dev/shm/|/var/tmp/"),
+        ("system_bin", r"/usr/(local/)?s?bin/|\s/s?bin/"),
+        ("cloud_bucket", r"s3://|gs://|remote:"),
+        ("url", r"(https?|ftp)://"),
+        ("log_dir", r"/var/log/"),
+        ("web_root", r"/var/www|/srv/"),
+        ("sshd_config", r"/etc/ssh/sshd_config"),
+        ("pam", r"/etc/pam\.d/|pam_\w+\.so"),
+        ("motd", r"update-motd\.d"),
+        ("web_shell", r"/var/www/\S*\.(php\d?|phtml|jsp)\b"),
+        ("data_file", r"\.(csv|tsv|sql|dump|xlsx?|db|sqlite3?|kdbx?)\b"),
+        ("disk_device", r"/dev/(sd[a-z]|nvme\d|xvd[a-z]|vd[a-z])"),
+        ("kernel_module", r"\.ko\b"),
+        ("hidden_staging", r"/(tmp|dev/shm|var/tmp)/\."),
+        ("sudoers_dir", r"/etc/sudoers"),
+    )
+)
+
+#: Shapes of arguments that change what a command does.
+FLAG_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (name, re.compile(pattern)) for name, pattern in (
+        ("upload", r"\s(-F|-T|--form|--upload-file|--post-file)\b|--data-binary\s+@|-d\s+@"),
+        ("suid_perm", r"-perm\s+[-/+]?(4000|2000|6000|u=s|g=s)"),
+        ("setuid_mode", r"chmod\s+([ugoa]*\+s|[2467][0-7]{3})\b"),
+        ("port_probe", r"\bnc\b.*\s-[a-y]*z|\bnmap\b"),
+        ("pipe_to_shell", r"\|\s*(sudo\s+)?(ba|z|da)?sh\b"),
+        ("write_redirect", r"[^2&]>{1,2}\s*[^&\s]"),
+        ("append_redirect", r">>"),
+        ("input_redirect", r"\s<\s*[^<]"),
+        ("remote_spec", r"\b[\w.-]+@[\w.$-]+:"),
+        ("sql_select", r"(?i)\bselect\b.+\bfrom\b"),
+        ("sql_schema", r"(?i)\bshow\s+(databases|tables)|information_schema|\\d[tl]?\b|\bdescribe\b"),
+        ("tunnel", r"\bssh\b.*\s-[a-zA-Z]*[LDR]\b"),
+        ("decode", r"\s(-d|--decode)\b"),
+        ("create_archive", r"\btar\s+-?[a-z]*c[a-z]*\b|\bzip\s+-r"),
+        ("in_place_edit", r"\bsed\s+(-\S+\s+)*-i|\bperl\s+-\w*i"),
+        ("encrypt", r"\bgpg\b.*(\s-\w*[ce]\b|--symmetric|--encrypt)|\bopenssl\s+(enc|aes|des|chacha)"),
+        ("container_exec", r"\b(kubectl|docker|podman|oc|crictl)\s+(exec|attach|cp|rsh)\b"),
+        ("remote_exec", r"\b(ansible|ansible-playbook|salt|pssh|pdsh|clush)\b"),
+        ("dev_tcp_write", r">\s*/dev/(tcp|udp)/"),
+        ("upload_verb", r"\b(m?put|upload)\b"),
+        ("listing_flag", r"\s(-l|--list|-qa|list)\b"),
+    )
+)
+
+_IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_SETUID_MODE = dict(FLAG_MARKERS)["setuid_mode"]
+
+
+def _recency_weights(count: int) -> list[float]:
+    """Newest command 1.0, the one before 0.5, then 0.25 -- oldest first."""
+    return [0.5 ** (count - 1 - index) for index in range(count)]
+
+
+def _window_features(commands: list[str]) -> OrderedDict[str, float]:
+    """What each command runs and touches, weighted toward the newest command.
+
+    The window's label is the stage at its newest command, so a feature that
+    cannot tell "ssh happened two commands ago" from "ssh just happened" throws
+    away the single most useful thing the model could know. Each feature is the
+    recency-weighted count of commands it appears in: 1.0 means the newest
+    command alone, 1.75 all three.
+    """
+    names = (
+        [f"prog_{re.sub(r'[^a-z0-9]', '_', p)}" for p in PROGRAM_VOCABULARY]
+        + [f"path_{name}" for name, _ in PATH_MARKERS]
+        + [f"flag_{name}" for name, _ in FLAG_MARKERS]
+        + ["addr_internal", "addr_external", "recency_last_has_program_hit", "window_neutral_share"]
+    )
+    features: OrderedDict[str, float] = OrderedDict((name, 0.0) for name in names)
+    vocabulary = set(PROGRAM_VOCABULARY)
+    neutral = {"cd", "pwd", "clear", "exit", "bash", "sh", "export", "unset", "rm", "mkdir", "touch", "kill", "pkill", "sleep"}
+
+    neutral_commands = 0
+    for command, weight in zip(commands, _recency_weights(len(commands))):
+        ran: set[str] = set()
+        for segment in segments(command):
+            ran.update(w for w in segment.wrappers if w in vocabulary)
+            if segment.program in vocabulary:
+                ran.add(segment.program)
+        for program in ran:
+            features[f"prog_{re.sub(r'[^a-z0-9]', '_', program)}"] += weight
+        staged = ran - neutral
+        if staged == {"chmod"} and not _SETUID_MODE.search(command):
+            staged = set()  # chmod +x readies a tool; only a setuid/setgid bit is a stage
+        if not staged:
+            neutral_commands += 1
+        for name, pattern in PATH_MARKERS:
+            if pattern.search(command):
+                features[f"path_{name}"] += weight
+        for name, pattern in FLAG_MARKERS:
+            if pattern.search(" " + command):
+                features[f"flag_{name}"] += weight
+        addresses = _IPV4.findall(command)
+        if any(is_external_host(a) for a in addresses):
+            features["addr_external"] += weight
+        if any(not is_external_host(a) for a in addresses):
+            features["addr_internal"] += weight
+        if weight == 1.0:
+            features["recency_last_has_program_hit"] = 1.0 if staged else 0.0
+    features["window_neutral_share"] = neutral_commands / len(commands) if commands else 0.0
+    return features
+
+
 def extract_features(activity: dict[str, Any]) -> OrderedDict[str, float]:
     commands = [str(command) for command in activity.get("commands", [])]
     http_logs = [str(log) for log in activity.get("http_logs", [])]
@@ -429,6 +592,24 @@ def extract_features(activity: dict[str, Any]) -> OrderedDict[str, float]:
     features.update(_db_features(db_queries))
     features.update(timing_features)
     features.update(_cross_source_features(command_text, http_text, db_text, timing_features))
+    features.update(_window_features(commands))
+    features.update(_session_features(activity.get("previous_intent")))
+    return features
+
+
+def _session_features(previous_intent: Any) -> OrderedDict[str, float]:
+    """The intent returned for the session's previous window, one-hot.
+
+    Context, not a verdict. A window of `cd`, `chmod +x` and heredoc lines
+    carries no stage of its own, and the model learns to keep the previous one
+    there -- while a window that does show a change (an exploit compiled and
+    run, a config edited in place) still overrides it. A fixed "carry the old
+    stage forward" rule broke exactly those changes.
+    """
+    features: OrderedDict[str, float] = OrderedDict(
+        (f"session_prev_{intent}", 1.0 if previous_intent == intent else 0.0) for intent in INTENT_CLASSES
+    )
+    features["session_prev_known"] = 1.0 if previous_intent in INTENT_CLASSES else 0.0
     return features
 
 

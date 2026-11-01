@@ -22,6 +22,7 @@ def _to_activity(data: dict) -> dict:
         "db_queries": db_queries,
         "event_timestamps": event_timestamps,
         "raw_activity": data.get("log", ""),
+        "previous_intent": data.get("previous_intent"),
     }
 
 

@@ -1,6 +1,24 @@
+"""Training, persistence and inference for the intent model.
+
+The model answers only when the rules abstain (predict.py), which in live
+traffic means windows made of commands the rules do not recognise. It is
+trained on generated sessions (dataset.py) and judged on hand-labelled ones
+(evaluation.py); the figures from the last training run are written into
+intent_model_metadata.json alongside the model.
+
+A committed model is only valid for the code that produced it. Pickles from
+another scikit-learn version may load and quietly mispredict, and a model
+trained on a different feature list maps values onto the wrong columns. So
+the artifact records what it was built from, and `load_or_train` retrains
+instead of trusting one that no longer matches.
+"""
+
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,22 +26,30 @@ from time import perf_counter
 from typing import Any
 
 import joblib
-from sklearn.ensemble import RandomForestClassifier
+import sklearn
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 
 from core.intent_taxonomy import INTENT_CLASSES
 
-from .dataset import build_training_dataset
-from .feature_engineering import extract_features
+from .dataset import DATASET_VERSION, build_training_dataset
+from .feature_engineering import extract_features, feature_names
 
 try:
     from xgboost import XGBClassifier
 except Exception:  # pragma: no cover - optional dependency
     XGBClassifier = None
 
+log = logging.getLogger(__name__)
 
 MODEL_DIR = Path(__file__).resolve().parent
 MODEL_PATH = MODEL_DIR / "intent_model.joblib"
 METADATA_PATH = MODEL_DIR / "intent_model_metadata.json"
+
+#: Gradient boosting replaced the random forest as the default: on the
+#: labelled transcripts it scored higher (0.935 vs 0.779 on dev) from an
+#: artifact about a seventh the size (0.46 MB vs 3.3 MB), and predicts faster.
+DEFAULT_MODEL_TYPE = "gradient_boosting"
+MODEL_TYPES = ("gradient_boosting", "random_forest", "xgboost")
 
 
 @dataclass
@@ -36,69 +62,11 @@ class PredictionResult:
     model_name: str
 
 
-def _normalized(values: dict[str, float]) -> dict[str, float]:
-    total = sum(max(value, 0.0) for value in values.values())
-    if total <= 0:
-        uniform = 1.0 / len(INTENT_CLASSES)
-        return {intent: uniform for intent in INTENT_CLASSES}
-    return {intent: max(values.get(intent, 0.0), 0.0) / total for intent in INTENT_CLASSES}
-
-
-def _feature_signal_probabilities(feature_map: dict[str, float]) -> dict[str, float]:
-    signals = {
-        "reconnaissance": (
-            feature_map.get("cross_reconnaissance_signal", 0.0)
-            + 2.0 * feature_map.get("commands_reconnaissance_signature_hits", 0.0)
-            + 1.5 * feature_map.get("http_reconnaissance_signature_hits", 0.0)
-            + 1.5 * feature_map.get("db_reconnaissance_signature_hits", 0.0)
-            + 1.0 * feature_map.get("contains_recon_marker", 0.0)
-        ),
-        "privilege_escalation": (
-            feature_map.get("cross_privilege_escalation_signal", 0.0)
-            + 2.0 * feature_map.get("commands_privilege_escalation_signature_hits", 0.0)
-            + 1.5 * feature_map.get("http_privilege_escalation_signature_hits", 0.0)
-            + 1.5 * feature_map.get("db_privilege_escalation_signature_hits", 0.0)
-            + 1.0 * feature_map.get("contains_auth_marker", 0.0)
-        ),
-        "persistence": (
-            feature_map.get("cross_persistence_signal", 0.0)
-            + 2.0 * feature_map.get("commands_persistence_signature_hits", 0.0)
-            + 1.5 * feature_map.get("http_persistence_signature_hits", 0.0)
-            + 1.5 * feature_map.get("db_persistence_signature_hits", 0.0)
-            + 1.0 * feature_map.get("contains_persistence_marker", 0.0)
-        ),
-        "lateral_movement": (
-            feature_map.get("cross_lateral_movement_signal", 0.0)
-            + 2.0 * feature_map.get("commands_lateral_movement_signature_hits", 0.0)
-            + 1.5 * feature_map.get("http_lateral_movement_signature_hits", 0.0)
-            + 1.5 * feature_map.get("db_lateral_movement_signature_hits", 0.0)
-            + 1.0 * feature_map.get("contains_remote_exec_marker", 0.0)
-        ),
-        "data_exfiltration": (
-            feature_map.get("cross_data_exfiltration_signal", 0.0)
-            + 2.0 * feature_map.get("commands_data_exfiltration_signature_hits", 0.0)
-            + 1.5 * feature_map.get("http_data_exfiltration_signature_hits", 0.0)
-            + 1.5 * feature_map.get("db_data_exfiltration_signature_hits", 0.0)
-            + 1.0 * feature_map.get("contains_archive_marker", 0.0)
-            + 1.0 * feature_map.get("contains_base64_marker", 0.0)
-        ),
-    }
-    return _normalized(signals)
-
-
-def _blend_probabilities(
-    model_probabilities: dict[str, float],
-    feature_probabilities: dict[str, float],
-) -> dict[str, float]:
-    blended = {
-        intent: (0.55 * model_probabilities.get(intent, 0.0)) + (0.45 * feature_probabilities.get(intent, 0.0))
-        for intent in INTENT_CLASSES
-    }
-    return _normalized(blended)
-
-
-def _build_classifier(model_type: str = "random_forest"):
+def _build_classifier(model_type: str = DEFAULT_MODEL_TYPE):
     if model_type == "xgboost" and XGBClassifier is not None:
+        # NOTE: XGBClassifier needs integer labels; untested here because
+        # xgboost is not a dependency, so the option only works once that is
+        # handled. Without xgboost installed this falls through to the default.
         return XGBClassifier(
             n_estimators=120,
             max_depth=5,
@@ -111,56 +79,129 @@ def _build_classifier(model_type: str = "random_forest"):
             random_state=42,
             verbosity=0,
         )
-
-    return RandomForestClassifier(
-        n_estimators=160,
-        max_depth=10,
-        min_samples_leaf=2,
+    if model_type == "random_forest":
+        return RandomForestClassifier(
+            n_estimators=60,
+            min_samples_leaf=6,
+            class_weight="balanced",
+            random_state=42,
+            n_jobs=1,
+        )
+    return HistGradientBoostingClassifier(
+        max_iter=200,
+        learning_rate=0.1,
+        max_leaf_nodes=31,
+        class_weight="balanced",
         random_state=42,
-        n_jobs=1,
-        class_weight="balanced"
-        
     )
 
 
-def train_and_persist(model_type: str = "random_forest") -> dict[str, Any]:
+def _fingerprint(names: list[str]) -> dict[str, str]:
+    """What a model was built from. Any difference makes it stale."""
+    return {
+        "sklearn_version": sklearn.__version__,
+        "dataset_version": DATASET_VERSION,
+        "feature_names_sha256": hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest(),
+    }
+
+
+def train(model_type: str = DEFAULT_MODEL_TYPE) -> dict[str, Any]:
+    """Train a model in memory and return its artifact."""
+    started = perf_counter()
     dataset = build_training_dataset()
     rows = [extract_features(sample) for sample in dataset]
     labels = [str(sample["label"]) for sample in dataset]
-    feature_names = list(rows[0].keys()) if rows else []
-    matrix = [list(row.values()) for row in rows]
+    names = list(rows[0].keys())
 
     model = _build_classifier(model_type)
-    model.fit(matrix, labels)
+    model.fit([list(row.values()) for row in rows], labels)
 
     artifact = {
         "model": model,
-        "feature_names": feature_names,
-        "labels": INTENT_CLASSES,
+        "feature_names": names,
+        "labels": list(INTENT_CLASSES),
         "model_name": model.__class__.__name__,
-    }
-    joblib.dump(artifact, MODEL_PATH)
-    metadata = {
-        "model_name": artifact["model_name"],
-        "model_type": model_type if artifact["model_name"] != "RandomForestClassifier" else "random_forest",
-        "labels": INTENT_CLASSES,
-        "feature_count": len(feature_names),
+        "model_type": model_type,
         "training_samples": len(dataset),
         "class_balance": dict(Counter(labels)),
+        **_fingerprint(names),
     }
-    METADATA_PATH.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    log.info("trained %s on %d windows in %.1fs", artifact["model_name"], len(dataset), perf_counter() - started)
     return artifact
 
 
-def load_or_train(model_type: str = "random_forest") -> dict[str, Any]:
+def train_and_persist(model_type: str = DEFAULT_MODEL_TYPE) -> dict[str, Any]:
+    """Train, evaluate on the labelled transcripts, and write model + metadata."""
+    from .evaluation import run
+
+    artifact = train(model_type)
+    joblib.dump(artifact, MODEL_PATH, compress=3)
+
+    results = run(IntentClassifier(artifact=artifact))
+    metadata = {
+        key: artifact[key]
+        for key in (
+            "model_name", "model_type", "labels", "training_samples", "class_balance",
+            "sklearn_version", "dataset_version", "feature_names_sha256",
+        )
+    }
+    metadata["feature_count"] = len(artifact["feature_names"])
+    metadata["evaluation"] = {
+        "note": "Measured on ml/intent_classification/eval_transcripts.py, never on generated data.",
+        **{
+            split: {name: report.summary() for name, report in reports.items()}
+            for split, reports in results.items()
+        },
+    }
+    METADATA_PATH.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    artifact["evaluation"] = results
+    return artifact
+
+
+def stale_reason(artifact: dict[str, Any], model_type: str) -> str | None:
+    """Why an artifact cannot be used as-is, or None when it can."""
+    if artifact.get("model_type", "random_forest") != model_type:
+        return f"model type is {artifact.get('model_type')!r}, wanted {model_type!r}"
+    expected = _fingerprint(feature_names())
+    for key, value in expected.items():
+        if artifact.get(key) != value:
+            return f"{key} is {artifact.get(key)!r}, current code has {value!r}"
+    return None
+
+
+def load_or_train(model_type: str = DEFAULT_MODEL_TYPE) -> dict[str, Any]:
+    """The committed model when it matches this code, otherwise a fresh one.
+
+    A fresh model is trained in memory only. Writing it back silently would
+    leave an unexplained binary diff in the working tree; the warning says how
+    to refresh the committed artifact instead.
+    """
+    reason = "no model file"
     if MODEL_PATH.exists():
-        return joblib.load(MODEL_PATH)
-    return train_and_persist(model_type=model_type)
+        try:
+            with warnings.catch_warnings():
+                # Version mismatches are detected below, deliberately and with
+                # a reason, rather than as a pickle warning nobody reads.
+                warnings.simplefilter("ignore")
+                artifact = joblib.load(MODEL_PATH)
+        except Exception as exc:  # corrupt file, missing class, ...
+            reason = f"model file unreadable ({exc})"
+        else:
+            reason = stale_reason(artifact, model_type)
+            if reason is None:
+                return artifact
+
+    log.warning(
+        "intent model at %s cannot be used (%s); training %s in memory. "
+        "Run `python -m ml.intent_classification.train` to refresh the committed model.",
+        MODEL_PATH, reason, model_type,
+    )
+    return train(model_type)
 
 
 class IntentClassifier:
-    def __init__(self, model_type: str = "random_forest"):
-        self.artifact = load_or_train(model_type=model_type)
+    def __init__(self, model_type: str = DEFAULT_MODEL_TYPE, artifact: dict[str, Any] | None = None):
+        self.artifact = artifact if artifact is not None else load_or_train(model_type=model_type)
         self.model = self.artifact["model"]
         self.feature_names = list(self.artifact["feature_names"])
         self.labels = list(self.artifact["labels"])
@@ -172,18 +213,19 @@ class IntentClassifier:
         started = perf_counter()
         probabilities_raw = self.model.predict_proba([vector])[0]
         inference_time_ms = (perf_counter() - started) * 1000
-        model_probabilities = {
-            label: float(probability)
-            for label, probability in zip(self.model.classes_, probabilities_raw)
-        }
-        feature_probabilities = _feature_signal_probabilities(feature_map)
-        probabilities = _blend_probabilities(model_probabilities, feature_probabilities)
+        # The model's own probabilities. They used to be blended 55/45 with a
+        # keyword-count heuristic; on the labelled transcripts the blend cost
+        # 13 points of dev accuracy (0.753 -> 0.623) and gained nothing on test.
+        probabilities = {label: 0.0 for label in self.labels}
+        probabilities.update(
+            {str(label): float(p) for label, p in zip(self.model.classes_, probabilities_raw)}
+        )
         predicted_intent = max(probabilities, key=probabilities.get)
         return PredictionResult(
             predicted_intent=predicted_intent,
-            confidence=probabilities.get(predicted_intent, 0.0),
-            probabilities={label: probabilities.get(label, 0.0) for label in self.labels},
-            feature_values=feature_map,
+            confidence=probabilities[predicted_intent],
+            probabilities=probabilities,
+            feature_values=dict(feature_map),
             inference_time_ms=inference_time_ms,
             model_name=self.model_name,
         )

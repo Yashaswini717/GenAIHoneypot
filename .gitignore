@@ -117,3 +117,10 @@ geoip/*.mmdb
 # See intelligence_hub/geoip/README.md to fetch it.
 intelligence_hub/geoip/*.mmdb
 intelligence_hub/geoip/*.mmdb.gz
+
+# Honeypot captures being prepared for labelling (ai-brain/.../captures.py).
+# Exports are raw and candidates unlabelled (unscrubbed with --no-scrub): keep them local.
+# Only the labelled captured_sessions.json is meant to be committed.
+capture_candidates*.json
+ai-brain/content-generator/telemetry/
+ai-brain/content-generator/es.json

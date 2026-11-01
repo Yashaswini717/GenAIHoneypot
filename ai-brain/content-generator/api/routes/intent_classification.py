@@ -17,8 +17,11 @@ router = APIRouter(tags=["intent-classification"])
 logger = get_logger(__name__)
 
 
+#: A plain `def`, so FastAPI runs it in its threadpool. As `async def` the model
+#: inference and the bandit's SQLite writes ran on the event loop itself, and
+#: every other request -- health checks, decoy generation -- waited behind them.
 @router.post("/intent-classify", response_model=IntentClassificationResponse)
-async def classify_attacker_intent(
+def classify_attacker_intent(
     request: IntentClassificationRequest,
     decision_engine: AdaptiveDecisionEngine = Depends(get_adaptive_engine),
 ) -> IntentClassificationResponse:
