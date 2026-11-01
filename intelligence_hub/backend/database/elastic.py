@@ -38,6 +38,8 @@ async def init_elasticsearch():
                     "asn":             {"type": "keyword"},
                     "mitre_tactic":    {"type": "keyword"},
                     "mitre_technique": {"type": "keyword"},
+                    # "sensor" or "operator_upload": see ingest.normalizer
+                    "source":          {"type": "keyword"},
                     "location": {
                         "type": "geo_point"
                     }

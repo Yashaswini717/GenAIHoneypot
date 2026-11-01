@@ -196,6 +196,8 @@ services:
       EVENT_PATH: /var/spool/honeypot/events.ndjson
       STATE_PATH: /var/lib/sidecar/offset.json
       SPOOL_DIR: /var/lib/sidecar/pending
+      # Events the hub rejected as malformed. Move one back to SPOOL_DIR to resend.
+      DEAD_LETTER_DIR: /var/lib/sidecar/dead-letter
       FLUSH_INTERVAL: "${FLUSH_INTERVAL:-5.0}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     volumes:

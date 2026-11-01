@@ -32,6 +32,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from ingest.normalizer import SOURCE_SENSOR
+
 
 #: Sensor name to position in the estate: how far through they got.
 NODE_DEPTH: dict[str, int] = {
@@ -67,8 +69,21 @@ def _seconds(later: datetime, earlier: datetime) -> float:
     return max(0.0, (later - earlier).total_seconds())
 
 
+def is_live(row: dict[str, Any]) -> bool:
+    """Whether a sensor recorded this session, as opposed to an operator upload.
+
+    An upload is whatever file someone chose to send, so it says nothing about
+    how long the estate held an attacker. A row with no source counts as a
+    sensor's: the query always supplies one, and fixtures predate the column.
+    """
+    return (row.get("source") or SOURCE_SENSOR) == SOURCE_SENSOR
+
+
 def build_visits(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Group an attacker's sessions into visits, split on inactivity.
+
+    Sessions that are not live (`is_live`) are skipped here, so no caller can
+    count an upload as an attacker by forgetting to filter.
 
     Pure and separated from the query so it can be tested on fixed input;
     the sessionisation rule is the part most likely to be wrong, and it is
@@ -76,6 +91,8 @@ def build_visits(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     by_attacker: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
+        if not is_live(row):
+            continue
         by_attacker.setdefault(row["attacker"], []).append(row)
 
     visits: list[dict[str, Any]] = []

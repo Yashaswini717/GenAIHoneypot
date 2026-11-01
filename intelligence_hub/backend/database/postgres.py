@@ -6,6 +6,7 @@ from datetime import datetime
 import enum
 
 from config import DATABASE_URL
+from ingest.normalizer import SOURCE_SENSOR
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -56,6 +57,11 @@ class Session(Base):
     threat_score = Column(Integer, default=0)
     mitre_tactics = Column(ARRAY(String), default=list)
 
+    # Where the session's events came from: "sensor" (recorded live, signed)
+    # or "operator_upload" (a file uploaded through the dashboard). Retention
+    # counts only sensor sessions. See SOURCE_* in ingest.normalizer.
+    source       = Column(String, default=SOURCE_SENSOR)
+
 
 class Alert(Base):
     __tablename__ = "alerts"
@@ -85,6 +91,9 @@ _SESSION_COLUMNS = (
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS adaptive BOOLEAN DEFAULT TRUE",
     "CREATE INDEX IF NOT EXISTS ix_sessions_attacker_id ON sessions (attacker_id)",
     "CREATE INDEX IF NOT EXISTS ix_sessions_adaptive ON sessions (adaptive)",
+    # Rows from before uploads were tagged become 'sensor'. Uploads made
+    # before this change cannot be told apart, and are not.
+    f"ALTER TABLE sessions ADD COLUMN IF NOT EXISTS source VARCHAR DEFAULT '{SOURCE_SENSOR}'",
 )
 
 

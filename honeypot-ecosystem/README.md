@@ -145,7 +145,8 @@ git worktree add ../GenAIHoneypot-hub feature/intelligence-hub
 ```
 
 Then create `intelligence_hub/.env`. **`HMAC_SECRET` must be byte-identical
-to this module's**, or every signed event is rejected with 401:
+to this module's**, or every signed event is rejected with 401. The hub
+refuses to start with a secret published in this repo (`dev`, `change-me`):
 
 ```
 HMAC_SECRET=<copy from honeypot-ecosystem/.env>
@@ -156,7 +157,12 @@ NEO4J_USER=neo4j
 NEO4J_PASSWORD=<pick one>
 LOG_LEVEL=info
 CORS_ORIGIN=http://localhost:5173
+# Only for the dashboard's Ingest Logs page; leave it out to disable uploads.
+OPERATOR_TOKEN=<python -c "import secrets; print(secrets.token_urlsafe(32))">
 ```
+
+How events are signed and checked, and every ingest setting, is in
+`intelligence_hub/README.md`.
 
 ```bash
 cd ../GenAIHoneypot-hub/intelligence_hub; docker compose up -d
@@ -265,6 +271,26 @@ python -m pytest tests/ -v
 Eleven tests covering command reconstruction: tab completion, history recall,
 unechoed sudo passwords, and the ANSI/CR edge cases that broke it twice.
 
+### Score intent classification on captured sessions
+
+The brain's accuracy is measured on hand-labelled sessions, and the fairest of
+them are ones the sensors captured. From `ai-brain/content-generator`, with
+the classifier frozen:
+
+```bash
+docker compose -f ../../honeypot-ecosystem/docker-compose.yml cp sidecar:/var/spool/honeypot ./telemetry
+python -m ml.intent_classification.captures extract ./telemetry --limit 60
+python -m ml.intent_classification.captures label
+python -m ml.intent_classification.captures add
+python -m ml.intent_classification.evaluation
+```
+
+Extraction merges identical bot scripts, skips your own logins from inside the
+estate, and scrubs public addresses, domains, keys and payloads. Label before
+running the classifier on anything, and read `captured_sessions.json` before
+committing it. Cowrie logs from other sensors read the same way.
+`ml/intent_classification/captures.py` explains each step.
+
 ---
 
 ## What each piece is
@@ -333,7 +359,21 @@ network exists and the hub's backend is attached.
 
 **Hub rejects everything with 401**
 `HMAC_SECRET` differs between `honeypot-ecosystem/.env` and
-`intelligence_hub/.env`. Usually caused by `bootstrap.py --force`.
+`intelligence_hub/.env` (usually after `bootstrap.py --force`), or the hub's
+and the sidecar's clocks are more than five minutes apart; the hub's message
+says which. Nothing is lost meanwhile: the sidecar keeps the events spooled
+and delivers them by itself once the secret or the clock is fixed.
+
+**Sidecar logs "dead-lettered"**
+The hub answered 4xx for that event: it is malformed (no timestamp, an
+address that is not an IP, not JSON), and resending it unchanged cannot
+succeed. Rather than block the spool it is kept in
+`/var/lib/sidecar/dead-letter`, next to a `.reason.json` with the hub's
+answer. To resend after fixing the cause, move it back:
+
+```bash
+docker compose exec sidecar sh -c 'mv /var/lib/sidecar/dead-letter/*.ndjson /var/lib/sidecar/pending/'
+```
 
 **Inner SSH fails with "Auth failed for user devuser"**
 `bootstrap.py --force` rotated the backend key after the node images were
@@ -365,9 +405,9 @@ Geo enrichment silently no-ops without a GeoLite2 database. Drop
   deployment.
 - **Ambient activity engine** (live log growth, processes churning) and the
   **fake-internet gateway**. History is currently seeded at build time.
-- `POST /ingest/batch` on the hub accepts unsigned events. Sensors do not use
-  it — they stream signed events to `/ingest/` — but set
-  `allow_unsigned_batch=false` before exposing the hub anywhere.
+- Sessions uploaded through Ingest Logs **before** uploads were tagged cannot
+  be told apart from sensor sessions, so they still count toward retention.
+  Only clearing that data removes them.
 - Nothing is internet-exposed yet. See the pre-launch checklist in the build
   plan before that changes.
 
@@ -416,16 +456,28 @@ after testing showed attacker A could reach attacker B's container.
 ### Zero-trust pipeline
 
 - Sidecar holds the HMAC key; nodes hold nothing.
-- Streams **single signed events** to `/ingest/`, the only endpoint that
-  verifies signatures. Batching sent everything down the one path where the
-  check does not run.
+- Streams **single signed events** to `/ingest/`. `/ingest/batch` is the
+  operator's upload path: it needs `OPERATOR_TOKEN` (it used to accept anyone
+  by default), and what it stores is tagged `operator_upload`, left out of
+  the retention figures and never merged into a live session.
+- **Replay protection.** The signature covers a timestamp and an event id as
+  well as the body. The hub refuses a timestamp more than five minutes out
+  and an event id it has already ingested (remembered in Redis), so a
+  captured request cannot be sent again, and a retry after a lost response is
+  not ingested twice.
+- The hub **refuses to start** with a published secret unless
+  `INSECURE_DEV_MODE` is set. `HMAC_SECRET=dev` used to switch verification
+  off without a word.
 - **inotify instead of polling** — median latency 1000 ms → 58 ms.
 - Disk-backed spool, so an unreachable hub costs latency rather than evidence.
+- Malformed events get a **4xx** from the hub instead of a 500, and the
+  sidecar **dead-letters** them. One used to be retried forever, holding back
+  everything spooled behind it.
 
 ### Adaptive loop
 
 The sidecar fans out to the GenAI brain as well as the hub. Intent
-classification works without an LLM key (rules plus RandomForest); decoy
+classification works without an LLM key (rules plus a gradient-boosted model); decoy
 content falls back to local bundles when no key is configured. Chosen decoys
 are written into the attacker's own container by the broker, using
 `put_archive` so no process appears in their `ps`.
@@ -435,7 +487,7 @@ are written into the attacker's own container by the broker, using
 Fixed on the hub branch: `frontend/Dockerfile` was committed empty (0 bytes),
 so the dashboard could never start; `vite.config.js` proxied to `localhost`,
 which inside the container is the frontend itself, so every API call vanished;
-`/ingest/batch` now guarded by `allow_unsigned_batch`.
+`/ingest/batch` now needs the operator token (see Zero-trust pipeline).
 
 ### Not merged to main
 

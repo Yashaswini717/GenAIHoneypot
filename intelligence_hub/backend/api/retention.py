@@ -17,6 +17,7 @@ from analytics.retention import (
     MIN_ARM_VISITS,
     VISIT_GAP_SECONDS,
     build_visits,
+    is_live,
     summarise,
 )
 from database.postgres import AsyncSessionLocal
@@ -32,7 +33,8 @@ SELECT
     started_at,
     COALESCE(ended_at, started_at)      AS ended_at,
     COALESCE(event_count, 0)            AS event_count,
-    COALESCE(threat_score, 0)           AS threat_score
+    COALESCE(threat_score, 0)           AS threat_score,
+    COALESCE(source, 'sensor')          AS source
 FROM sessions
 WHERE started_at IS NOT NULL
 ORDER BY COALESCE(attacker_id, src_ip), started_at
@@ -84,7 +86,9 @@ async def retention() -> dict[str, Any]:
     each has enough engaged visits to mean anything, because a ratio computed
     from one or two sessions looks exactly like a finding and is not one.
     """
-    visits = build_visits(await _fetch_sessions())
+    rows = await _fetch_sessions()
+    visits = build_visits(rows)  # sensor sessions only
+    uploads = sum(1 for row in rows if not is_live(row))
 
     # A visit that received both treatments belongs to neither arm. Left in,
     # it would count toward whichever arm it was labelled, which is how a
@@ -134,6 +138,9 @@ async def retention() -> dict[str, Any]:
             "engaged_min_seconds": ENGAGED_MIN_SECONDS,
             "note": "A visit ends after this much inactivity; returning later starts a new one.",
         },
+        # Uploaded through the dashboard rather than recorded by a sensor.
+        # Never in the figures above; counted so leaving them out is visible.
+        "excluded_operator_uploads": uploads,
     }
 
 

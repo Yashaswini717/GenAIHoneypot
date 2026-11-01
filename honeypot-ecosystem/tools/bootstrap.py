@@ -11,10 +11,10 @@ Produces three things, none of which belong in git:
                               any case.
 
   .env                        environment for the stack, including a random
-                              HMAC secret. The hub skips signature
-                              verification when the secret is the literal
-                              string "dev", so leaving the default in place
-                              would silently disable the zero-trust check.
+                              HMAC secret. The hub refuses to start with a
+                              secret published in this repo ("dev", or the
+                              .env.example placeholder), since anyone could
+                              sign events with it.
 
   nodes/*/sshd_policy.conf    the node's sshd_config policy block, generated
                               from the same module the proxy advertises from.

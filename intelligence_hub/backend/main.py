@@ -10,7 +10,7 @@ from database.elastic import init_elasticsearch
 from enrichment.geoip import init_geoip
 from database.postgres import init_postgres
 from database.neo4j import init_neo4j
-from ingest.receiver import router as ingest_router
+from ingest.receiver import router as ingest_router, report_ingest_posture
 from api.events import router as events_router
 from api.iocs import router as iocs_router
 from api.sessions import router as sessions_router
@@ -21,6 +21,7 @@ from websocket.feed import router as ws_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    report_ingest_posture()
     init_geoip()
     await init_elasticsearch()
     await init_postgres()
