@@ -81,6 +81,13 @@ IDLE_TTL_SECONDS = int(os.environ.get("SESSION_IDLE_TTL", str(6 * 60 * 60)))
 #: otherwise turn per-IP isolation into a memory exhaustion bug on our own host.
 MAX_CONTAINERS = int(os.environ.get("MAX_CONTAINERS", "40"))
 
+#: Container runtime for attacker nodes; empty means Docker's default (runc).
+#: "runsc" runs them under gVisor, so a kernel exploit by an attacker with root
+#: in a node meets gVisor's user-space kernel instead of the host's -- worth it
+#: on an internet-facing host. gVisor must be installed and registered with
+#: Docker first (deploy/server-setup.sh does both).
+NODE_RUNTIME = os.environ.get("NODE_RUNTIME", "").strip()
+
 MEM_LIMIT = os.environ.get("NODE_MEM_LIMIT", "512m")
 PIDS_LIMIT = int(os.environ.get("NODE_PIDS_LIMIT", "200"))
 CPU_QUOTA = int(os.environ.get("NODE_CPU_QUOTA", "50000"))  # 0.5 CPU at the default 100ms period
@@ -645,6 +652,15 @@ def _kvm_style_mac(key: str) -> str:
     return "52:54:00:" + ":".join(digest[i : i + 2] for i in (0, 2, 4))
 
 
+def _runtime_options() -> dict[str, str]:
+    """`runtime=` for an attacker node, or nothing for Docker's default.
+
+    Both kinds of node -- the entry host and the pivot peers -- take it, so
+    an attacker cannot step from a sandboxed container into an unsandboxed one.
+    """
+    return {"runtime": NODE_RUNTIME} if NODE_RUNTIME else {}
+
+
 #: The estate, and where each node sits relative to the attacker.
 #
 # node-01 is the only host on the front network. node-02 and node-03 live on a
@@ -931,6 +947,7 @@ def _create_container(key: str) -> Backend:
         network=network.name,
         extra_hosts=_peer_hosts(network),
         mac_address=_kvm_style_mac(key),
+        **_runtime_options(),
         cap_drop=["ALL"],
         cap_add=NODE_CAPABILITIES,
         mem_limit=MEM_LIMIT,
@@ -1002,6 +1019,7 @@ def _spawn_peer(key: str, octet: int) -> str:
         # settings.py names exactly that host.
         network=None,
         mac_address=_kvm_style_mac(f"{key}:{spec['node']}"),
+        **_runtime_options(),
         cap_drop=["ALL"],
         cap_add=NODE_CAPABILITIES,
         mem_limit=os.environ.get("PEER_MEM_LIMIT", "640m"),
@@ -1238,10 +1256,11 @@ async def _startup() -> None:
     orphaned = await asyncio.to_thread(_reap_orphans, {b.key for b in recovered})
 
     log.info(
-        "session broker up: image=%s network=%s idle_ttl=%ds max=%d | adopted %d "
+        "session broker up: image=%s network=%s runtime=%s idle_ttl=%ds max=%d | adopted %d "
         "existing environment(s), cleaned up after %d departed attacker(s)",
         NODE_IMAGE,
         NODE_NETWORK,
+        NODE_RUNTIME or "default",
         IDLE_TTL_SECONDS,
         MAX_CONTAINERS,
         len(recovered),

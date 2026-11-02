@@ -1,13 +1,25 @@
+# Every port is published on 127.0.0.1 only. Elasticsearch has no password and
+# the hub holds attacker data, so none of it may answer on a public address;
+# on a server, reach the dashboard through an SSH tunnel (deploy/aws/README.md).
+# Docker writes its own iptables rules, so a host firewall such as ufw would
+# not have blocked these -- the bind address is what keeps them private.
+# The sidecar is unaffected: it reaches the hub over the telemetry network.
+#
+# Every service has restart: unless-stopped, like the honeypot's. Without it a
+# reboot brings the honeypot back but not the hub, and the sidecar spools
+# telemetry with nothing to receive it.
+
 services:
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    restart: unless-stopped
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
     ports:
-      - "9200:9200"
+      - "127.0.0.1:9200:9200"
     volumes:
       - es_data:/usr/share/elasticsearch/data
     healthcheck:
@@ -18,12 +30,13 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -34,8 +47,9 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -44,11 +58,12 @@ services:
 
   neo4j:
     image: neo4j:5.19-community
+    restart: unless-stopped
     environment:
       NEO4J_AUTH: ${NEO4J_USER}/${NEO4J_PASSWORD}
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
     volumes:
       - neo4j_data:/data
     healthcheck:
@@ -59,8 +74,9 @@ services:
 
   backend:
     build: ./backend
+    restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     networks:
       # Reachable from honeypot sidecars by name, without depending on a host
       # port. The host's 8000 is not ours to assume — a Splunk instance holds
@@ -86,8 +102,9 @@ services:
 
   frontend:
     build: ./frontend
+    restart: unless-stopped
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
     depends_on:
       - backend
     volumes:
