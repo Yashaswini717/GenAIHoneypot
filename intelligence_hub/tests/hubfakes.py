@@ -120,8 +120,17 @@ class _FakeDBSession:
         return False
 
     async def execute(self, statement):
-        # The receiver's only query: select a Session by session_id.
-        (session_id,) = statement.compile().params.values()
+        # The receiver's queries: a Session by session_id, or the open
+        # Alert for a session and alert type.
+        params = statement.compile().params
+        if statement.column_descriptions[0]["entity"] is receiver.Alert:
+            wanted = {name.rsplit("_", 1)[0]: value for name, value in params.items()}
+            for alert in self.db.alerts:
+                if (alert.session_id, alert.alert_type, alert.status) == (
+                        wanted["session_id"], wanted["alert_type"], wanted["status"]):
+                    return _Result(alert)
+            return _Result(None)
+        (session_id,) = params.values()
         return _Result(self.db.sessions.get(session_id))
 
     def add(self, obj) -> None:

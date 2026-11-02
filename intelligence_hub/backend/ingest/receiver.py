@@ -1,6 +1,7 @@
 import hmac
 import json
 import logging
+from datetime import datetime
 import redis.asyncio as aioredis
 
 from fastapi import APIRouter, Request, HTTPException, status
@@ -15,7 +16,7 @@ from ingest.normalizer import (
 from ingest.signing import EVENT_ID_HEADER, Rejected, authenticate
 from enrichment.geoip import enrich_geoip
 from enrichment.mitre import enrich_mitre
-from enrichment.scorer import compute_threat_score
+from enrichment.scorer import ALERT_THRESHOLD, compute_threat_score
 from database.elastic import index_event, upsert_ioc
 from database.neo4j import write_session_graph
 from database.postgres import AsyncSessionLocal, Session, Alert, AlertStatus
@@ -248,19 +249,36 @@ async def process_event(raw: dict, source: str = SOURCE_SENSOR):
             if event.get("country") and not sess.country:
                 sess.country = event["country"]
 
-        # 7. Auto-alert on high threat score
-        if event.get("threat_score", 0) >= 70:
-            alert = Alert(
-                session_id      = event["session_id"],
-                src_ip          = event["src_ip"],
-                alert_type      = event.get("event_type", "unknown"),
-                description     = event.get("raw_message", ""),
-                threat_score    = event.get("threat_score", 0),
-                mitre_technique = event.get("mitre_technique"),
-                country         = event.get("country"),
-                status          = AlertStatus.open,
+        # 7. Alert on a high threat score, once per session and kind of
+        #    threat. A bot that runs the same download ten times has done one
+        #    thing an analyst needs to look at, so later events of the same
+        #    kind raise the open alert's score instead of adding rows.
+        score = event.get("threat_score", 0)
+        if score >= ALERT_THRESHOLD:
+            alert_type = event.get("command_category") or event.get("event_type", "unknown")
+            result = await db.execute(
+                select(Alert).where(
+                    Alert.session_id == event["session_id"],
+                    Alert.alert_type == alert_type,
+                    Alert.status == AlertStatus.open,
+                ).limit(1)
             )
-            db.add(alert)
+            alert = result.scalar_one_or_none()
+            if alert is None:
+                db.add(Alert(
+                    session_id      = event["session_id"],
+                    src_ip          = event["src_ip"],
+                    alert_type      = alert_type,
+                    description     = event.get("raw_message", ""),
+                    threat_score    = score,
+                    mitre_technique = event.get("mitre_technique"),
+                    country         = event.get("country"),
+                    status          = AlertStatus.open,
+                ))
+            elif score > (alert.threat_score or 0):
+                alert.threat_score = score
+                alert.description  = event.get("raw_message", "")
+                alert.updated_at   = datetime.utcnow()
 
         await db.commit()
 
