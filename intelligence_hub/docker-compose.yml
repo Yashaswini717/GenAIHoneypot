@@ -4,11 +4,16 @@
 # Docker writes its own iptables rules, so a host firewall such as ufw would
 # not have blocked these -- the bind address is what keeps them private.
 # The sidecar is unaffected: it reaches the hub over the telemetry network.
+#
+# Every service has restart: unless-stopped, like the honeypot's. Without it a
+# reboot brings the honeypot back but not the hub, and the sidecar spools
+# telemetry with nothing to receive it.
 
 services:
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    restart: unless-stopped
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
@@ -25,6 +30,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -41,6 +47,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
@@ -51,6 +58,7 @@ services:
 
   neo4j:
     image: neo4j:5.19-community
+    restart: unless-stopped
     environment:
       NEO4J_AUTH: ${NEO4J_USER}/${NEO4J_PASSWORD}
     ports:
@@ -66,6 +74,7 @@ services:
 
   backend:
     build: ./backend
+    restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
     networks:
@@ -93,6 +102,7 @@ services:
 
   frontend:
     build: ./frontend
+    restart: unless-stopped
     ports:
       - "127.0.0.1:5173:5173"
     depends_on:

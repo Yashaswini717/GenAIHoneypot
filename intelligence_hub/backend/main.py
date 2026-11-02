@@ -19,13 +19,34 @@ from api.retention import router as retention_router
 from websocket.feed import router as ws_router
 
 
+# After a reboot Docker restarts every container at once and ignores
+# depends_on, so the databases may still be starting when the backend is.
+# Without a retry the first refused connection fails startup, and --reload's
+# supervisor then keeps the container up with nothing serving.
+STARTUP_PATIENCE_SECONDS = 300
+
+
+async def _until_ready(name, init, patience=STARTUP_PATIENCE_SECONDS, sleep=asyncio.sleep):
+    waited, delay = 0.0, 1.0
+    while True:
+        try:
+            return await init()
+        except Exception as e:
+            if waited + delay > patience:
+                raise
+            print(f"{name} not ready ({type(e).__name__}) — retrying in {delay:.0f}s", flush=True)
+            await sleep(delay)
+            waited += delay
+            delay = min(delay * 2, 10.0)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     report_ingest_posture()
     init_geoip()
-    await init_elasticsearch()
-    await init_postgres()
-    await init_neo4j()
+    await _until_ready("Elasticsearch", init_elasticsearch)
+    await _until_ready("PostgreSQL", init_postgres)
+    await _until_ready("Neo4j", init_neo4j)
     # start Redis → WebSocket broadcaster
     asyncio.create_task(redis_listener())
     yield

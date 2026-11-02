@@ -6,10 +6,11 @@ driver = None
 
 async def init_neo4j():
     global driver
-    driver = AsyncGraphDatabase.driver(
-        settings.neo4j_uri,
-        auth=(settings.neo4j_user, settings.neo4j_password)
-    )
+    if driver is None:  # a retried startup reuses the driver
+        driver = AsyncGraphDatabase.driver(
+            settings.neo4j_uri,
+            auth=(settings.neo4j_user, settings.neo4j_password)
+        )
     # Create constraints (run once, idempotent)
     async with driver.session() as session:
         await session.run(

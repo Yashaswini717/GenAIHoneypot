@@ -5,7 +5,8 @@ es: AsyncElasticsearch = None
 
 async def init_elasticsearch():
     global es
-    es = AsyncElasticsearch(settings.es_url)
+    if es is None:  # a retried startup reuses the client
+        es = AsyncElasticsearch(settings.es_url)
 
     # Create cowrie events index
     if not await es.indices.exists(index="cowrie-events"):
