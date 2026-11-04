@@ -71,6 +71,9 @@ class NormalizedEvent(BaseModel):
     # that is the measurement, so the sensor sends it and we carry it through.
     attacker_id:   Optional[str] = None
     adaptive:      Optional[bool] = None
+    # A line typed into a pivot through this session: the pivot's own session
+    # records it too, so it is kept here but not counted twice.
+    nested:        bool = False
     timestamp:     datetime
     username:      Optional[str]
     password:      Optional[str]
@@ -152,6 +155,7 @@ def _normalize(raw: dict, source: str) -> NormalizedEvent:
         # sensible instead of by nothing.
         attacker_id  = raw.get("attacker") or raw.get("src_ip", ""),
         adaptive     = raw.get("adaptive"),
+        nested       = raw.get("nested") is True,
         timestamp    = raw.get("timestamp"),
         username     = raw.get("username"),
         password     = raw.get("password"),

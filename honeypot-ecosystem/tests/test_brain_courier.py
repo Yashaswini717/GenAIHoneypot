@@ -875,5 +875,20 @@ def test_the_fallback_owner_never_undoes_the_real_one():
     assert all(p["attacker"] == "10.0.0.5" for p in rec.plants())
 
 
+def test_a_nested_line_neither_trips_nor_classifies():
+    """The pivot's own session counts it; the node-01 copy used to count it again."""
+    rec = Recorder()
+    courier = build_courier(rec)
+    _, credential = ALL_TOKEN_VALUES[0]
+
+    drive(courier, [
+        {**command("o1", f"mysql -h db-01 -p{credential}"), "nested": True},
+        {**command("o1", "id"), "nested": True},
+    ])
+
+    assert rec.checks() == [] and rec.registrations() == []
+    assert rec.classifies() == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

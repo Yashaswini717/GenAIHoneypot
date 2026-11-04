@@ -232,6 +232,21 @@ def test_a_session_store_that_keeps_failing_is_still_a_500(stores, monkeypatch):
     assert ingest_keys(stores) == []  # claim released, so the sidecar's retry is not refused
 
 
+def test_a_line_typed_into_a_pivot_is_stored_but_raises_no_alert(stores):
+    """The pivot's own session raises it; node-01's copy of the line used to raise a second."""
+    client = client_for(stores)
+    dump = "mysqldump -h db-01 erp > /tmp/erp.sql"
+    nested = event_body(input=dump, message=f"CMD: {dump}", nested=True)
+    plain = event_body(session="f6e5d4c3b2a1", input=dump, message=f"CMD: {dump}")
+
+    assert client.post("/ingest/", content=nested, headers=signed(nested)).status_code == 200
+    assert stores.indexed[-1]["nested"] is True
+    assert stores.db.alerts == []
+
+    assert client.post("/ingest/", content=plain, headers=signed(plain)).status_code == 200
+    assert [a.session_id for a in stores.db.alerts] == ["f6e5d4c3b2a1"], "the pivot's own copy still alerts"
+
+
 def test_a_captured_request_goes_stale(stores):
     body = event_body()
     old = signed(body, ts=time.time() - SKEW - 60)
