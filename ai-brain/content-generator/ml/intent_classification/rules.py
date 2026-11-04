@@ -239,6 +239,25 @@ def _url_host(arg: str) -> str:
     return arg.split("/", 1)[0].split("@")[-1].split(":")[0]
 
 
+#: OpenSSH runs `scp -t PATH` on the target of an upload and `scp -f PATH` on
+#: the source of a download. On a honeypot they are the far end of a copy the
+#: attacker started from their own machine -- `-t` a file arriving, `-f` one
+#: being taken -- not the attacker copying anywhere. Whole flags only:
+#: `-oStrictHostKeyChecking=no` also contains a t.
+_SCP_SERVER_FLAG = re.compile(r"-[dpqrv]*([tf])[dpqrv]*")
+
+
+def scp_server_mode(seg: Any) -> Optional[str]:
+    """'t' or 'f' when this segment is the far end of an scp, else None."""
+    if seg.program != "scp":
+        return None
+    for arg in seg.args:
+        match = _SCP_SERVER_FLAG.fullmatch(arg)
+        if match:
+            return match.group(1)
+    return None
+
+
 def _remote_hosts(program: str, args: list[str]) -> list[str]:
     """Hosts named as the remote side of an scp/rsync/sftp invocation."""
     hosts = []
@@ -506,7 +525,9 @@ def _segment_evidence(seg: Segment, following: Optional[Segment], hit: _Hit, dep
             for intent, rules in command_evidence(" ".join(args[i:]), depth + 1).items():
                 for rule in rules:
                     hit(intent, rule)
-    if prog in {"scp", "rsync", "sftp"}:
+    if scp_server_mode(seg) == "f":
+        hit(X, "command:scp_source")    # a file here being copied out to them
+    elif prog in {"scp", "rsync", "sftp"} and not scp_server_mode(seg):
         hosts = _remote_hosts(prog, args)
         if any(is_external_host(host) for host in hosts):
             hit(X, "command:external_transfer")
