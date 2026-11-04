@@ -28,6 +28,13 @@ COMMAND_RULES: list[tuple[str, int, re.Pattern]] = [
         _AT_COMMAND + r"\./\S",                         # run a dropped binary
         _AT_COMMAND + r"(?:ba)?sh\s+/(?:tmp|var/tmp|dev/shm)/",
     )),
+    # Reading records out of a database is exfiltration in the brain's labelling
+    # guide too, so the hub alerts on what the classifier calls data_exfiltration.
+    ("data_exfiltration", 90, _any(
+        r"\b(?:mysqldump|pg_dump|pg_dumpall|mongodump)\b",
+        r"\bmysql\b[^;&|]*\s(?:-e|--execute)\b",          # mysql -e "select ..."
+        r"\bpsql\b[^;&|]*\s(?:-c|--command)\b",
+    )),
     ("persistence", 85, _any(
         r"authorized_keys",
         r"\bcrontab\b(?!\s+-l\b)",                      # crontab -l only reads

