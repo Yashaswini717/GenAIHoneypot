@@ -10,6 +10,8 @@ was silent while open:
    it stored was indistinguishable from live attacker sessions.
 3. HMAC_SECRET=dev switched verification off without a word.
 4. A malformed event answered 500, which the sidecar retries forever.
+5. Two events creating one session at once: the second insert failed on
+   the primary key, and the hub answered 500.
 
 Redis and the stores are faked (`hubfakes`), so these run without services.
 
@@ -23,10 +25,12 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 
 from analytics.retention import build_visits, is_live
 from config import Settings, settings
 from hubfakes import DROP, event_body, signed, stores  # noqa: F401  (stores is a fixture)
+from ingest import receiver
 from ingest.signing import Rejected, authenticate, content_event_id, sign
 
 SECRET = settings.hmac_secret
@@ -193,6 +197,39 @@ def test_a_sidecar_retry_after_a_lost_response_is_not_stored_twice(stores):
 
     assert retry.status_code == 409  # the sidecar counts this as delivered
     assert len(stores.indexed) == 1
+
+
+def test_an_event_that_loses_the_race_to_create_its_session_is_still_stored(stores):
+    """Seen 2026-11-03: the hub's first event after 7 idle hours took over 15 s.
+
+    The sidecar timed out and sent the session's next event, both requests
+    found no session row, and the second insert failed on sessions_pkey: 500.
+    """
+    stores.db.lose_insert_races = 1
+    body = event_body()
+    response = client_for(stores).post("/ingest/", content=body, headers=signed(body))
+
+    assert response.status_code == 200, response.text
+    assert list(stores.db.sessions) == ["a1b2c3d4e5f6"]
+    assert stores.db.sessions["a1b2c3d4e5f6"].event_count == 1  # an update to the winner's row
+    assert len(stores.indexed) == 1  # only the Postgres step ran again
+
+
+def test_a_session_store_that_keeps_failing_is_still_a_500(stores, monkeypatch):
+    """One more try for the race, not a loop that hides a real fault."""
+    attempts = []
+
+    async def conflicts(event, stamp):
+        attempts.append(event["session_id"])
+        raise IntegrityError("INSERT INTO sessions", {}, Exception("duplicate key"))
+
+    monkeypatch.setattr(receiver, "_store_session", conflicts)
+    body = event_body()
+    response = client_for(stores).post("/ingest/", content=body, headers=signed(body))
+
+    assert response.status_code == 500
+    assert len(attempts) == 2
+    assert ingest_keys(stores) == []  # claim released, so the sidecar's retry is not refused
 
 
 def test_a_captured_request_goes_stale(stores):

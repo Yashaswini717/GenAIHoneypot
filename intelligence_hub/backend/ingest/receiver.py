@@ -1,6 +1,7 @@
 import hmac
 import json
 import logging
+from datetime import datetime
 import redis.asyncio as aioredis
 
 from fastapi import APIRouter, Request, HTTPException, status
@@ -15,11 +16,12 @@ from ingest.normalizer import (
 from ingest.signing import EVENT_ID_HEADER, Rejected, authenticate
 from enrichment.geoip import enrich_geoip
 from enrichment.mitre import enrich_mitre
-from enrichment.scorer import compute_threat_score
+from enrichment.scorer import ALERT_THRESHOLD, compute_threat_score
 from database.elastic import index_event, upsert_ioc
 from database.neo4j import write_session_graph
 from database.postgres import AsyncSessionLocal, Session, Alert, AlertStatus
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 router = APIRouter()
 log = logging.getLogger("ingest")
@@ -193,6 +195,35 @@ async def process_event(raw: dict, source: str = SOURCE_SENSOR):
     # 5. Write to Neo4j graph
     await write_session_graph(event)
 
+    # 6-7. The session row and any alert. Two events of one new session can
+    #      get here at once: a sender that timed out on the first moves on to
+    #      the next while the hub is still storing the first (seen 2026-11-03,
+    #      on the hub's first event after 7 idle hours). Both find no row,
+    #      both insert one, and the loser's commit fails on sessions_pkey.
+    #      Nothing of the loser was kept, so it runs once more, finds the
+    #      winner's row and stores this event as an update to it.
+    stamp = normalized.timestamp.replace(tzinfo=None)
+    try:
+        await _store_session(event, stamp)
+    except IntegrityError:
+        log.info("session %s was created by a concurrent event; storing this one as an update",
+                 event["session_id"])
+        await _store_session(event, stamp)
+
+    # 8. Publish to Redis for WebSocket live feed. Best effort: the event is
+    #    stored by now, and failing the request here would only make the
+    #    sidecar send it again.
+    try:
+        r = get_redis()
+        await r.publish("events:live", json.dumps(event, default=str))
+    except Exception as exc:
+        log.warning("live feed publish failed for %s: %s", event["session_id"], exc)
+
+    return event
+
+
+async def _store_session(event: dict, stamp: datetime) -> None:
+    """Steps 6 and 7 of `process_event`, in one transaction."""
     # 6. Upsert session in Postgres
     async with AsyncSessionLocal() as db:
         result = await db.execute(
@@ -207,7 +238,7 @@ async def process_event(raw: dict, source: str = SOURCE_SENSOR):
                 adaptive    = event.get("adaptive"),
                 sensor_id   = event["sensor_id"],
                 protocol    = event.get("protocol", "ssh"),
-                started_at  = normalized.timestamp.replace(tzinfo=None),
+                started_at  = stamp,
                 hassh       = event.get("hassh"),
                 ssh_version = event.get("ssh_version"),
                 country     = event.get("country"),
@@ -224,7 +255,7 @@ async def process_event(raw: dict, source: str = SOURCE_SENSOR):
             if event.get("event_type") == "brute_force":
                 sess.login_attempts = (sess.login_attempts or 0) + 1
             if event.get("event_type") == "session_end" and event.get("duration"):
-                sess.ended_at = normalized.timestamp.replace(tzinfo=None)
+                sess.ended_at = stamp
                 sess.duration = event.get("duration")
             if event.get("hassh") and not sess.hassh:
                 sess.hassh = event["hassh"]
@@ -248,32 +279,38 @@ async def process_event(raw: dict, source: str = SOURCE_SENSOR):
             if event.get("country") and not sess.country:
                 sess.country = event["country"]
 
-        # 7. Auto-alert on high threat score
-        if event.get("threat_score", 0) >= 70:
-            alert = Alert(
-                session_id      = event["session_id"],
-                src_ip          = event["src_ip"],
-                alert_type      = event.get("event_type", "unknown"),
-                description     = event.get("raw_message", ""),
-                threat_score    = event.get("threat_score", 0),
-                mitre_technique = event.get("mitre_technique"),
-                country         = event.get("country"),
-                status          = AlertStatus.open,
+        # 7. Alert on a high threat score, once per session and kind of
+        #    threat. A bot that runs the same download ten times has done one
+        #    thing an analyst needs to look at, so later events of the same
+        #    kind raise the open alert's score instead of adding rows.
+        score = event.get("threat_score", 0)
+        if score >= ALERT_THRESHOLD:
+            alert_type = event.get("command_category") or event.get("event_type", "unknown")
+            result = await db.execute(
+                select(Alert).where(
+                    Alert.session_id == event["session_id"],
+                    Alert.alert_type == alert_type,
+                    Alert.status == AlertStatus.open,
+                ).limit(1)
             )
-            db.add(alert)
+            alert = result.scalar_one_or_none()
+            if alert is None:
+                db.add(Alert(
+                    session_id      = event["session_id"],
+                    src_ip          = event["src_ip"],
+                    alert_type      = alert_type,
+                    description     = event.get("raw_message", ""),
+                    threat_score    = score,
+                    mitre_technique = event.get("mitre_technique"),
+                    country         = event.get("country"),
+                    status          = AlertStatus.open,
+                ))
+            elif score > (alert.threat_score or 0):
+                alert.threat_score = score
+                alert.description  = event.get("raw_message", "")
+                alert.updated_at   = datetime.utcnow()
 
         await db.commit()
-
-    # 8. Publish to Redis for WebSocket live feed. Best effort: the event is
-    #    stored by now, and failing the request here would only make the
-    #    sidecar send it again.
-    try:
-        r = get_redis()
-        await r.publish("events:live", json.dumps(event, default=str))
-    except Exception as exc:
-        log.warning("live feed publish failed for %s: %s", event["session_id"], exc)
-
-    return event
 
 
 @router.post("/")

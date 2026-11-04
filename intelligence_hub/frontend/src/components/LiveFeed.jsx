@@ -1,5 +1,11 @@
 import useWebSocket from '../hooks/useWebSocket.js'
 
+// Same origin as the page, so Vite's /ws proxy carries it to the backend. A
+// hardcoded ws://localhost:8000 bypassed the proxy: viewed through an SSH
+// tunnel to the cloud hub, Live Feed connected to whatever hub was running
+// on the viewer's own machine instead, or to nothing.
+const FEED_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/feed`
+
 function scoreBadge(score) {
   if (score >= 90) return <span className="badge badge-critical">{score}</span>
   if (score >= 70) return <span className="badge badge-high">{score}</span>
@@ -8,7 +14,7 @@ function scoreBadge(score) {
 }
 
 export default function LiveFeed() {
-  const { messages, connected } = useWebSocket('ws://localhost:8000/ws/feed')
+  const { messages, connected } = useWebSocket(FEED_URL)
 
   return (
     <div>

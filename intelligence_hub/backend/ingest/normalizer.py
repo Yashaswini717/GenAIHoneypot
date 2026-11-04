@@ -10,7 +10,9 @@ from datetime import datetime
 COWRIE_EVENT_MAP = {
     "cowrie.session.connect":  ("connection",  30),
     "cowrie.login.failed":     ("brute_force", 60),
-    "cowrie.login.success":    ("compromise",  95),  # critical
+    # Every attacker on a honeypot logs in, so a login is not an alert by
+    # itself. What they do next is what gets scored.
+    "cowrie.login.success":    ("compromise",  60),
     "cowrie.command.input":    ("command_exec",80),
     "cowrie.session.closed":   ("session_end", 10),
     "cowrie.client.version":   ("recon",       20),

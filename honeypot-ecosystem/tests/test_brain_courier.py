@@ -787,5 +787,93 @@ def test_a_plant_that_did_not_land_costs_no_model_calls():
     assert courier.deployed == 0
 
 
+# --------------------------------------------------------------------------
+# a session on a pivot node
+# --------------------------------------------------------------------------
+
+
+def pivot_command(session: str, text: str) -> dict:
+    """A command on erp-web, as the proxy records it after the attacker's ssh from node-01."""
+    return {
+        **command(session, text),
+        "src_ip": "172.23.0.2",
+        "sensor": "node-02-erp",
+        "attacker": "10.0.0.5",
+        "username": "deploy",
+    }
+
+
+def test_a_pivot_plant_names_the_real_attacker_and_the_node():
+    """Planting by source address sent pivots to the jump host, which owns nothing."""
+    rec = Recorder()
+    courier = build_courier(rec)
+
+    drive(courier, [pivot_command("p1", "hostname"), pivot_command("p1", "cat /opt/erp/settings.py")])
+
+    plant = rec.plants()[0]
+    assert (plant["attacker"], plant["node"], plant["src_ip"]) == ("10.0.0.5", "node-02-erp", "172.23.0.2")
+
+
+def test_a_pivot_gets_its_decoys_in_the_logged_in_users_home():
+    """devuser exists only on node-01; on erp-web the session is deploy."""
+    rec = Recorder(action="populate_developer_workstation")
+    courier = build_courier(rec)
+
+    drive(courier, [pivot_command("p2", "hostname"), pivot_command("p2", "ls")])
+
+    assert [f["path"] for f in rec.plants()[0]["files"]] == [
+        "/home/deploy/.netrc",
+        "/home/deploy/projects/erp-backend/.env.local",
+    ]
+
+
+def test_generation_is_asked_for_the_pivot_users_home():
+    rec = Recorder(action="populate_developer_workstation", generated=GENERATED)
+    courier = build_courier(rec)
+
+    drive(courier, [pivot_command("p3", "hostname"), pivot_command("p3", "ls")])
+
+    asks = [body for path, body in rec.calls if path.endswith("/decoys/generate")]
+    assert asks and asks[0]["home_user"] == "deploy"
+
+
+def test_node01_sessions_are_planted_as_before():
+    rec = Recorder(action="populate_developer_workstation", generated=GENERATED)
+    courier = build_courier(rec)
+
+    drive(courier, [command("j1", "w"), command("j1", "ps aux")])
+
+    plant = rec.plants()[0]
+    assert (plant["attacker"], plant["node"]) == ("10.0.0.5", "node-01-jump")
+    assert [f["path"] for f in plant["files"]] == [p for p, _, _ in DECOY_BUNDLES["populate_developer_workstation"]]
+    asks = [body for path, body in rec.calls if path.endswith("/decoys/generate")]
+    assert asks[0]["home_user"] == "devuser"
+
+
+def test_honeypot_id_follows_the_real_attacker_on_a_pivot():
+    """Every attacker's jump host can have the same address inside its own network."""
+    a = SessionState(session_id="a", src_ip="172.23.0.2", sensor="node-02-erp", attacker="10.0.0.5")
+    b = SessionState(session_id="b", src_ip="172.23.0.2", sensor="node-02-erp", attacker="10.0.0.9")
+
+    assert a.honeypot_id == "node-02-erp-10.0.0.5"
+    assert a.honeypot_id != b.honeypot_id
+
+
+def test_the_fallback_owner_never_undoes_the_real_one():
+    """A pivot's first events can carry its own address as the owner."""
+    rec = Recorder()
+    courier = build_courier(rec)
+    fallback = {"attacker": "172.23.0.2"}
+
+    drive(courier, [
+        {**pivot_command("p4", "hostname"), **fallback},
+        pivot_command("p4", "id"),
+        {**pivot_command("p4", "ls"), **fallback},
+    ])
+
+    assert courier.sessions["p4"].attacker == "10.0.0.5"
+    assert all(p["attacker"] == "10.0.0.5" for p in rec.plants())
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

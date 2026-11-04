@@ -1,6 +1,10 @@
+import asyncio
 import pytest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 import os
+
+from pydantic import ValidationError
 
 
 def test_openrouter_default_settings():
@@ -14,8 +18,9 @@ def test_openrouter_default_settings():
         # Should default to OpenRouter base URL
         assert settings.openai_base_url == "https://openrouter.ai/api/v1"
 
-        # Should default to Google Gemini 2.0 Flash model
-        assert settings.llm_model == "google/gemini-2.0-flash-exp:free"
+        # Should default to a free model that answers, with reasoning off
+        assert settings.llm_model == "nvidia/nemotron-3.5-lightning:free"
+        assert settings.llm_reasoning == "off"
 
 
 def test_openrouter_custom_settings():
@@ -131,3 +136,64 @@ def test_settings_with_env_variables():
         assert settings.openai_api_key == "sk-or-v1-env-key"
         assert settings.openai_base_url == "https://openrouter.ai/api/v1"
         assert settings.llm_model == "qwen/qwen-2.5-7b-instruct:free"
+
+
+@pytest.mark.parametrize("value, enabled", [("off", False), ("on", True)])
+def test_reasoning_switch_reaches_openrouter(value, enabled):
+    """LLM_REASONING goes out with every request as reasoning.enabled."""
+    from config import settings as settings_module
+
+    with patch.multiple(
+        settings_module.settings,
+        openai_api_key="sk-or-v1-test",
+        openai_base_url="https://openrouter.ai/api/v1",
+        llm_reasoning=value,
+    ):
+        from core.llm_client import LLMClient
+        client = LLMClient()
+        reply = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="OK"))])
+        create = AsyncMock(return_value=reply)
+        with patch.object(client.client.chat.completions, "create", create):
+            assert asyncio.run(client.generate("hi")) == "OK"
+        assert create.call_args.kwargs["extra_body"] == {"reasoning": {"enabled": enabled}}
+
+
+def test_reasoning_switch_stays_off_other_providers():
+    """Direct OpenAI rejects the field, so it is never sent there."""
+    from config import settings as settings_module
+
+    with patch.multiple(
+        settings_module.settings,
+        openai_api_key="sk-test-key",
+        openai_base_url="https://api.openai.com/v1",
+        llm_reasoning="off",
+    ):
+        from core.llm_client import LLMClient
+        assert LLMClient().extra_body is None
+
+
+def test_empty_reasoning_leaves_the_model_default():
+    """For models whose reasoning can't be turned off, send nothing."""
+    from config import settings as settings_module
+
+    with patch.multiple(
+        settings_module.settings,
+        openai_api_key="sk-or-v1-test",
+        openai_base_url="https://openrouter.ai/api/v1",
+        llm_reasoning="",
+    ):
+        from core.llm_client import LLMClient
+        assert LLMClient().extra_body is None
+
+
+def test_reasoning_setting_parsing():
+    """Case is ignored, empty is allowed, anything else is a config error."""
+    from config.settings import Settings
+
+    for raw, parsed in [("OFF", "off"), (" On ", "on"), ("", "")]:
+        with patch.dict(os.environ, {"LLM_REASONING": raw}, clear=True):
+            assert Settings(_env_file=None).llm_reasoning == parsed
+
+    with patch.dict(os.environ, {"LLM_REASONING": "maybe"}, clear=True):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None)

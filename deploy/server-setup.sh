@@ -145,6 +145,11 @@ prepare() {
     docker network inspect honeypot-telemetry >/dev/null 2>&1 || docker network create honeypot-telemetry
     .venv/bin/python tools/build_nodes.py
     docker compose up -d --build
+    # The proxy reads its key to the attacker nodes through a bind mount, which
+    # keeps the host file's owner and mode. bootstrap.py ran as root and left it
+    # 0600 root-only, so every attacker session closed as it opened. (Docker
+    # Desktop on Windows hides this: files it mounts are readable by everyone.)
+    chown "$(docker run --rm --entrypoint id honeypot/ssh-proxy:current -u)" secrets/backend_key
 
     say "Intelligence hub (every port on 127.0.0.1 only)"
     [[ -f "$HUB/.env" ]] || write_hub_env
@@ -204,6 +209,13 @@ check() {
         pass "the broker starts attacker nodes under runsc"
     else
         fail "the broker is not using runsc (NODE_RUNTIME in $HP/.env)"
+    fi
+    # </dev/null: compose exec attaches stdin, and a stdin that never closes
+    # (a script, a non-interactive ssh) would hang check() here.
+    if (cd "$HP" && docker compose exec -T ssh-proxy test -r /run/secrets/backend_key) </dev/null 2>/dev/null; then
+        pass "the proxy can read its key to the attacker nodes"
+    else
+        fail "the proxy cannot read secrets/backend_key, so every attacker session closes at once"
     fi
     node="$(docker ps -q --filter label=honeypot.role=node | head -1)"
     if [[ -z "$node" ]]; then

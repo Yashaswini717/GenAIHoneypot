@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import redis.exceptions
 from fastapi import FastAPI
+from sqlalchemy.exc import IntegrityError
 
 from config import settings
 from ingest import receiver
@@ -104,6 +105,10 @@ class FakeDB:
     def __init__(self) -> None:
         self.sessions: dict[str, receiver.Session] = {}
         self.alerts: list = []
+        #: Make the next N new sessions lose the race to create themselves: a
+        #: concurrent request commits the same session first, so this commit
+        #: fails on the primary key, as it does in Postgres.
+        self.lose_insert_races = 0
 
     def __call__(self):
         return _FakeDBSession(self)
@@ -112,29 +117,57 @@ class FakeDB:
 class _FakeDBSession:
     def __init__(self, db: FakeDB) -> None:
         self.db = db
+        self.pending: list = []
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *exc):
+        # Whatever was not committed is rolled back.
+        self.pending.clear()
         return False
 
     async def execute(self, statement):
-        # The receiver's only query: select a Session by session_id.
-        (session_id,) = statement.compile().params.values()
+        # The receiver's queries: a Session by session_id, or the open
+        # Alert for a session and alert type.
+        params = statement.compile().params
+        if statement.column_descriptions[0]["entity"] is receiver.Alert:
+            wanted = {name.rsplit("_", 1)[0]: value for name, value in params.items()}
+            for alert in self.db.alerts:
+                if (alert.session_id, alert.alert_type, alert.status) == (
+                        wanted["session_id"], wanted["alert_type"], wanted["status"]):
+                    return _Result(alert)
+            return _Result(None)
+        (session_id,) = params.values()
         return _Result(self.db.sessions.get(session_id))
 
     def add(self, obj) -> None:
-        if isinstance(obj, receiver.Session):
-            # Column defaults are applied by the database on INSERT.
-            obj.event_count = obj.event_count or 0
-            obj.login_attempts = obj.login_attempts or 0
-            self.db.sessions[obj.session_id] = obj
-        else:
-            self.db.alerts.append(obj)
+        self.pending.append(obj)
 
     async def commit(self) -> None:
-        pass
+        new = [obj for obj in self.pending
+               if isinstance(obj, receiver.Session) and obj.session_id not in self.db.sessions]
+        if new and self.db.lose_insert_races:
+            self.db.lose_insert_races -= 1
+            # The concurrent request's row, committed a moment before ours.
+            self.db.sessions[new[0].session_id] = receiver.Session(
+                session_id=new[0].session_id, src_ip=new[0].src_ip, sensor_id=new[0].sensor_id,
+                source=new[0].source, event_count=0, login_attempts=0, threat_score=0,
+            )
+            self.pending.clear()
+            raise IntegrityError(
+                "INSERT INTO sessions", {},
+                Exception('duplicate key value violates unique constraint "sessions_pkey"'),
+            )
+        for obj in self.pending:
+            if isinstance(obj, receiver.Session):
+                # Column defaults are applied by the database on INSERT.
+                obj.event_count = obj.event_count or 0
+                obj.login_attempts = obj.login_attempts or 0
+                self.db.sessions[obj.session_id] = obj
+            else:
+                self.db.alerts.append(obj)
+        self.pending.clear()
 
 
 @pytest.fixture

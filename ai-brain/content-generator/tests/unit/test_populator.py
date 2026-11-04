@@ -92,6 +92,18 @@ async def test_build_returns_specs_without_writing_anything(temp_dir):
 
 
 @pytest.mark.asyncio
+async def test_source_files_get_their_real_extension(temp_dir):
+    """`ls ~/projects/app/src` showed main.ja: slicing "javascript" to two letters."""
+    strategy = _strategy(temp_dir)
+
+    files = await strategy.build("hp-ext", {"profile": "developer_workstation"})
+
+    paths = {f["path"] for f in files}
+    assert {"projects/app/src/main.py", "projects/app/src/main.js"} <= paths
+    assert not any(p.endswith(".ja") for p in paths)
+
+
+@pytest.mark.asyncio
 async def test_populate_still_writes_to_disk(temp_dir):
     """The existing local-deployment path must be unchanged by the split."""
     strategy = _strategy(temp_dir)

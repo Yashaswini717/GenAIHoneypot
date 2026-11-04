@@ -1,6 +1,6 @@
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -49,13 +49,17 @@ class Settings(BaseSettings):
     # LLM Configuration
     llm_provider: LLMProvider = Field(default=LLMProvider.OPENAI, alias="LLM_PROVIDER")
     llm_model: str = Field(
-        default="google/gemini-2.0-flash-exp:free", alias="LLM_MODEL"
+        default="nvidia/nemotron-3.5-lightning:free", alias="LLM_MODEL"
     )
     llm_temperature: float = Field(default=0.7, alias="LLM_TEMPERATURE")
     llm_max_tokens: int = Field(default=2048, alias="LLM_MAX_TOKENS")
     llm_timeout: int = Field(default=60, alias="LLM_TIMEOUT")
     llm_max_retries: int = Field(default=3, alias="LLM_MAX_RETRIES")
     llm_retry_delay: int = Field(default=2, alias="LLM_RETRY_DELAY")
+    # OpenRouter's reasoning switch: "off" sends reasoning.enabled=false, "on"
+    # sends true, empty leaves the model's own default. Every free model there
+    # reasons now, and some think until max_tokens runs out and return no text.
+    llm_reasoning: Literal["", "on", "off"] = Field(default="off", alias="LLM_REASONING")
 
     # OpenAI / OpenRouter
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
@@ -159,6 +163,12 @@ class Settings(BaseSettings):
         if v <= 0:
             raise ValueError("Max tokens must be positive")
         return v
+
+    @field_validator("llm_reasoning", mode="before")
+    @classmethod
+    def normalise_reasoning(cls, v: object) -> object:
+        """Accept OFF or Off as well as off."""
+        return v.strip().lower() if isinstance(v, str) else v
 
     def get_api_key(self) -> Optional[str]:
         """Get API key based on provider."""
