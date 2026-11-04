@@ -179,8 +179,9 @@ class PopulationStrategy(BasePopulator):
 
         files = []
 
-        # Source code
-        for lang in ["python", "javascript"]:
+        # Source code. Extensions spelled out: the first two letters of
+        # "javascript" made main.ja, which no developer's checkout contains.
+        for lang, ext in [("python", "py"), ("javascript", "js")]:
             code = await self._gen(self.source_code_gen, {
                 "language": lang,
                 "script_type": "webapp",
@@ -188,7 +189,7 @@ class PopulationStrategy(BasePopulator):
             }, what=f"source/{lang}")
             if code:
                 files.append({
-                    "path": f"projects/app/src/main.{lang[:2]}",
+                    "path": f"projects/app/src/main.{ext}",
                     "content": code.content,
                     "permissions": 0o644,
                 })
