@@ -334,7 +334,12 @@ class DecoyFile(BaseModel):
 
 
 class DecoyRequest(BaseModel):
-    src_ip: str = Field(description="Which attacker's environment to plant into")
+    src_ip: str = Field(description="The session's source address")
+    attacker: str | None = Field(
+        default=None,
+        description="Whose environment, as the proxy recorded it; on a pivot this is not src_ip",
+    )
+    node: str | None = Field(default=None, description="The node the session is on, e.g. node-02-erp")
     action: str = Field(description="The brain's chosen action label, for logging")
     intent: str = Field(default="unknown")
     files: list[DecoyFile]
@@ -348,36 +353,52 @@ async def plant_decoys(request: DecoyRequest) -> dict[str, Any]:
     container requires the Docker socket, and the process holding the HMAC
     signing key must not also hold the ability to create and modify
     containers. The sidecar decides *what* to plant; only the broker can
-    actually place it, and only into the environment belonging to that source
-    IP — never into another attacker's.
+    actually place it, and only into the environment belonging to that
+    attacker — never into another attacker's.
+
+    On a pivot it goes into the attacker's own copy of the node the session
+    is on. Pivots used to be looked up by source address, which there is the
+    attacker's jump host and owns no environment, so erp-web and db-01 never
+    received a decoy ("no-active-session").
     """
     if _docker is None:
         raise HTTPException(status_code=503, detail="docker unavailable")
 
-    backend = state.backends.get(request.src_ip)
+    owner = request.attacker or request.src_ip
+    backend = state.backends.get(owner)
     if backend is None:
         # Their session ended before the brain answered. Normal, not an error.
         return {"status": "no-active-session", "planted": 0}
 
+    target, label = backend.container_id, request.action
+    target_name = backend.container_name
+    if request.node in {spec["node"] for spec in PEER_PLAN.values()}:
+        target_name = _peer_container_name(owner, request.node)
+        if not await asyncio.to_thread(_peer_exists, target_name):
+            return {"status": "no-active-session", "planted": 0}
+        # By name: it is stable for the life of the environment, as an id is.
+        target, label = target_name, f"{request.node}:{request.action}"
+
     # Once per environment, not once per session. The sidecar only remembers
     # what it planted within one session, so every return visit used to plant
     # the same action again: decoys the attacker had deleted came back, and
-    # ones they had edited were silently reverted.
-    if request.action in backend.planted:
+    # ones they had edited were silently reverted. Per node, so planting on
+    # erp-web does not count as planting on node-01.
+    if label in backend.planted:
         return {"status": "already-planted", "planted": 0, "skipped": len(request.files)}
     # Claimed before the write, so two sessions planting the same action at
     # once cannot both get past the check while the first is still writing.
-    backend.planted.add(request.action)
+    backend.planted.add(label)
 
     try:
         planted, skipped = await asyncio.to_thread(
             _write_files,
-            backend.container_id,
+            target,
             [(f.path, f.content, f.mode) for f in request.files],
         )
     except Exception as exc:
-        backend.planted.discard(request.action)
-        log.error("could not plant decoys into %s", backend.container_name, exc_info=True)
+        backend.planted.discard(label)
+        log.error("could not plant decoys into %s", target_name, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     backend.touch()
@@ -385,11 +406,11 @@ async def plant_decoys(request: DecoyRequest) -> dict[str, Any]:
         "planted %s (intent=%s) into %s: %d file(s), %d left alone because they already exist",
         request.action,
         request.intent,
-        backend.container_name,
+        target_name,
         planted,
         skipped,
     )
-    return {"status": "ok", "planted": planted, "skipped": skipped, "container": backend.container_name}
+    return {"status": "ok", "planted": planted, "skipped": skipped, "container": target_name}
 
 
 #: Prints which of its arguments already exist, and creates the parent

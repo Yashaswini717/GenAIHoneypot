@@ -157,6 +157,35 @@ class SessionState:
     #: rather than global because they are generated fresh per environment,
     #: unlike the static bundle values.
     extra_tokens: list[tuple[str, str]] = field(default_factory=list)
+    #: Who owns the environment, as the proxy recorded it. On a pivot the
+    #: source address is the attacker's own jump host, so this, not src_ip,
+    #: says whose environment the session is in.
+    attacker: str = ""
+    #: The account the session logged in as.
+    username: str = ""
+
+    @property
+    def pivot(self) -> bool:
+        """Whether this session is on a host the attacker reached from node-01."""
+        return bool(self.attacker) and self.attacker != self.src_ip
+
+    @property
+    def home_user(self) -> str:
+        """Whose home directory the decoys belong in.
+
+        The bundles are written for devuser, the account on node-01. A pivot
+        lands as someone else -- deploy on erp-web, dbadmin on db-01 -- and
+        devuser does not exist there.
+        """
+        if self.pivot and self.username and self.username != "root":
+            return self.username
+        return "devuser"
+
+    def place(self, path: str) -> str:
+        """Where a decoy written for devuser's home goes in this session."""
+        if self.home_user != "devuser" and path.startswith("/home/devuser/"):
+            return f"/home/{self.home_user}/{path[len('/home/devuser/'):]}"
+        return path
 
     @property
     def honeypot_id(self) -> str:
@@ -165,11 +194,13 @@ class SessionState:
         Was the bare sensor name, which is shared by every attacker on the
         node. That made honeytoken attribution collective: a credential used by
         one attacker looked, to the reward calculator, like evidence for
-        everyone's pending decisions. Keyed by source IP it matches how the
+        everyone's pending decisions. Keyed by the attacker it matches how the
         broker isolates environments in the first place, and it survives a
-        returning attacker the same way their container does.
+        returning attacker the same way their container does. On a pivot that
+        is the recorded attacker: the source address there is a jump host, and
+        every attacker's jump host can have the same one.
         """
-        safe_ip = self.src_ip.replace(":", "-") or "unknown"
+        safe_ip = (self.attacker or self.src_ip).replace(":", "-") or "unknown"
         return f"{self.sensor or 'node-01-jump'}-{safe_ip}"
 
 
@@ -275,8 +306,16 @@ class BrainCourier:
                 src_ip=event.get("src_ip", ""),
                 sensor=event.get("sensor", ""),
                 adaptive=bool(event.get("adaptive", True)),
+                username=event.get("username", ""),
             )
             self.sessions[session_id] = state
+        # Read from every command, not just the first: a pivot's earliest events
+        # can carry the fallback owner, its own source address, before the
+        # broker has said whose environment it is. A different value is the
+        # real owner and wins; the fallback never undoes it (the hub's rule).
+        incoming = event.get("attacker")
+        if incoming and (incoming != state.src_ip or not state.attacker):
+            state.attacker = incoming
 
         # A control-arm attacker gets a static honeypot: the same three nodes,
         # the same seeded decoys baked into the images, the same credentials,
@@ -397,7 +436,7 @@ class BrainCourier:
             state,
             action,
             intent,
-            [{"path": path, "content": body, "mode": mode} for path, body, mode in files],
+            [{"path": state.place(path), "content": body, "mode": mode} for path, body, mode in files],
         )
         if outcome is None:
             return
@@ -468,7 +507,7 @@ class BrainCourier:
         try:
             response = await self.client.post(
                 f"{self.brain_url}/api/v1/decoys/generate",
-                json={"action": action, "honeypot_id": state.honeypot_id},
+                json={"action": action, "honeypot_id": state.honeypot_id, "home_user": state.home_user},
                 timeout=GENERATE_TIMEOUT,
             )
             if response.status_code == 503:
@@ -520,6 +559,10 @@ class BrainCourier:
                 f"{self.broker_url}/session/decoys",
                 json={
                     "src_ip": state.src_ip,
+                    # Whose environment, and which host in it: on a pivot the
+                    # source address is the jump host, which owns nothing.
+                    "attacker": state.attacker or state.src_ip,
+                    "node": state.sensor,
                     "action": action,
                     "intent": intent,
                     "files": files,

@@ -516,33 +516,39 @@ class FakeHTTPException(Exception):
 
 @pytest.fixture
 def plant():
-    calls: list[list] = []
+    calls: list[tuple[str, list]] = []
     ns: dict[str, Any] = {
         "asyncio": asyncio,
+        "hashlib": hashlib,
         "log": logging.getLogger("t"),
         "HTTPException": FakeHTTPException,
         "_docker": object(),
         "Any": Any,
+        # The attacker's pivot targets that exist, by container name.
+        "peers": set(),
     }
     backend = SimpleNamespace(container_id="c1", container_name="jump-01-abc123", planted=set(), touch=lambda: None)
     ns["state"] = SimpleNamespace(backends={"203.0.113.5": backend})
 
     def fake_write(container_id, files):
-        calls.append(files)
+        calls.append((container_id, files))
         if ns.get("fail_next"):
             ns["fail_next"] = False
             raise RuntimeError("docker went away")
         return len(files), 0
 
     ns["_write_files"] = fake_write
-    _extract(["plant_decoys"], ns)
+    ns["_peer_exists"] = lambda name: name in ns["peers"]
+    _extract_assignment("PEER_PLAN", ns)
+    _extract(["plant_decoys", "_peer_container_name"], ns)
 
-    def request(action: str):
+    def request(action: str, *, src_ip: str = "203.0.113.5", attacker: str | None = None, node: str | None = None):
         file = SimpleNamespace(path="/home/devuser/notes.txt", content="x\n", mode=0o644)
-        return SimpleNamespace(src_ip="203.0.113.5", action=action, intent="reconnaissance", files=[file])
+        return SimpleNamespace(src_ip=src_ip, attacker=attacker, node=node, action=action,
+                               intent="reconnaissance", files=[file])
 
-    def call(action: str):
-        return asyncio.run(ns["plant_decoys"](request(action)))
+    def call(action: str, **where):
+        return asyncio.run(ns["plant_decoys"](request(action, **where)))
 
     ns.update(call=call, calls=calls, backend=backend)
     return ns
@@ -566,3 +572,46 @@ def test_a_failed_plant_can_be_retried(plant):
     assert "show_fake_endpoints" not in plant["backend"].planted
     assert plant["call"]("show_fake_endpoints")["status"] == "ok"
 
+
+# A session on erp-web reached from the attacker's own node-01: its source
+# address is that jump host, which owns no environment.
+PIVOT = {"src_ip": "172.23.0.2", "attacker": "203.0.113.5", "node": "node-02-erp"}
+
+
+def test_a_pivot_is_planted_into_the_attackers_own_copy_of_that_node(plant):
+    """Pivots were looked up by source address and always got no-active-session."""
+    erp = plant["_peer_container_name"]("203.0.113.5", "node-02-erp")
+    plant["peers"].add(erp)
+
+    result = plant["call"]("expose_fake_internal_ips", **PIVOT)
+
+    assert result == {"status": "ok", "planted": 1, "skipped": 0, "container": erp}
+    assert plant["calls"][0][0] == erp
+
+
+def test_a_pivot_without_that_attackers_node_plants_nothing(plant):
+    result = plant["call"]("expose_fake_internal_ips", **PIVOT)    # no erp-web was ever spawned
+    assert result["status"] == "no-active-session"
+    assert plant["calls"] == []
+
+
+def test_the_source_address_alone_still_finds_nothing_on_a_pivot(plant):
+    """Without the recorded owner a pivot must not land anywhere, least of all node-01."""
+    result = plant["call"]("expose_fake_internal_ips", src_ip="172.23.0.2")
+    assert result["status"] == "no-active-session"
+    assert plant["calls"] == []
+
+
+def test_each_node_is_planted_once_on_its_own(plant):
+    plant["peers"].add(plant["_peer_container_name"]("203.0.113.5", "node-02-erp"))
+
+    on_jump = plant["call"]("show_fake_endpoints", attacker="203.0.113.5", node="node-01-jump")
+    on_erp = plant["call"]("show_fake_endpoints", **PIVOT)
+    again = plant["call"]("show_fake_endpoints", **PIVOT)
+
+    assert (on_jump["status"], on_erp["status"], again["status"]) == ("ok", "ok", "already-planted")
+    assert [target for target, _ in plant["calls"]] == ["c1", on_erp["container"]]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
