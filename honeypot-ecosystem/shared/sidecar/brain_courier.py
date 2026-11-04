@@ -153,16 +153,17 @@ class SessionState:
     #: each -- an attacker who runs the same mysql command five times has told
     #: us one thing, not five.
     tripped: set[str] = field(default_factory=set)
-    #: Credentials the brain generated into this session's content. Per session
-    #: rather than global because they are generated fresh per environment,
-    #: unlike the static bundle values.
-    extra_tokens: list[tuple[str, str]] = field(default_factory=list)
     #: Who owns the environment, as the proxy recorded it. On a pivot the
     #: source address is the attacker's own jump host, so this, not src_ip,
     #: says whose environment the session is in.
     attacker: str = ""
     #: The account the session logged in as.
     username: str = ""
+
+    @property
+    def owner(self) -> str:
+        """Whose environment this session is in."""
+        return self.attacker or self.src_ip
 
     @property
     def pivot(self) -> bool:
@@ -226,6 +227,11 @@ class BrainCourier:
         self.resolved = 0
         self.tripped = 0
         self.brain_available: bool | None = None
+        #: Credentials the brain generated, by the attacker whose environment
+        #: they were planted in. They were kept on the session that asked for
+        #: them, but decoys outlive that session: a profile can land after
+        #: logout, and a returning attacker using one tripped nothing.
+        self.generated_tokens: dict[str, set[tuple[str, str]]] = {}
         #: Generation runs alongside the queue rather than in it. Held so a
         #: running task is not garbage collected, and so shutdown can wait.
         self._tasks: set[asyncio.Future] = set()
@@ -540,7 +546,9 @@ class BrainCourier:
         for token in body.get("tokens") or []:
             value = token.get("token_value")
             if value and len(value) >= 10:
-                state.extra_tokens.append((token.get("token_type", "generated"), value))
+                self.generated_tokens.setdefault(state.owner, set()).add(
+                    (token.get("token_type", "generated"), value)
+                )
 
         outcome = await self._plant_files(state, f"{action}:generated", intent, files)
         if outcome and outcome.get("status", "ok") == "ok":
@@ -602,9 +610,9 @@ class BrainCourier:
         if not isinstance(command, str):
             return  # malformed event; a substring test would raise on it
 
-        # Static bundle values plus anything the brain generated for this
-        # session specifically.
-        candidates = ALL_TOKEN_VALUES + tuple(state.extra_tokens)
+        # Static bundle values plus anything the brain generated into this
+        # attacker's environment, in this session or an earlier one.
+        candidates = ALL_TOKEN_VALUES + tuple(self.generated_tokens.get(state.owner, ()))
         hits = [
             (token_type, value)
             for token_type, value in candidates
