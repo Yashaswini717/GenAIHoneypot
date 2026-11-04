@@ -300,6 +300,14 @@ class BrainCourier:
         if not command:
             return
 
+        # Typed into a pivot through this session (ssh-proxy/pivots.py). The
+        # pivot's own session records and scores the same line; counting it
+        # here as well fired every tripwire and classification twice.
+        if event.get("nested"):
+            if state is not None:
+                state.last_seen = time.time()
+            return
+
         if state is None:
             state = SessionState(
                 session_id=session_id,

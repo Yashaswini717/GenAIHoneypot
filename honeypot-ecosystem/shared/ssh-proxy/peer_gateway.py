@@ -40,6 +40,7 @@ from credentials import CredentialStore
 from emitter import EventEmitter
 from experiment import is_adaptive
 from recorder import CommandReconstructor, TranscriptWriter
+import pivots
 
 log = logging.getLogger("ssh-proxy.peer")
 
@@ -170,7 +171,7 @@ class PeerGateway:
             process.stderr.write(b"Connection to host closed.\r\n")
         finally:
             for command in reconstructor.flush():
-                await self.emitter.emit(events.command(command))
+                await self.emitter.emit(pivots.mark(events, command))
             transcript.close()
             with contextlib.suppress(Exception):
                 process.exit(0)
@@ -229,6 +230,9 @@ class PeerServer(asyncssh.SSHServer):
             owner = self.target.get("owner")
             if owner:
                 self.events.attacker = owner
+                # From here the session that typed the ssh for this pivot
+                # records the same lines this one does; see pivots.py.
+                pivots.TRACKER.opened(self, owner)
                 # Recomputed from the owner rather than the peer address: the
                 # peer here is our own jump host, and assigning a pivot by it
                 # would put an attacker's deepest sessions in the opposite arm
@@ -236,6 +240,7 @@ class PeerServer(asyncssh.SSHServer):
                 self.events.adaptive = is_adaptive(owner)
 
     def connection_lost(self, exc: Exception | None) -> None:
+        pivots.TRACKER.closed(self)
         if self.events is not None:
             _schedule(self.gateway.emitter.emit(self.events.closed()))
 
@@ -359,7 +364,7 @@ async def _pump(
                 break
             transcript.write("o", data)
             for command in reconstructor.feed_output(data):
-                await emitter.emit(events.command(command))
+                await emitter.emit(pivots.mark(events, command))
             process.stdout.write(data)
 
     async def shell_stderr() -> None:

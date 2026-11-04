@@ -284,7 +284,9 @@ async def _store_session(event: dict, stamp: datetime) -> None:
         #    thing an analyst needs to look at, so later events of the same
         #    kind raise the open alert's score instead of adding rows.
         score = event.get("threat_score", 0)
-        if score >= ALERT_THRESHOLD:
+        # Not for a line typed into a pivot through this session: the pivot's
+        # own session raises that alert, and one query used to raise two.
+        if score >= ALERT_THRESHOLD and not event.get("nested"):
             alert_type = event.get("command_category") or event.get("event_type", "unknown")
             result = await db.execute(
                 select(Alert).where(

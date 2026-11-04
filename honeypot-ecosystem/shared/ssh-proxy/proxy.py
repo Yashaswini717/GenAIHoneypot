@@ -53,6 +53,7 @@ from experiment import describe as describe_experiment, is_adaptive  # noqa: E40
 from hassh import HandshakeSniffer  # noqa: E402
 from peer_gateway import PeerGateway  # noqa: E402
 from recorder import CommandReconstructor, TranscriptWriter  # noqa: E402
+import pivots  # noqa: E402
 
 log = logging.getLogger("ssh-proxy")
 
@@ -364,7 +365,7 @@ async def handle_session(process: asyncssh.SSHServerProcess) -> None:
         process.stderr.write(b"Connection to host closed.\r\n")
     finally:
         for command in reconstructor.flush():
-            await emitter.emit(events.command(command))
+            await emitter.emit(pivots.mark(events, command))
         transcript.close()
         with contextlib.suppress(Exception):
             process.exit(0)
@@ -397,7 +398,9 @@ async def _pump(
                 break
             transcript.write("o", data)
             for command in reconstructor.feed_output(data):
-                await emitter.emit(events.command(command))
+                # Marked nested while a pivot typed here is open: the peer
+                # gateway records the same line as the pivot's own.
+                await emitter.emit(pivots.mark(events, command))
             process.stdout.write(data)
 
     async def shell_stderr_to_attacker() -> None:
