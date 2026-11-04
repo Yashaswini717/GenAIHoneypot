@@ -414,6 +414,34 @@ def _prepare_paths(container: Any, paths: list[str]) -> set[str]:
     return {line for line in (output or b"").decode("utf-8", "replace").splitlines() if line in requested}
 
 
+#: Prints, for each argument in order, "<mtime> <directory>": the nearest
+#: directory above it that already exists. Run before anything is created,
+#: because making a directory, or adding anything to one, moves its mtime to
+#: the present.
+_ANCESTOR_SCRIPT = (
+    'for p in "$@"; do a="${p%/*}"; '
+    'while [ -n "$a" ] && [ ! -d "$a" ]; do a="${a%/*}"; done; '
+    'printf \'%s %s\\n\' "$(stat -c %Y "${a:-/}")" "${a:-/}"; '
+    "done"
+)
+
+
+def _existing_ancestors(container: Any, paths: list[str]) -> dict[str, tuple[str, int]]:
+    """Each path's nearest existing directory, with that directory's mtime now."""
+    if not paths:
+        return {}
+    exit_code, output = container.exec_run(["sh", "-c", _ANCESTOR_SCRIPT, "sh", *paths], user="root")
+    if exit_code != 0:
+        return {}
+    found = {}
+    lines = (output or b"").decode("utf-8", "replace").splitlines()
+    for path, line in zip(paths, lines):
+        stamp, _, directory = line.partition(" ")
+        if stamp.isdigit() and directory:
+            found[path] = (directory, int(stamp))
+    return found
+
+
 def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> tuple[int, int]:
     """Place files inside a running container via the archive API.
 
@@ -438,6 +466,10 @@ def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> tuple[
     written = 0
     # Read once: every decoy in this container hangs off the same fixed point.
     anchor = _container_epoch(container)
+    stamps: dict[str, int] = {}
+
+    # Before anything is created; see _date_directories.
+    ancestors = _existing_ancestors(container, [path for path, _, _ in files])
 
     # Also creates any missing directories (.aws, /srv/exports and so on).
     present = _prepare_paths(container, [path for path, _, _ in files])
@@ -456,6 +488,7 @@ def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> tuple[
         # two root-owned files materialising mid-session is exactly the kind
         # of thing `ls -la ~` shows and nothing explains.
         owner = _owner_for(directory)
+        mtimes = {name: _decoy_mtime(anchor, container_id, f"{directory}/{name}") for name, _, _ in entries}
 
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w") as archive:
@@ -466,12 +499,13 @@ def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> tuple[
                 info.mode = mode
                 info.uname = owner
                 info.gname = owner
-                info.mtime = _decoy_mtime(anchor, container_id, f"{directory}/{name}")
+                info.mtime = mtimes[name]
                 archive.addfile(info, io.BytesIO(payload))
         buffer.seek(0)
 
         if container.put_archive(directory, buffer.read()):
             written += len(entries)
+            stamps.update({f"{directory.rstrip('/')}/{name}": mtime for name, mtime in mtimes.items()})
             # uname/gname in the tar only apply if those names resolve inside
             # the container, so chown explicitly rather than trusting it.
             if owner != "root":
@@ -491,14 +525,68 @@ def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> tuple[
                 # Also `owner:owner` rather than a bare `owner`: chown without
                 # a group leaves group root, which `ls -la` prints just as
                 # plainly as a wrong owner does.
-                ancestors = _owned_ancestors(directory, owner)
-                if ancestors:
+                owned = _owned_ancestors(directory, owner)
+                if owned:
                     container.exec_run(
-                        ["sh", "-c", f"chown {owner}:{owner} {' '.join(ancestors)}"],
+                        ["sh", "-c", f"chown {owner}:{owner} {' '.join(owned)}"],
                         user="root",
                     )
 
+    _date_directories(container, stamps, ancestors)
     return written, len(files) - len(fresh)
+
+
+#: Sets atime and mtime from "<epoch> <path>" argument pairs.
+_BACKDATE_SCRIPT = 'while [ "$#" -gt 1 ]; do touch -c -d "@$1" "$2"; shift 2; done'
+
+
+def _directory_times(stamps: dict[str, int], ancestors: dict[str, tuple[str, int]]) -> dict[str, int]:
+    """The mtime each directory should end on once the files in `stamps` exist.
+
+    `stamps` maps each file written to its backdated mtime; `ancestors` maps it
+    to the nearest directory that existed before the write, with that
+    directory's mtime then. Every directory in between was made for this write,
+    so it takes the time of the newest file below it. The pre-existing one
+    keeps its own time unless something newer was added to it.
+    """
+    times: dict[str, int] = {}
+    for path, stamp in stamps.items():
+        if path not in ancestors:
+            continue
+        top, before = ancestors[path]
+        if not path.startswith(top.rstrip("/") + "/"):
+            continue
+        directory = path.rpartition("/")[0] or "/"
+        while directory != top:
+            times[directory] = max(times.get(directory, 0), stamp)
+            directory = directory.rpartition("/")[0] or "/"
+        times[top] = max(times.get(top, before), stamp)
+    return times
+
+
+def _date_directories(container: Any, stamps: dict[str, int], ancestors: dict[str, tuple[str, int]]) -> None:
+    """Date the directories a write touched to match the files it wrote.
+
+    Only the files used to be backdated. `mkdir -p` dated every directory it
+    made to the present, and adding a file or directory moved its parent's
+    mtime there too, so `ls -la ~/app` showed `.` and `..` from today above
+    contents months old (seen 2026-11-04). Now the tree looks as it would had
+    the decoys really been written on their dates.
+
+    Never fails a plant: the files are in place either way, and a directory
+    that keeps today's date is the old behaviour, not a new failure.
+    """
+    times = _directory_times(stamps, ancestors)
+    if not times:
+        return
+    pairs = [str(value) for directory, mtime in sorted(times.items()) for value in (mtime, directory)]
+    try:
+        exit_code, output = container.exec_run(["sh", "-c", _BACKDATE_SCRIPT, "sh", *pairs], user="root")
+    except Exception as exc:
+        log.warning("could not date decoy directories: %s", exc)
+        return
+    if exit_code != 0:
+        log.warning("could not date decoy directories (exit %s): %r", exit_code, output)
 
 
 #: Decoys are dated between these two bounds, in days before now.
