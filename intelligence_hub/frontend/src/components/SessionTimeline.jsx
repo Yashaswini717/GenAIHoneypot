@@ -71,8 +71,17 @@ export default function SessionTimeline() {
                     {e.event_type}
                   </span>
                   <div style={{ fontSize:12, color:'#94a3b8' }}>
-                    {e.username && `${e.username} / ${e.password}`}
-                    {e.command && `$ ${e.command}`}
+                    {/* Commands carry the username too: printing it with the
+                        missing password showed every command as "devuser / null$ ls". */}
+                    {e.command
+                      ? `$ ${e.command}`
+                      : e.username && (e.password ? `${e.username} / ${e.password}` : e.username)}
+                    {e.nested && (
+                      <span style={{ color:'#64748b', marginLeft:8 }}
+                        title="Typed into a pivot through this session; scored on the pivot's own session">
+                        (typed inside a pivot)
+                      </span>
+                    )}
                     {e.mitre_technique && <span style={{ color:'#a78bfa', marginLeft:8 }}>{e.mitre_technique}</span>}
                   </div>
                 </div>

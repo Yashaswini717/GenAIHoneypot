@@ -102,10 +102,27 @@ def test_commands_are_read_for_what_they_run(command, intent):
         "tar xzf tools.tgz",                          # extracting is not archiving
         "chmod 600 /tmp/k",
         "cd /tmp && ./run.sh",
+        "scp -t ~/4w39gvky8v7tk1qntdre0kdfog",          # an upload arriving (holdout v3)
+        "scp -t /dev/shm/4w39gvky8v7tk1qntdre0kdfog",
+        "scp -r -d -t /tmp/drop",
     ],
 )
 def test_neutral_commands_carry_no_evidence(command):
     assert command_evidence(command) == {}
+
+
+@pytest.mark.parametrize(
+    "command, intent",
+    [
+        ("scp -f /etc/passwd", "data_exfiltration"),           # a file being taken from here
+        ("scp -r -f /var/www/erp", "data_exfiltration"),
+        ("scp -oStrictHostKeyChecking=no /tmp/k deploy@erp-web:/tmp/", "lateral_movement"),
+        ("scp -i /tmp/k /tmp/tool deploy@erp-web:/tmp/", "lateral_movement"),
+    ],
+)
+def test_the_far_end_of_an_scp_is_read_by_its_direction(command, intent):
+    """OpenSSH runs `scp -t` where a file arrives and `scp -f` where one leaves."""
+    assert intent_of(command) == intent
 
 
 @pytest.mark.parametrize(

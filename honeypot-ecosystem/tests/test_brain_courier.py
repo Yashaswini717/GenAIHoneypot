@@ -680,6 +680,49 @@ def test_generated_credentials_join_the_tripwire():
     assert any(c["token_value"] == "AKIAZZ99TESTGEN0001" for c in rec.checks())
 
 
+def test_a_generated_credential_still_trips_when_the_attacker_comes_back():
+    """It was kept on the session that asked for it, so a return visit tripped nothing."""
+    rec = Recorder(action="populate_developer_workstation", generated=GENERATED)
+    courier = build_courier(rec)
+
+    drive(courier, [
+        command("v1", "whoami"),
+        command("v1", "ls -la ~"),          # classify -> plant -> generate
+        closed("v1"),
+        command("v2", "aws sts get-caller-identity --profile AKIAZZ99TESTGEN0001"),
+    ])
+
+    assert courier.tripped == 1
+    assert any(c["token_value"] == "AKIAZZ99TESTGEN0001" for c in rec.checks())
+
+
+def test_a_generated_credential_trips_on_the_attackers_pivot_too():
+    """Found on node-01, used on erp-web: the same attacker's environment."""
+    rec = Recorder(action="populate_developer_workstation", generated=GENERATED)
+    courier = build_courier(rec)
+
+    drive(courier, [
+        command("v3", "whoami"),
+        command("v3", "ls -la ~"),
+        pivot_command("v4", "aws s3 ls --profile AKIAZZ99TESTGEN0001"),
+    ])
+
+    assert courier.tripped == 1
+
+
+def test_another_attackers_generated_credential_is_not_theirs():
+    rec = Recorder(action="populate_developer_workstation", generated=GENERATED)
+    courier = build_courier(rec)
+
+    drive(courier, [
+        command("v5", "whoami"),
+        command("v5", "ls -la ~"),
+        {**command("v6", "aws s3 ls --profile AKIAZZ99TESTGEN0001"), "src_ip": "10.9.9.9"},
+    ])
+
+    assert courier.tripped == 0
+
+
 def test_no_model_key_leaves_the_bundle_standing_alone():
     """503 from the brain is the deployed default, not an error path."""
     rec = Recorder(action="populate_developer_workstation", generated=None)
