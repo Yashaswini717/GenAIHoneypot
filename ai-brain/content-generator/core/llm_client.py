@@ -35,6 +35,8 @@ class LLMClient(LoggerMixin):
         self.retry_delay = settings.llm_retry_delay
         self.client = None
         self._client_init_error: Exception | None = None
+        # Extra request fields only some providers accept; set per provider.
+        self.extra_body: dict[str, Any] | None = None
 
         # Initialize provider-specific client
         if self.provider == LLMProvider.OPENAI:
@@ -65,6 +67,11 @@ class LLMClient(LoggerMixin):
                 "HTTP-Referer": "https://github.com/gowrishn17/honeypot_ai",
                 "X-Title": "Honeypot AI Content Generator",
             }
+            # Decoy files need no reasoning, and a reasoning model can spend
+            # all of max_tokens thinking and hand back empty content. OpenRouter
+            # only: other providers reject the field.
+            if settings.llm_reasoning:
+                self.extra_body = {"reasoning": {"enabled": settings.llm_reasoning == "on"}}
 
         self.client = AsyncOpenAI(
             api_key=settings.openai_api_key,
@@ -200,6 +207,7 @@ class LLMClient(LoggerMixin):
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                extra_body=self.extra_body,
             )
 
             if not response.choices:

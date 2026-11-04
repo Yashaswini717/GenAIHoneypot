@@ -165,9 +165,22 @@ services:
       # container quietly kept the defaults from config/settings.py. Defaulted
       # here to those same values so behaviour is unchanged when unset.
       OPENAI_BASE_URL: "${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}"
-      # Free model ids on OpenRouter are retired without notice; the previous
-      # default now 404s with "No endpoints found".
-      LLM_MODEL: "${LLM_MODEL:-nex-agi/nex-n2.5-mini:free}"
+      # Free model ids on OpenRouter are retired without notice, and popular
+      # ones get rate-limited upstream: on 2026-11-03 nex-agi/nex-n2.5-mini:free
+      # was gone and both Gemma 4 models answered 429. This one answered in a
+      # second.
+      LLM_MODEL: "${LLM_MODEL:-nvidia/nemotron-3.5-lightning:free}"
+      # Every free model on OpenRouter reasons, and this one thinks until
+      # max_tokens runs out and returns no text unless told not to. "off" sends
+      # reasoning.enabled=false. For a model whose reasoning is mandatory, set
+      # LLM_REASONING= (empty) in .env; OpenRouter's docs say those reject it.
+      LLM_REASONING: "${LLM_REASONING-off}"
+      # Other free providers work the same way, with far larger quotas than
+      # OpenRouter's 50 requests a day; .env.example lists them. Two traps
+      # found testing them (2026-11-03/04): Gemma 4 on Google AI Studio writes
+      # its reasoning into the reply, no setting turns that off, and two of
+      # five test calls answered 500; Mistral's Medium and Small models are not
+      # in its free plan (0 requests a minute).
     # control reaches the sidecar and broker; uplink is how the model provider
     # is reached.
     #
