@@ -120,7 +120,12 @@ SESSION_TTL = 3600
 #: brain went on to answer successfully at 26s: the content was generated,
 #: charged for, and thrown away unread. This runs in a background task, so a
 #: long wait here costs nothing.
-GENERATE_TIMEOUT = 300.0
+#:
+#: Five minutes was the same mistake again on OpenRouter's free tier: one
+#: developer_workstation profile took 5 min 38 s (2026-11-03), its first call
+#: alone 3.5 minutes, and all ten files were discarded. Late content still
+#: lands: the broker keeps the environment for its idle TTL after logout.
+GENERATE_TIMEOUT = 600.0
 
 
 @dataclass
