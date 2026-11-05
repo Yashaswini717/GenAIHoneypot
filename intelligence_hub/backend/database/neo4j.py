@@ -41,6 +41,9 @@ async def write_session_graph(event: dict):
         return
 
     async with driver.session() as session:
+        # started_at is set once, by the session's first event. A plain SET
+        # moved it to the time of every later event, so a session's start in
+        # the graph was really its latest activity.
         await session.run("""
             MERGE (ip:IP {address: $src_ip})
             SET ip.country   = $country,
@@ -48,9 +51,9 @@ async def write_session_graph(event: dict):
                 ip.last_seen = $timestamp
 
             MERGE (s:Session {session_id: $session_id})
+            ON CREATE SET s.started_at = $timestamp
             SET s.protocol   = $protocol,
-                s.src_ip     = $src_ip,
-                s.started_at = $timestamp
+                s.src_ip     = $src_ip
 
             MERGE (ip)-[:INITIATED]->(s)
         """, {

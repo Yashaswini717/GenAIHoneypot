@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Query, HTTPException
 from typing import Optional
-from sqlalchemy import select, desc, update
+from sqlalchemy import select, desc, func
 from database.postgres import AsyncSessionLocal, Alert, AlertStatus
 from datetime import datetime
 
@@ -13,16 +13,23 @@ async def get_alerts(
     offset: int                    = Query(0),
     status: Optional[AlertStatus]  = Query(None),
 ):
+    # `total` is every alert that matches, not the length of this page: it
+    # used to be len(alerts), which a client paging through could not use.
+    conditions = [Alert.status == status] if status else []
     async with AsyncSessionLocal() as db:
-        q = select(Alert)
-        if status:
-            q = q.where(Alert.status == status)
-        q = q.order_by(desc(Alert.created_at)).offset(offset).limit(limit)
+        total = await db.scalar(select(func.count()).select_from(Alert).where(*conditions))
+        q = (
+            select(Alert)
+            .where(*conditions)
+            .order_by(desc(Alert.created_at))
+            .offset(offset)
+            .limit(limit)
+        )
         result = await db.execute(q)
         alerts = result.scalars().all()
 
     return {
-        "total":  len(alerts),
+        "total":  total or 0,
         "alerts": [
             {
                 "id":               a.id,

@@ -61,7 +61,7 @@ Measured on this system in November 2026.
 | Intent accuracy on the synthetic test set | 0.961 (220 of 229 windows) | Includes earlier test sets whose misses shaped the rules: a coverage check, not proof of generalisation |
 | The classifier before this term's rework | 0.481 dev, 0.522 test | On the evaluation sets of 1 November |
 | Time for a decoy to land | Templates: within 1 s. LLM files: 1–5 min | Mistral's free `ministral-8b-latest` |
-| Automated tests | Honeypot 200, brain 235, hub 116 passing | Two brain tests fail on Windows only, because they check Unix file permissions |
+| Automated tests | Honeypot 202, brain 237, hub 121 passing | Two brain tests fail on Windows only, because they check Unix file permissions |
 
 Accuracy is scored on windows of three commands, as the sidecar sends them. To print the
 tables, run `python -m ml.intent_classification.evaluation` from `ai-brain/content-generator`.
@@ -128,7 +128,6 @@ following, then run `python -m pytest tests/ -q` from the module's folder:
 - **No adaptive-versus-static result yet.** The experiment is built in:
   `EXPERIMENT_CONTROL_RATIO` holds back 15% of attackers, who get only the fixed decoys. But it
   needs live traffic.
-- **The bandit forgets on restart.** Its learned rewards are kept in memory only.
 - **Not on the internet yet.** The AWS deployment is prepared on a server but not exposed.
 
 The honeypot README lists more under ["Not done yet"](honeypot-ecosystem/README.md#not-done-yet).
