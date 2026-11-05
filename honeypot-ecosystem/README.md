@@ -4,9 +4,9 @@ Three deception nodes that an attacker can genuinely pivot through, every
 action streamed to the intelligence hub within milliseconds, and the GenAI
 brain changing the decoys while the attacker is still typing.
 
-This is the honeypot half of the capstone. It talks to two other modules:
-the **intelligence hub** (`feature/intelligence-hub`) and the **GenAI brain**
-(`ai-brain/content-generator`, already on `main`).
+This is the honeypot half of the capstone. It talks to the two other modules
+in this repository: the **intelligence hub** (`intelligence_hub/`) and the
+**GenAI brain** (`ai-brain/content-generator/`).
 
 ---
 
@@ -137,14 +137,8 @@ docker compose up -d
 
 ## Running the intelligence hub
 
-The hub lives on a different branch. Use a git worktree so both are checked
-out at once — you need them running together:
-
-```bash
-git worktree add ../GenAIHoneypot-hub feature/intelligence-hub
-```
-
-Then create `intelligence_hub/.env`. **`HMAC_SECRET` must be byte-identical
+The hub is in this repository, in `intelligence_hub/`, and runs alongside
+this stack. Create `intelligence_hub/.env`. **`HMAC_SECRET` must be byte-identical
 to this module's**, or every signed event is rejected with 401. The hub
 refuses to start with a secret published in this repo (`dev`, `change-me`):
 
@@ -165,7 +159,7 @@ How events are signed and checked, and every ingest setting, is in
 `intelligence_hub/README.md`.
 
 ```bash
-cd ../GenAIHoneypot-hub/intelligence_hub; docker compose up -d
+cd ../intelligence_hub && docker compose up -d
 ```
 
 First start pulls Elasticsearch, Postgres, Neo4j and Redis — give it a few
@@ -268,8 +262,11 @@ cannot reach yours at all.
 python -m pytest tests/ -v
 ```
 
-Eleven tests covering command reconstruction: tab completion, history recall,
-unechoed sudo passwords, and the ANSI/CR edge cases that broke it twice.
+Install `httpx==0.27.0` alongside `requirements.txt` first. There are about
+200 tests. They start with command reconstruction: tab completion, history
+recall, unechoed sudo passwords, and the ANSI/CR edge cases that broke it
+twice. They go on to event signing and the spool, decoy placement, pivots,
+return visits and the tripwire.
 
 ### Score intent classification on captured sessions
 
@@ -490,7 +487,12 @@ so the dashboard could never start; `vite.config.js` proxied to `localhost`,
 which inside the container is the frontend itself, so every API call vanished;
 `/ingest/batch` now needs the operator token (see Zero-trust pipeline).
 
-### Not merged to main
+### Branches (as of 5 November 2026)
 
-Everything lives on `feature/honeypot-ecosystem` and
-`feature/intelligence-hub`. Merge is deliberately deferred.
+All three modules and the work above are on `classifier-rework-and-hardening`,
+which is merged into `feat/close-the-adaptive-loop`. `main` still holds the
+October state.
+
+`feature/intelligence-hub` also has a setup for running the hub on a separate
+Windows PC (`intelligence_hub/WINDOWS_SETUP.md`). That setup is not on these
+branches.
