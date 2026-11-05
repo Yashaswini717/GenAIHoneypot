@@ -206,3 +206,54 @@ class TestAdaptiveDecisionEngine:
             assert stats[good_action].posterior_mean > stats[bad_action].posterior_mean
         finally:
             actions_module.ACTION_CATALOG[intent] = original_catalog
+
+
+class TestLearningSurvivesARestart:
+    """A restarted brain builds a new store on the same database file.
+
+    In Docker that file is on the brain-state volume (see
+    honeypot-ecosystem/docker-compose.yml), so the bandit keeps what it learned
+    only if nothing it learns stays in the process.
+    """
+
+    @staticmethod
+    def _arms(store):
+        return {
+            (s.intent, s.action): (s.alpha, s.beta, s.times_selected, s.total_reward)
+            for s in store.get_arm_stats()
+        }
+
+    def test_a_new_store_on_the_same_file_has_what_was_learned(self, test_database_url):
+        first = AdaptiveLearningStore(database_url=test_database_url)
+        engine = AdaptiveDecisionEngine(store=first, reward_calculator=RewardCalculator())
+        chosen = engine.decide(intent="data_exfiltration", session_id="s1").action
+        engine.resolve_feedback("s1", reward=REWARD_HONEYTOKEN_TRIGGERED)
+        learned = self._arms(first)
+        first.close()
+
+        second = AdaptiveLearningStore(database_url=test_database_url)
+        try:
+            assert self._arms(second) == learned
+            alpha, beta, times_selected, _ = learned[("data_exfiltration", chosen)]
+            assert (alpha, beta, times_selected) == (
+                1.0 + REWARD_HONEYTOKEN_TRIGGERED,
+                1.0 + (1.0 - REWARD_HONEYTOKEN_TRIGGERED),
+                1,
+            )
+        finally:
+            second.close()
+
+    def test_a_decision_made_before_the_restart_is_rewarded_after_it(self, test_database_url):
+        first = AdaptiveLearningStore(database_url=test_database_url)
+        engine = AdaptiveDecisionEngine(store=first, reward_calculator=RewardCalculator())
+        chosen = engine.decide(intent="persistence", session_id="s2").action
+        first.close()
+
+        second = AdaptiveLearningStore(database_url=test_database_url)
+        try:
+            engine = AdaptiveDecisionEngine(store=second, reward_calculator=RewardCalculator())
+            assert engine.resolve_feedback("s2", reward=REWARD_HONEYTOKEN_TRIGGERED) == 1
+            stats = {s.action: s for s in engine.get_stats(intent="persistence")}
+            assert stats[chosen].total_reward == REWARD_HONEYTOKEN_TRIGGERED
+        finally:
+            second.close()

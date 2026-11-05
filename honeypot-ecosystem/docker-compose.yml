@@ -156,6 +156,15 @@ services:
     environment:
       API_PORT: 8000
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      # What the bandit has learned, the honeytokens the brain registered and
+      # its generation log are one SQLite file. Its default place is /app/data,
+      # inside the container, so every recreate -- any `docker compose up -d`
+      # after a change to .env or to the image -- threw away everything learned
+      # since the image was built. On the brain-state volume it survives
+      # recreates and rebuilds. Not /app/data itself: the image copies the
+      # build machine's data/ folder there, local database included, and a new
+      # volume at that path would start as a copy of it.
+      DATABASE_URL: "sqlite:////var/lib/ai-brain/honeypot.db"
       # Without a key the brain still classifies; generation degrades to the
       # sidecar's offline bundles rather than failing the loop.
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
@@ -194,6 +203,8 @@ services:
     # reach the component that decides what to show them, and uplink is
     # outbound-only, so this does not hand them an egress path either.
     networks: [control, uplink]
+    volumes:
+      - brain-state:/var/lib/ai-brain
 
   sidecar:
     build:
@@ -265,3 +276,4 @@ volumes:
   telemetry:
   hostkeys:
   sidecar-state:
+  brain-state:
