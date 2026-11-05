@@ -1,6 +1,4 @@
-# GenAI Honeypot Ecosystem
-
-**with Adaptive Synthetic Decoys and Zero-Trust Sharing**
+# GenAI Honeypot Ecosystem with Adaptive Synthetic Decoys and Zero-Trust Sharing
 
 An SSH honeypot that works out what each attacker is trying to do, and changes what they
 find while they are still connected. Every two commands, an intent classifier names the
