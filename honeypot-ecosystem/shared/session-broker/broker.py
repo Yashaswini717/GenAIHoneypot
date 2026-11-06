@@ -1055,6 +1055,8 @@ def _create_container(key: str) -> Backend:
         domainname=NODE_DOMAIN,
         network=network.name,
         extra_hosts=_peer_hosts(network),
+        # Not the cloud host's search domain (ap-southeast-2.compute.internal on AWS).
+        dns_search=[NODE_DOMAIN],
         mac_address=_kvm_style_mac(key),
         **_runtime_options(),
         cap_drop=["ALL"],
@@ -1116,17 +1118,52 @@ def _spawn_peer(key: str, octet: int) -> str:
     except NotFound:
         pass
 
+    # The pivot targets come up as a pair. node-02's config names db-01, so a
+    # web node without a database behind it dead-ends the chain one hop from
+    # the payload. Still lazy in the way that matters: nothing beyond node-01
+    # exists until somebody actually pivots, and most sessions never do.
+    # The database comes up first so the web node can be handed its address.
+    # Docker's embedded DNS does not answer inside gVisor, so under runsc the
+    # alias alone left `db-01` unresolvable from erp-web (AWS, 2026-11-05).
+    hosts: dict[str, str] = {}
+    if spec["node"] == "node-02-erp":
+        for other_octet, other in PEER_PLAN.items():
+            if other["node"] == spec["node"]:
+                continue
+            try:
+                other_address = _spawn_peer(key, other_octet)
+            except Exception:
+                log.warning("could not pre-spawn %s", other["node"], exc_info=True)
+                continue
+            hosts[other["hostname"]] = other_address
+            hosts[f"{other['hostname']}.{NODE_DOMAIN}"] = other_address
+
     container = _docker.containers.run(
         spec["image"],
         name=name,
         detach=True,
         hostname=spec["hostname"],
         domainname=NODE_DOMAIN,
-        # Attached below with aliases rather than here: Docker's embedded DNS
-        # answers on the container *name*, not its hostname, so without an
-        # alias node-02 could not resolve `db-01` at all -- and node-02's own
-        # settings.py names exactly that host.
-        network=None,
+        extra_hosts=hosts,
+        # Otherwise Docker copies the host's search domain into resolv.conf,
+        # and on AWS that is ap-southeast-2.compute.internal: a giveaway.
+        dns_search=[NODE_DOMAIN],
+        # On the back network only, from creation. It used to start on Docker's
+        # default network and be connected to the back network afterwards:
+        # - That left a second interface on the default bridge, which routes to
+        #   the internet, so erp-web and db-01 could reach anything, the cloud
+        #   metadata address included (found on the AWS server, 2026-11-05).
+        # - gVisor never sees an interface added after start, so under runsc
+        #   the back network was missing inside the peer and every pivot failed.
+        # The aliases are needed because Docker's embedded DNS answers on the
+        # container *name*, not its hostname. Without them node-02 could not
+        # resolve `db-01`, and node-02's own settings.py names exactly that host.
+        network=back.name,
+        networking_config={
+            back.name: _docker.api.create_endpoint_config(
+                aliases=[spec["hostname"], f"{spec['hostname']}.{NODE_DOMAIN}"],
+            ),
+        },
         mac_address=_kvm_style_mac(f"{key}:{spec['node']}"),
         **_runtime_options(),
         cap_drop=["ALL"],
@@ -1141,28 +1178,11 @@ def _spawn_peer(key: str, octet: int) -> str:
             "honeypot.key": key,
         },
     )
-    back.connect(
-        container,
-        aliases=[spec["hostname"], f"{spec['hostname']}.{NODE_DOMAIN}"],
-    )
     _attach_proxy(back)
 
     container.reload()
     address = _address_of(container, back.name)
     log.info("spawned peer %s (%s) for %s at %s", name, spec["node"], key, address)
-
-    # The pivot targets come up as a pair. node-02's config names db-01, so a
-    # web node without a database behind it dead-ends the chain one hop from
-    # the payload. Still lazy in the way that matters: nothing beyond node-01
-    # exists until somebody actually pivots, and most sessions never do.
-    if spec["node"] == "node-02-erp":
-        for other_octet, other in PEER_PLAN.items():
-            if other["node"] != spec["node"]:
-                try:
-                    _spawn_peer(key, other_octet)
-                except Exception:
-                    log.warning("could not pre-spawn %s", other["node"], exc_info=True)
-
     return address
 
 
