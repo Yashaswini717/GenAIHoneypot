@@ -13,7 +13,12 @@
 # port. Re-running any phase is safe. Step-by-step guide: deploy/aws/README.md.
 set -euo pipefail
 
-ADMIN_SSH_PORT="${ADMIN_SSH_PORT:-22022}"
+# 3389, not a high port. An EC2 Instance Connect Endpoint, the only way in from a
+# network that allows just 80 and 443, tunnels to ports 22 and 3389 and refuses
+# any other ("The specified RemotePort is not valid"). Port 22 becomes the
+# honeypot's, so admin SSH has to be on 3389, and the security group should allow
+# 3389 only from the endpoint's security group. It is SSH on that port, not RDP.
+ADMIN_SSH_PORT="${ADMIN_SSH_PORT:-3389}"
 # Real bots arrive from thousands of addresses and each gets its own container,
 # so a small server needs a lower ceiling and a shorter idle life than local runs.
 MAX_CONTAINERS="${MAX_CONTAINERS:-15}"
@@ -158,7 +163,8 @@ prepare() {
     cat <<EOF
 
 Prepared. Next, without closing this session:
-  1. In the AWS security group, allow TCP $ADMIN_SSH_PORT from your IP.
+  1. In the AWS security group, allow TCP $ADMIN_SSH_PORT from your IP, or from the
+     Instance Connect Endpoint's security group if you connect through one.
   2. From a NEW terminal:  ssh -i <key.pem> -p $ADMIN_SSH_PORT ${SUDO_USER:-ubuntu}@<server address>
   3. In that new session:  cd $REPO && sudo bash deploy/server-setup.sh go-live
 EOF
@@ -180,7 +186,8 @@ go_live() {
     cat <<EOF
 
 Live on port 22. Last step, in the AWS security group: change the port-22 rule
-to allow 0.0.0.0/0 (the honeypot), and keep $ADMIN_SSH_PORT limited to your IP.
+to allow 0.0.0.0/0 (the honeypot), and keep $ADMIN_SSH_PORT limited to your IP or
+the Instance Connect Endpoint's security group.
 Test it:  ssh -p 22 devuser@<server address>   (password dev@123), then run
 check again -- it can verify gVisor and containment once a node container exists.
 EOF
@@ -223,6 +230,16 @@ check() {
     else
         [[ "$(docker inspect -f '{{.HostConfig.Runtime}}' "$node")" == runsc ]] \
             && pass "attacker container runs under gVisor" || fail "attacker container is not under gVisor"
+        # Not a safety check, so a note rather than a failure. gVisor ignores
+        # setuid and setgid bits unless runsc runs with --allow-suid, so inside
+        # a node `sudo` says "effective uid is not 0" and `crontab` is denied.
+        local sudo_out
+        sudo_out="$(docker exec -u nobody "$node" /usr/bin/sudo -n true 2>&1 || true)"
+        if [[ "$sudo_out" == *"effective uid is not 0"* ]]; then
+            note "sudo and crontab cannot elevate in attacker containers (runsc without --allow-suid)"
+        else
+            pass "setuid works in attacker containers, so sudo behaves as on a real host"
+        fi
         for target in "1.1.1.1 443 internet" "169.254.169.254 80 cloud-metadata"; do
             set -- $target
             if docker exec "$node" timeout 5 bash -c "echo > /dev/tcp/$1/$2" 2>/dev/null; then

@@ -22,6 +22,12 @@ host:
   os_version_id: "22.04"
   kernel: "5.15.0-118-generic"
   arch: x86_64
+  # The proxy may log attackers in as root, because root is what most SSH bots
+  # try first. The image then carries the proxy's key for root and says
+  # `PermitRootLogin yes`, so sshd_config agrees with a password login as root.
+  # Whether root is actually accepted is decided at the perimeter: root must
+  # also be listed in secrets/credentials.yaml.
+  root_login: true
 
 # How long the box claims to have been up when its logs are seeded. Real
 # uptime accrues on its own once the golden master runs continuously; this

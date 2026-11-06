@@ -75,12 +75,12 @@ class DockerException(Exception):
 # --------------------------------------------------------------------------
 
 
-@pytest.fixture
-def rendered(tmp_path, monkeypatch):
+def _render_node01(tmp_path, monkeypatch, root_login=None):
     """Run the real render_users and render_sshd into a temporary root.
 
     Account management is faked -- useradd only creates the home directory --
     and the timezone is fixed, because Windows ships no tz database.
+    `root_login`, when given, overrides node-01's host.root_login.
     """
     sys.path.insert(0, str(ROOT / "shared" / "node-build"))
     import render_node
@@ -90,6 +90,15 @@ def rendered(tmp_path, monkeypatch):
     pubkey.write_text(key + "\n", encoding="utf-8")
     monkeypatch.setattr(render_node, "BACKEND_PUBKEY", pubkey)
     monkeypatch.setattr(render_node, "zone", lambda name: timezone(timedelta(hours=5, minutes=30)))
+
+    # The real policy block, as bootstrap.py writes it for the node build. It
+    # carries `PermitRootLogin no`, which an image without it would never meet.
+    sys.path.insert(0, str(ROOT / "shared" / "ssh-proxy"))
+    import openssh_profile
+
+    policy = tmp_path / "sshd_policy.conf"
+    policy.write_text(openssh_profile.SSHD_CONFIG_LINES + "\n", encoding="utf-8", newline="")
+    monkeypatch.setattr(render_node, "SSHD_POLICY_PATH", policy)
 
     root = tmp_path / "root"
 
@@ -104,10 +113,22 @@ def rendered(tmp_path, monkeypatch):
     monkeypatch.setattr(render_node.subprocess, "run", fake_run)
 
     identity = yaml.safe_load((ROOT / "nodes" / "node-01-jump" / "identity.yaml").read_text(encoding="utf-8"))
+    if root_login is not None:
+        identity["host"]["root_login"] = root_login
     renderer = render_node.NodeRenderer(identity, root)
     renderer.render_users()
     renderer.render_sshd()
     return SimpleNamespace(root=root, key=key, identity=identity, module=render_node)
+
+
+@pytest.fixture
+def rendered(tmp_path, monkeypatch):
+    return _render_node01(tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def rendered_without_root(tmp_path, monkeypatch):
+    return _render_node01(tmp_path, monkeypatch, root_login=False)
 
 
 def test_backend_key_lives_where_the_login_account_cannot_reach(rendered):
@@ -154,6 +175,33 @@ def test_central_keys_pass_sshd_strict_modes(rendered):
 def test_central_key_directory_is_not_stamped_with_the_build_date(rendered):
     central = rendered.root / rendered.module.CENTRAL_KEYS_DIR.lstrip("/")
     assert time.time() - central.stat().st_mtime > 100 * 86400
+
+
+def test_root_gets_the_proxy_key_when_root_login_is_on(rendered):
+    """Most SSH bots try root first, and the proxy logs them in with this key."""
+    assert rendered.identity["host"].get("root_login") is True, "node-01 accepts root (identity.yaml)"
+    central = rendered.root / rendered.module.CENTRAL_KEYS_DIR.lstrip("/") / "root"
+    assert central.read_text(encoding="utf-8").strip() == rendered.key
+
+
+def _permit_root_lines(rendered) -> list[str]:
+    config = (rendered.root / "etc" / "ssh" / "sshd_config").read_text(encoding="utf-8")
+    return [line for line in config.splitlines() if line.split()[:1] == ["PermitRootLogin"]]
+
+
+def test_sshd_config_lets_root_in_with_a_single_line(rendered):
+    """sshd uses the first PermitRootLogin it reads, and the shared policy says no.
+
+    On the AWS server on 2026-11-06 the image had `no` from the policy and
+    `yes` further down; sshd took `no`, and every root login was dropped.
+    """
+    assert _permit_root_lines(rendered) == ["PermitRootLogin yes"]
+
+
+def test_without_root_login_the_policy_keeps_root_out(rendered_without_root):
+    central = rendered_without_root.root / rendered_without_root.module.CENTRAL_KEYS_DIR.lstrip("/")
+    assert not (central / "root").exists()
+    assert _permit_root_lines(rendered_without_root) == ["PermitRootLogin no"]
 
 
 # --------------------------------------------------------------------------
