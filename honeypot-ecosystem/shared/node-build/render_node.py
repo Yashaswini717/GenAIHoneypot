@@ -56,6 +56,10 @@ BACKEND_PUBKEY = Path("/tmp/build/backend_key.pub")
 #: The proxy's key lives here, where the account it logs in as cannot touch it.
 CENTRAL_KEYS_DIR = "/etc/ssh/authorized_keys"
 
+#: The sshd policy block, generated from the module the proxy advertises
+#: (shared/ssh-proxy/openssh_profile.py) and staged by the node Dockerfile.
+SSHD_POLICY_PATH = Path("/tmp/build/sshd_policy.conf")
+
 #: Bytes nginx logs for a GET / against the portal. Measured against the
 #: running node rather than guessed: the seeded availability-probe lines carry
 #: this size, and a response size in the access log that does not match what
@@ -367,6 +371,16 @@ class NodeRenderer:
             self.path(home).chmod(int(str(user.get("home_mode", "0750")), 8))
             self.run("chown", "-R", f"{name}:{name}", home)
 
+        # Root, when the proxy may log attackers in as root (host.root_login).
+        # Root already exists, so it is not in `users`. It only needs the
+        # proxy's key, in the same root-owned place as everyone else's. Whether
+        # an attacker can log in as root is still decided at the perimeter, by
+        # secrets/credentials.yaml.
+        if self.identity["host"].get("root_login") and authorized:
+            provisioned = self.random_moment(120, 400)
+            self.write(f"{CENTRAL_KEYS_DIR}/root", authorized + "\n", mode=0o644, when=provisioned)
+            keys_written.append(provisioned)
+
         # A directory's mtime is when an entry was last added to it. Left alone
         # it would carry the build date, the one fresh stamp in /etc/ssh.
         if keys_written:
@@ -389,8 +403,21 @@ class NodeRenderer:
         that contradiction alone would give the game away — so both sides are
         generated from the same source.
         """
-        policy = Path("/tmp/build/sshd_policy.conf")
+        policy = SSHD_POLICY_PATH
         policy_text = policy.read_text(encoding="utf-8") if policy.exists() else ""
+        # If the proxy logs attackers in as root, this file has to agree, and
+        # sshd too: it logs in to the node as root with its key. The shared
+        # policy says `PermitRootLogin no`, and sshd uses the first value it
+        # reads, so that line itself becomes `yes` (or is added if missing).
+        # Exactly one line, so the file does not contradict itself either.
+        if self.identity["host"].get("root_login"):
+            lines = policy_text.splitlines()
+            at = next((i for i, line in enumerate(lines) if line.split()[:1] == ["PermitRootLogin"]), None)
+            if at is None:
+                lines.append("PermitRootLogin yes")
+            else:
+                lines[at] = "PermitRootLogin yes"
+            policy_text = "\n".join(lines) + "\n"
 
         self.write(
             "/etc/ssh/sshd_config",
