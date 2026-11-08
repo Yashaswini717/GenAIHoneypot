@@ -463,8 +463,31 @@ def _existing_ancestors(container: Any, paths: list[str]) -> dict[str, tuple[str
     return found
 
 
+#: Writes one decoy from inside the container, so it lands in the filesystem the
+#: attacker sees. Arguments: path, mode (octal), owner ("" leaves it root's),
+#: mtime, first ("1" creates the file, "0" appends to it), last ("1" then sets
+#: mode, owner and time), and one base64 piece of the content. A first piece
+#: exits 3 if the path already exists, and writes under noclobber, so a file the
+#: attacker made after the existence check is not replaced either.
+_WRITE_SCRIPT = (
+    'p="$1"; d="${p%/*}"; if [ -n "$d" ]; then mkdir -p "$d" || exit 1; fi; '
+    'if [ "$5" = 1 ]; then '
+    'if [ -e "$p" ] || [ -L "$p" ]; then exit 3; fi; '
+    'set -C; printf %s "$7" | base64 -d > "$p" || exit 1; '
+    'else printf %s "$7" | base64 -d >> "$p" || exit 1; fi; '
+    'if [ "$6" = 1 ]; then chmod "$2" "$p" || exit 1; '
+    'if [ -n "$3" ]; then chown "$3:$3" "$p" || exit 1; fi; '
+    'touch -c -d "@$4" "$p" || exit 1; fi'
+)
+
+#: Raw bytes per write. In base64 that is 98,304 characters, under Linux's limit
+#: of 131,072 bytes for one argument, and a multiple of 3, so every piece
+#: decodes on its own.
+_WRITE_CHUNK_BYTES = 73728
+
+
 def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> tuple[int, int]:
-    """Place files inside a running container via the archive API.
+    """Place files inside a running container, writing them from inside it.
 
     Returns (written, skipped). A path that already exists is never
     overwritten: it is either something the attacker made or changed, a real
@@ -474,87 +497,79 @@ def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> tuple[
     attacker's own history vanished and rsyslog went on writing to an unlinked
     file while `tail` showed model-written lines.
 
-    put_archive is used rather than `exec` because it leaves no process behind
-    in the container's own process table. An attacker running `ps` while a
-    decoy is being planted should see nothing at all — a stray `sh -c cat > ...`
-    appearing mid-session would give away both the mechanism and the fact that
-    something is watching them.
+    The writes run inside the container because under gVisor the filesystem
+    the attacker sees is the sandbox's own, not the one Docker's archive API
+    writes to. This used put_archive, which leaves no process behind, and on
+    the cloud it failed twice over (found 2026-11-07):
+      - a directory made inside the sandbox does not exist from outside, so
+        every decoy that needed one (`~/.aws/credentials`, `~/app/...`) failed
+        with a 404 -- every generated decoy and every planted credential;
+      - a file written from outside never appears in a directory the sandbox
+        has already listed, so even the decoys that did land could be
+        invisible to the attacker.
+    Without gVisor the two views are one, which is why local runs never showed
+    either. The price is a short-lived `sh` per file, as the existence check
+    and the dating step already were.
     """
-    import io
-    import tarfile
+    import base64
 
     container = _docker.containers.get(container_id)
     written = 0
     # Read once: every decoy in this container hangs off the same fixed point.
     anchor = _container_epoch(container)
     stamps: dict[str, int] = {}
+    chowned: set[str] = set()
 
     # Before anything is created; see _date_directories.
     ancestors = _existing_ancestors(container, [path for path, _, _ in files])
 
-    # Also creates any missing directories (.aws, /srv/exports and so on).
+    # Also creates any missing directories (.aws, /srv/exports and so on),
+    # inside the container, where the writes below happen too.
     present = _prepare_paths(container, [path for path, _, _ in files])
     fresh = [(path, content, mode) for path, content, mode in files if path not in present]
 
-    # Group by directory: put_archive extracts a tar relative to one path.
-    by_dir: dict[str, list[tuple[str, str, int]]] = {}
     for path, content, mode in fresh:
-        directory, _, name = path.rpartition("/")
-        by_dir.setdefault(directory or "/", []).append((name, content, mode))
-
-    for directory, entries in by_dir.items():
-        # Ownership must match the directory the file lands in. put_archive
-        # defaults to root:root, so decoys dropped into /home/devuser arrived
-        # owned by root while every neighbouring file was devuser:devuser --
-        # two root-owned files materialising mid-session is exactly the kind
-        # of thing `ls -la ~` shows and nothing explains.
+        directory = path.rpartition("/")[0] or "/"
+        # Ownership must match the directory the file lands in. Decoys dropped
+        # into /home/devuser once arrived owned by root while every
+        # neighbouring file was devuser:devuser -- two root-owned files
+        # materialising mid-session is exactly the kind of thing `ls -la ~`
+        # shows and nothing explains. `owner:owner`, not a bare owner: chown
+        # without a group leaves group root, which `ls -la` prints just as
+        # plainly.
         owner = _owner_for(directory)
-        mtimes = {name: _decoy_mtime(anchor, container_id, f"{directory}/{name}") for name, _, _ in entries}
+        mtime = _decoy_mtime(anchor, container_id, path)
+        payload = content.encode("utf-8")
+        pieces = [payload[i:i + _WRITE_CHUNK_BYTES] for i in range(0, len(payload), _WRITE_CHUNK_BYTES)] or [b""]
 
-        buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w") as archive:
-            for name, content, mode in entries:
-                payload = content.encode("utf-8")
-                info = tarfile.TarInfo(name=name)
-                info.size = len(payload)
-                info.mode = mode
-                info.uname = owner
-                info.gname = owner
-                info.mtime = mtimes[name]
-                archive.addfile(info, io.BytesIO(payload))
-        buffer.seek(0)
-
-        if container.put_archive(directory, buffer.read()):
-            written += len(entries)
-            stamps.update({f"{directory.rstrip('/')}/{name}": mtime for name, mtime in mtimes.items()})
-            # uname/gname in the tar only apply if those names resolve inside
-            # the container, so chown explicitly rather than trusting it.
+        for index, piece in enumerate(pieces):
+            first, last = index == 0, index == len(pieces) - 1
+            exit_code, output = container.exec_run(
+                ["sh", "-c", _WRITE_SCRIPT, "sh", path, f"{mode:o}",
+                 "" if owner == "root" else owner, str(mtime),
+                 "1" if first else "0", "1" if last else "0",
+                 base64.b64encode(piece).decode("ascii")],
+                user="root",
+            )
+            if first and exit_code == 3:
+                break  # the attacker made it after the existence check; theirs stays
+            if exit_code != 0:
+                raise RuntimeError(f"could not write {path} (exit {exit_code}): {output!r}")
+        else:
+            written += 1
+            stamps[path] = mtime
+            # Every directory `mkdir -p` had to create, not just the leaf. A
+            # path like /home/devuser/.config/gh creates BOTH .config and gh as
+            # root, and chowning only the leaf left `.config` sitting
+            # root-owned in a user's home -- the first line of `ls -la ~`.
             if owner != "root":
-                paths = " ".join(f"{directory}/{name}" for name, _, _ in entries)
-                container.exec_run(
-                    ["sh", "-c", f"chown {owner}:{owner} {paths}"], user="root"
-                )
-                # Every directory `mkdir -p` had to create, not just the leaf.
-                #
-                # A path like /home/devuser/.config/gh creates BOTH .config and
-                # gh as root, and chowning only the leaf left `.config` sitting
-                # root-owned in a user's home -- the first line of `ls -la ~`,
-                # and exactly the anomaly the comment above is about. Flat
-                # bundles never showed it because they had no intermediate
-                # directories; generated profiles have several.
-                #
-                # Also `owner:owner` rather than a bare `owner`: chown without
-                # a group leaves group root, which `ls -la` prints just as
-                # plainly as a wrong owner does.
-                owned = _owned_ancestors(directory, owner)
+                owned = [d for d in _owned_ancestors(directory, owner) if d not in chowned]
                 if owned:
-                    container.exec_run(
-                        ["sh", "-c", f"chown {owner}:{owner} {' '.join(owned)}"],
-                        user="root",
-                    )
+                    container.exec_run(["chown", f"{owner}:{owner}", *owned], user="root")
+                    chowned.update(owned)
 
     _date_directories(container, stamps, ancestors)
-    return written, len(files) - len(fresh)
+    return written, len(files) - written
 
 
 #: Sets atime and mtime from "<epoch> <path>" argument pairs.
