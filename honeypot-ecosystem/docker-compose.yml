@@ -127,6 +127,10 @@ services:
       NODE_DOMAIN: cs.internal
       SESSION_IDLE_TTL: "${SESSION_IDLE_TTL:-21600}"
       MAX_CONTAINERS: "${MAX_CONTAINERS:-40}"
+      # Nodes kept started and unowned, so a new attacker's shell answers at
+      # once instead of in ~3.4 s under gVisor. 0 (off) locally; the cloud
+      # deploy sets 2. See "Warm sandboxes" in broker.py.
+      WARM_POOL_SIZE: "${WARM_POOL_SIZE:-0}"
       # "runsc" to sandbox attacker nodes under gVisor; empty for Docker's default.
       NODE_RUNTIME: "${NODE_RUNTIME:-}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
