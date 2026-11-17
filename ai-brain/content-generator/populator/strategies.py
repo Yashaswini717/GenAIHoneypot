@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from core.llm_client import LLMClient
 from generators.config_files import ConfigGenerator
@@ -13,12 +13,46 @@ from .base import BasePopulator, PopulationResult
 from .filesystem import FilesystemPopulator
 
 
+def content_key(profile: str, action: Optional[str]) -> str:
+    """Which ready-made model-written content a request can be served from.
+
+    The model-written files depend only on the profile, except for two actions
+    that change which files are generated. Credentials are never part of this
+    content: they are made per request (see `build_personal`).
+    """
+    if action == "serve_minimal_banner":
+        return "developer_minimal"
+    if action == "simulate_cron_jobs":
+        return "production_cron"
+    return profile
+
+
+#: One representative request per content key, used to make stock ahead of time
+#: (storage/decoy_stock.py). Every action maps to exactly one of these keys.
+STOCK_CONTEXTS: dict[str, dict[str, str]] = {
+    "developer_workstation": {"profile": "developer_workstation", "action": "populate_developer_workstation"},
+    "developer_minimal": {"profile": "developer_workstation", "action": "serve_minimal_banner"},
+    "production_server": {"profile": "production_server", "action": "populate_production_server"},
+    "production_cron": {"profile": "production_server", "action": "simulate_cron_jobs"},
+    "web_server": {"profile": "web_server", "action": "show_fake_endpoints"},
+    "database_server": {"profile": "database_server", "action": "populate_database_server"},
+}
+
+
 class PopulationStrategy(BasePopulator):
-    """Strategies for populating different honeypot types."""
+    """Strategies for populating different honeypot types.
+
+    Each profile comes in two halves:
+      * content -- the model-written files. They depend on nothing about the
+        attacker, so they can be generated ahead of time and kept in stock;
+      * personal -- the credentials, registered to this attacker's environment so
+        a tripwire can say who used them, and the fixed files around them.
+    `build` makes both, as it always did.
+    """
 
     def __init__(
-        self, 
-        llm_client: LLMClient, 
+        self,
+        llm_client: LLMClient,
         filesystem_populator: FilesystemPopulator,
         honeytoken_store: Optional[HoneytokenStore] = None,
     ):
@@ -26,18 +60,22 @@ class PopulationStrategy(BasePopulator):
         self.llm_client = llm_client
         self.filesystem_populator = filesystem_populator
         self.honeytoken_store = honeytoken_store
-        
+
         # Initialize generators
         self.source_code_gen = SourceCodeGenerator(llm_client)
         self.config_gen = ConfigGenerator(llm_client)
         self.log_gen = SystemLogGenerator(llm_client)
         self.doc_gen = UserDocumentGenerator(llm_client)
         self.token_gen = HoneytokenGenerator(llm_client)
-        
+
         # Track embedded honeytokens during population
         self._embedded_tokens: list[dict[str, Any]] = []
         # Steps that failed during the most recent build, for the caller to see
         self._failures: list[str] = []
+        # Awaited before every generation step when set. The decoy stock's
+        # filler uses it to stand aside while an attacker's decoys are being
+        # generated live, since both share one rate-limited model account.
+        self.step_gate: Optional[Callable[[], Awaitable[None]]] = None
 
     async def _gen(self, generator: Any, context: dict[str, Any], *, what: str) -> Optional[Any]:
         """Run one generation step, returning None instead of raising.
@@ -52,6 +90,8 @@ class PopulationStrategy(BasePopulator):
         for None and skip that file; everything else still gets built.
         """
         try:
+            if self.step_gate is not None:
+                await self.step_gate()
             return await generator.generate(context)
         except Exception as e:
             self._failures.append(what)
@@ -104,7 +144,7 @@ class PopulationStrategy(BasePopulator):
                 "token_value": token_value,
                 "file_path": file_path,
             })
-        
+
         return token_value
 
     async def build(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
@@ -125,27 +165,38 @@ class PopulationStrategy(BasePopulator):
         self._embedded_tokens = []
         self._failures = []
 
-        profile = context.get("profile", "developer_workstation")
-
-        strategies = {
-            "developer_workstation": self._build_developer,
-            "production_server": self._build_production,
-            "database_server": self._build_database,
-            "web_server": self._build_web_server,
-        }
-
-        strategy_func = strategies.get(profile, self._build_developer)
-        files = await strategy_func(honeypot_id, context)
+        files = await self._content(context) + await self._personal(honeypot_id, context)
 
         if self._failures:
             self.logger.warning(
                 "build_completed_with_failures",
-                profile=profile,
+                profile=context.get("profile", "developer_workstation"),
                 files=len(files),
                 failed_steps=len(self._failures),
                 steps=self._failures,
             )
         return files
+
+    async def build_content(self, context: dict[str, Any]) -> list[dict[str, Any]]:
+        """Only the model-written files, which are the same for any attacker.
+
+        This is the slow half -- one to several minutes against a free model --
+        and the half the decoy stock makes ahead of time. It never registers a
+        credential.
+        """
+        self._failures = []
+        return await self._content(context)
+
+    async def build_personal(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+        """Only what is made for this attacker: credentials, and the fixed files around them.
+
+        Fast, so it can run while the attacker is connected. Each credential is
+        new and registered to `honeypot_id`, so a tripwire names the attacker it
+        was planted for. Failures add to `failures` rather than replacing them,
+        so a caller that also built content sees both.
+        """
+        self._embedded_tokens = []
+        return await self._personal(honeypot_id, context)
 
     @property
     def embedded_tokens(self) -> list[dict[str, Any]]:
@@ -172,11 +223,35 @@ class PopulationStrategy(BasePopulator):
 
         return result
 
-    async def _build_developer(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-        """Populate developer workstation profile."""
-        if context.get("action") == "serve_minimal_banner":
-            return await self._build_developer_minimal(honeypot_id, context)
+    # -- dispatch ----------------------------------------------------------
 
+    async def _content(self, context: dict[str, Any]) -> list[dict[str, Any]]:
+        profile = context.get("profile", "developer_workstation")
+        if profile == "developer_workstation" and context.get("action") == "serve_minimal_banner":
+            return await self._content_developer_minimal(context)
+        builders = {
+            "developer_workstation": self._content_developer,
+            "production_server": self._content_production,
+            "database_server": self._content_database,
+            "web_server": self._content_web_server,
+        }
+        return await builders.get(profile, self._content_developer)(context)
+
+    async def _personal(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+        profile = context.get("profile", "developer_workstation")
+        if profile == "developer_workstation" and context.get("action") == "serve_minimal_banner":
+            return await self._personal_developer_minimal(honeypot_id, context)
+        builders = {
+            "developer_workstation": self._personal_developer,
+            "production_server": self._personal_production,
+            "database_server": self._personal_database,
+            "web_server": self._personal_web_server,
+        }
+        return await builders.get(profile, self._personal_developer)(honeypot_id, context)
+
+    # -- developer workstation ---------------------------------------------
+
+    async def _content_developer(self, context: dict[str, Any]) -> list[dict[str, Any]]:
         files = []
 
         # Source code. Extensions spelled out: the first two letters of
@@ -221,6 +296,11 @@ class PopulationStrategy(BasePopulator):
         if history:
             files.append({"path": ".bash_history", "content": history.content, "permissions": 0o600})
 
+        return files
+
+    async def _personal_developer(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+        files = []
+
         # Generate and embed honeytokens in credentials file
         aws_access_key_value = await self._generate_and_persist_honeytoken(
             "aws_access_key", honeypot_id, ".aws/credentials"
@@ -231,7 +311,7 @@ class PopulationStrategy(BasePopulator):
         github_token_value = await self._generate_and_persist_honeytoken(
             "github_token", honeypot_id, ".config/gh/hosts.yml"
         )
-        
+
         # Create AWS credentials file with honeytokens. Skipped entirely if
         # either value failed to generate -- a credentials file reading
         # "aws_secret_access_key = None" is a worse decoy than no file at all.
@@ -254,18 +334,17 @@ region = us-east-1
 
         return files
 
-    async def _build_developer_minimal(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-        """
-        Minimal-footprint variant of the developer workstation profile.
+    # Minimal-footprint variant of the developer workstation profile.
+    #
+    # Deliberately a much smaller surface than the full profile (3 files
+    # instead of 9, one honeytoken pair instead of three) -- the strategy this
+    # represents is giving a cautious attacker almost nothing to explore,
+    # rather than an elaborate environment inviting deeper poking around.
+    # Exists so `serve_minimal_banner` produces genuinely different deployed
+    # content from `populate_developer_workstation`, not just a different
+    # label pointing at the same files.
 
-        Deliberately a much smaller surface than `_build_developer` (3
-        files instead of 7, one honeytoken pair instead of three) — the
-        strategy this represents is giving a cautious attacker almost
-        nothing to explore, rather than an elaborate environment inviting
-        deeper poking around. Exists so `serve_minimal_banner` produces
-        genuinely different deployed content from `populate_developer_workstation`,
-        not just a different label pointing at the same files.
-        """
+    async def _content_developer_minimal(self, context: dict[str, Any]) -> list[dict[str, Any]]:
         files = []
 
         code = await self._gen(self.source_code_gen, {
@@ -279,6 +358,11 @@ region = us-east-1
         bashrc = await self._gen(self.config_gen, {"config_type": "bashrc", "persona": "developer"}, what="config/bashrc")
         if bashrc:
             files.append({"path": ".bashrc", "content": bashrc.content, "permissions": 0o644})
+
+        return files
+
+    async def _personal_developer_minimal(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+        files = []
 
         aws_access_key_value = await self._generate_and_persist_honeytoken(
             "aws_access_key", honeypot_id, ".aws/credentials"
@@ -296,10 +380,11 @@ region = us-east-1
 
         return files
 
-    async def _build_production(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-        """Populate production server profile."""
+    # -- production server -------------------------------------------------
+
+    async def _content_production(self, context: dict[str, Any]) -> list[dict[str, Any]]:
         files = []
-        
+
         # Server configs
         nginx = await self._gen(self.config_gen, {"config_type": "nginx", "site_type": "web_app"}, what="config/nginx")
         if nginx:
@@ -331,6 +416,25 @@ region = us-east-1
         if deploy_script:
             files.append({"path": "scripts/deploy.sh", "content": deploy_script.content, "permissions": 0o755})
 
+        # simulate_cron_jobs specifically: add real persistence-mechanism
+        # content (a backup script, and in the personal half the crontab that
+        # runs it) that's otherwise absent from this profile, so it's genuinely
+        # distinct from populate_production_server rather than the same files
+        # under a different action label.
+        if context.get("action") == "simulate_cron_jobs":
+            backup_script = await self._gen(self.source_code_gen, {
+                "language": "shell",
+                "script_type": "backup",
+                "purpose": "nightly backup and log rotation",
+            }, what="source/backup")
+            if backup_script:
+                files.append({"path": "opt/scripts/nightly_backup.sh", "content": backup_script.content, "permissions": 0o755})
+
+        return files
+
+    async def _personal_production(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+        files = []
+
         # Generate and embed API token honeytoken
         api_token = await self._generate_and_persist_honeytoken(
             "api_token", honeypot_id, "app/.env.production"
@@ -338,7 +442,7 @@ region = us-east-1
         jwt_secret = await self._generate_and_persist_honeytoken(
             "jwt_secret", honeypot_id, "app/.env.production"
         )
-        
+
         # Create production env file with honeytokens
         if api_token and jwt_secret:
             env_prod_content = f"""# Production environment
@@ -350,20 +454,9 @@ REDIS_URL=redis://cache.internal:6379/0
 """
             files.append({"path": "app/.env.production", "content": env_prod_content, "permissions": 0o600})
 
-        # simulate_cron_jobs specifically: add real persistence-mechanism
-        # content (a crontab + the script it runs) that's otherwise absent
-        # from this profile, so it's genuinely distinct from
-        # populate_production_server rather than the same files under a
-        # different action label.
+        # Fixed text, so it belongs here rather than in stock: the stock serves
+        # no file content twice, and this is the same for every attacker.
         if context.get("action") == "simulate_cron_jobs":
-            backup_script = await self._gen(self.source_code_gen, {
-                "language": "shell",
-                "script_type": "backup",
-                "purpose": "nightly backup and log rotation",
-            }, what="source/backup")
-            if backup_script:
-                files.append({"path": "opt/scripts/nightly_backup.sh", "content": backup_script.content, "permissions": 0o755})
-
             crontab_content = (
                 "# /etc/crontab: system-wide crontab\n"
                 "SHELL=/bin/bash\n"
@@ -376,10 +469,11 @@ REDIS_URL=redis://cache.internal:6379/0
 
         return files
 
-    async def _build_database(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-        """Populate database server profile."""
+    # -- database server ---------------------------------------------------
+
+    async def _content_database(self, context: dict[str, Any]) -> list[dict[str, Any]]:
         files = []
-        
+
         # Database scripts
         backup_script = await self._gen(self.source_code_gen, {
             "language": "python",
@@ -399,11 +493,16 @@ REDIS_URL=redis://cache.internal:6379/0
         if auth_log:
             files.append({"path": "var/log/auth.log", "content": auth_log.content, "permissions": 0o640})
 
+        return files
+
+    async def _personal_database(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+        files = []
+
         # Generate and embed database password honeytoken
         db_password = await self._generate_and_persist_honeytoken(
             "database_password", honeypot_id, ".pgpass"
         )
-        
+
         # Create .pgpass file with honeytoken
         if db_password:
             pgpass_content = f"""# hostname:port:database:username:password
@@ -441,10 +540,11 @@ db.internal:5432:production:app_user:{db_password}
 
         return files
 
-    async def _build_web_server(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-        """Populate web server profile."""
+    # -- web server --------------------------------------------------------
+
+    async def _content_web_server(self, context: dict[str, Any]) -> list[dict[str, Any]]:
         files = []
-        
+
         # Web application code
         app_code = await self._gen(self.source_code_gen, {
             "language": "python",
@@ -464,11 +564,16 @@ db.internal:5432:production:app_user:{db_password}
         if apache_log:
             files.append({"path": "logs/access.log", "content": apache_log.content, "permissions": 0o644})
 
+        return files
+
+    async def _personal_web_server(self, honeypot_id: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+        files = []
+
         # Generate and embed API key honeytoken
         api_key = await self._generate_and_persist_honeytoken(
             "api_token", honeypot_id, "app/config.py"
         )
-        
+
         # Create config file with honeytoken
         if api_key:
             config_content = f'''"""Application configuration."""

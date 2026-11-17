@@ -25,11 +25,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from api.dependencies import get_llm_client, get_population_strategy
+from api.dependencies import get_decoy_stock, get_llm_client, get_population_strategy
 from api.schemas.decoys import DecoyFile, GenerateDecoysRequest, GenerateDecoysResponse
 from config.logging_config import get_logger
 from core.adaptive_actions import ACTION_TO_PROFILE
 from core.llm_client import LLMClient
+from populator.strategies import content_key
 
 router = APIRouter(prefix="/api/v1/decoys", tags=["decoys"])
 logger = get_logger(__name__)
@@ -80,11 +81,31 @@ async def generate_decoys(
         )
 
     strategy = await get_population_strategy(llm_client)
+    context = {"profile": profile, "action": request.action}
 
     try:
-        specs = await strategy.build(
-            request.honeypot_id, {"profile": profile, "action": request.action}
-        )
+        # The model-written half from stock when there is any: made ahead of
+        # time, served to this attacker only, never again (storage/decoy_stock.py).
+        # Otherwise generated now, as before -- slow, but still unique.
+        stock = get_decoy_stock()
+        stocked = stock.take(content_key(profile, request.action)) if stock is not None else None
+        if stocked is not None:
+            content, stocked_failures, source = stocked["files"], stocked["failures"], "stock"
+        else:
+            # The stock filler stands aside meanwhile: one rate-limited model
+            # account serves both, and this attacker is waiting.
+            marker = stock.live_started() if stock is not None else None
+            try:
+                content = await strategy.build_content(context)
+            finally:
+                if marker is not None:
+                    stock.live_finished(marker)
+            stocked_failures, source = [], "live"
+            if stock is not None:
+                stock.record_served(content)  # so no stocked set repeats it later
+        # Always made now, for this attacker: new credentials registered to
+        # their environment, so a tripwire says exactly who used one.
+        specs = content + await strategy.build_personal(request.honeypot_id, context)
     except Exception as e:
         # `build` tolerates individual step failures now, so reaching here means
         # something structural went wrong rather than one model call stalling.
@@ -99,7 +120,7 @@ async def generate_decoys(
             detail=f"Could not generate content for {request.action}: {e}",
         ) from e
 
-    failures = strategy.failures
+    failures = stocked_failures + strategy.failures
 
     # 503 only when the profile came back completely empty.
     #
@@ -147,6 +168,7 @@ async def generate_decoys(
         failed_steps=len(failures),
         partial=bool(failures),
         honeypot_id=request.honeypot_id,
+        source=source,
     )
 
     return GenerateDecoysResponse(
@@ -156,4 +178,5 @@ async def generate_decoys(
         files=files,
         tokens=tokens,
         failed_steps=failures,
+        source=source,
     )

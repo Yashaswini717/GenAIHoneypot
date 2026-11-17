@@ -258,3 +258,75 @@ async def test_deploy_single_file(temp_dir):
     
     assert file_path.exists()
     assert file_path.stat().st_mode & 0o777 == 0o600
+
+
+# --------------------------------------------------------------------------
+# content (stockable) and personal (per attacker) halves
+# --------------------------------------------------------------------------
+
+_PROFILES = [
+    {"profile": "developer_workstation", "action": "populate_developer_workstation"},
+    {"profile": "developer_workstation", "action": "serve_minimal_banner"},
+    {"profile": "production_server", "action": "simulate_cron_jobs"},
+    {"profile": "production_server", "action": "populate_production_server"},
+    {"profile": "database_server", "action": "serve_fake_sensitive_files"},
+    {"profile": "web_server", "action": "show_fake_endpoints"},
+]
+
+
+@pytest.mark.asyncio
+async def test_build_content_never_makes_a_credential(temp_dir, honeytoken_store):
+    """Content goes into a stock shared by every future attacker, so no
+    credential may be in it: those must be minted for one attacker each."""
+    for context in _PROFILES:
+        strategy = _strategy(temp_dir, honeytoken_store)
+        files = await strategy.build_content(context)
+        assert files, context
+        assert strategy.embedded_tokens == [], context
+        assert not any("credentials" in f["path"] or f["path"].endswith((".pgpass", "config.py", ".env.production"))
+                       for f in files), context
+
+
+@pytest.mark.asyncio
+async def test_build_personal_registers_credentials_to_that_attacker(temp_dir, honeytoken_store):
+    strategy = _strategy(temp_dir, honeytoken_store)
+    files = await strategy.build_personal("hp-personal", {"profile": "developer_workstation"})
+
+    assert {f["path"] for f in files} == {".aws/credentials", ".config/gh/hosts.yml"}
+    assert strategy.embedded_tokens
+    for token in strategy.embedded_tokens:
+        assert honeytoken_store.check_honeytoken(token["token_value"]).honeypot_id == "hp-personal"
+
+
+@pytest.mark.asyncio
+async def test_build_is_still_content_plus_personal(temp_dir, honeytoken_store):
+    for context in _PROFILES:
+        whole = {f["path"] for f in await _strategy(temp_dir, honeytoken_store).build("hp", context)}
+        halves = _strategy(temp_dir, honeytoken_store)
+        parts = {f["path"] for f in await halves.build_content(context)}
+        parts |= {f["path"] for f in await halves.build_personal("hp", context)}
+        assert whole == parts, context
+
+
+@pytest.mark.asyncio
+async def test_fixed_text_stays_out_of_the_stockable_half(temp_dir, honeytoken_store):
+    """The stock never serves the same content twice, so text that is the same
+    for every attacker -- the crontab -- belongs to the personal half."""
+    context = {"profile": "production_server", "action": "simulate_cron_jobs"}
+    strategy = _strategy(temp_dir, honeytoken_store)
+    assert "etc/crontab" not in {f["path"] for f in await strategy.build_content(context)}
+    assert "etc/crontab" in {f["path"] for f in await strategy.build_personal("hp", context)}
+
+
+@pytest.mark.asyncio
+async def test_the_step_gate_is_awaited_before_every_generation_step(temp_dir):
+    strategy = _strategy(temp_dir)
+    calls = []
+
+    async def gate():
+        calls.append(1)
+
+    strategy.step_gate = gate
+    files = await strategy.build_content({"profile": "web_server", "action": "show_fake_endpoints"})
+
+    assert len(calls) == len(files) == 3

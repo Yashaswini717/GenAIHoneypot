@@ -95,6 +95,17 @@ class Settings(BaseSettings):
     )
     database_echo: bool = Field(default=False, alias="DATABASE_ECHO")
 
+    # Decoy stock: model-written decoys made ahead of time, each served once
+    # (storage/decoy_stock.py). Kept beside a SQLite database, so on the
+    # brain-state volume in the deployed stack, unless DECOY_STOCK_DIR says
+    # otherwise. The filler only runs when a model key is configured.
+    decoy_stock_enabled: bool = Field(default=True, alias="DECOY_STOCK_ENABLED")
+    decoy_stock_dir: Optional[Path] = Field(default=None, alias="DECOY_STOCK_DIR")
+    decoy_stock_per_key: int = Field(default=2, alias="DECOY_STOCK_PER_KEY")
+    decoy_stock_poll_seconds: float = Field(default=15.0, alias="DECOY_STOCK_POLL_SECONDS")
+    #: Least time between the filler's model calls; it is never in a hurry.
+    decoy_stock_step_seconds: float = Field(default=6.0, alias="DECOY_STOCK_STEP_SECONDS")
+
     # Storage
     output_base_path: Path = Field(
         default=Path("./data/generated"),
@@ -194,6 +205,23 @@ class Settings(BaseSettings):
                     "AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and "
                     "AZURE_OPENAI_DEPLOYMENT are required for Azure OpenAI provider"
                 )
+
+    def llm_configured(self) -> bool:
+        """Whether a model can be called at all. Without one, stocking is pointless."""
+        try:
+            self.validate_provider_config()
+        except ValueError:
+            return False
+        return True
+
+    def resolved_decoy_stock_dir(self) -> Path:
+        """Where the decoy stock lives: DECOY_STOCK_DIR, else beside a SQLite database."""
+        if self.decoy_stock_dir:
+            return Path(self.decoy_stock_dir)
+        prefix = "sqlite:///"
+        if self.database_url.startswith(prefix):
+            return Path(self.database_url[len(prefix):]).parent / "decoy-stock"
+        return Path("./data/decoy-stock")
 
 
 # Global settings instance
