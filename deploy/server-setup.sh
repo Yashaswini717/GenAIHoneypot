@@ -23,6 +23,9 @@ ADMIN_SSH_PORT="${ADMIN_SSH_PORT:-3389}"
 # so a small server needs a lower ceiling and a shorter idle life than local runs.
 MAX_CONTAINERS="${MAX_CONTAINERS:-15}"
 SESSION_IDLE_TTL="${SESSION_IDLE_TTL:-7200}"
+# Nodes kept started for the next attacker. A fresh one takes ~3.4 s under
+# gVisor, and on 2026-11-06 a bot that had logged in left 60 ms before its shell.
+WARM_POOL_SIZE="${WARM_POOL_SIZE:-2}"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HP="$REPO/honeypot-ecosystem"
@@ -145,6 +148,7 @@ prepare() {
     set_env .env NODE_RUNTIME runsc
     set_env .env MAX_CONTAINERS "$MAX_CONTAINERS"
     set_env .env SESSION_IDLE_TTL "$SESSION_IDLE_TTL"
+    set_env .env WARM_POOL_SIZE "$WARM_POOL_SIZE"
     # Port 22 is still the admin SSH until go-live (and stays the honeypot's after).
     grep -q '^PROXY_PUBLISH_PORT=22$' .env || set_env .env PROXY_PUBLISH_PORT 2222
     docker network inspect honeypot-telemetry >/dev/null 2>&1 || docker network create honeypot-telemetry

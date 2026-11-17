@@ -23,6 +23,22 @@ Containers are reaped after an idle TTL, together with any pivot targets the
 attacker reached. On reap we log the changed paths from `docker diff` (the
 broker's own log, not the hub's event stream), so what an attacker modified is
 recorded even though the container is not.
+
+Warm sandboxes
+--------------
+
+A new container takes about 3.4 s to answer under gVisor, and on the cloud
+honeypot (2026-11-06) a bot that had already logged in gave up 60 ms before its
+shell was ready. With WARM_POOL_SIZE > 0 the broker keeps that many nodes
+started on networks of their own, unowned, and hands one to the next new
+attacker: renamed to the name their source IP would have produced, and from then
+on an environment like any other. The pool refills in the background.
+
+The labels a node is created with cannot change, so a pooled node carries
+`honeypot.pool` instead of `honeypot.key`. Its owner is held in memory and
+recovered after a broker restart the same way any returning attacker's node is:
+by the name derived from their address, when they come back. Until then, or if
+they never do, it is reaped on the idle TTL like everything else.
 """
 
 from __future__ import annotations
@@ -31,6 +47,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import secrets
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -80,6 +97,11 @@ IDLE_TTL_SECONDS = int(os.environ.get("SESSION_IDLE_TTL", str(6 * 60 * 60)))
 #: Ceiling on simultaneous containers. A distributed brute-force campaign can
 #: otherwise turn per-IP isolation into a memory exhaustion bug on our own host.
 MAX_CONTAINERS = int(os.environ.get("MAX_CONTAINERS", "40"))
+
+#: Nodes kept started and unowned, so a new attacker's shell answers at once
+#: (see "Warm sandboxes" above). 0 turns the pool off. Not counted in
+#: MAX_CONTAINERS: that caps attackers, and these belong to nobody yet.
+WARM_POOL_SIZE = int(os.environ.get("WARM_POOL_SIZE", "0"))
 
 #: Container runtime for attacker nodes; empty means Docker's default (runc).
 #: "runsc" runs them under gVisor, so a kernel exploit by an attacker with root
@@ -132,15 +154,37 @@ class Backend:
     #: a broker restart forgets it; the no-clobber rule in _write_files still
     #: protects every file that exists, leaving only deleted decoys to return.
     planted: set[str] = field(default_factory=set)
+    #: The attacker network this node sits on. Derived from the key for a node
+    #: created for that attacker; a warm node keeps the network it was started
+    #: on, whose name has nothing to do with whoever it went to.
+    network_name: str = ""
 
     def touch(self) -> None:
         self.last_seen = time.time()
+
+
+@dataclass
+class PoolMember:
+    """A started node nobody owns yet."""
+
+    container_id: str
+    name: str
+    network_name: str
+    address: str
+    created_at: float = field(default_factory=time.time)
 
 
 class BrokerState:
     def __init__(self) -> None:
         self.backends: dict[str, Backend] = {}
         self.lock = asyncio.Lock()
+        #: Warm nodes, oldest first.
+        self.pool: list[PoolMember] = []
+        self.pool_filling = False
+        #: Warm nodes found at startup whose owner is not known yet, by
+        #: container id. A returning owner claims theirs by name; the rest are
+        #: reaped on the idle TTL.
+        self.unkeyed: dict[str, Backend] = {}
 
 
 state = BrokerState()
@@ -177,6 +221,7 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok" if _docker is not None else "degraded",
         "active_containers": len(state.backends),
+        "warm_pool": len(state.pool),
         "image": NODE_IMAGE,
     }
 
@@ -202,7 +247,7 @@ async def acquire_session(request: SessionRequest) -> SessionResponse:
             # session timing out with nothing explaining why. Both calls are
             # idempotent, so paying for them on the reuse path costs a
             # negligible exec and removes the whole failure mode.
-            network = await asyncio.to_thread(_ensure_network, key)
+            network = await asyncio.to_thread(_network_of, existing)
             await asyncio.to_thread(_attach_proxy, network)
             await asyncio.to_thread(_claim_peer_addresses, key, network)
             log.info("reusing container %s for %s", existing.container_name, key)
@@ -224,10 +269,16 @@ async def acquire_session(request: SessionRequest) -> SessionResponse:
             if len(state.backends) >= MAX_CONTAINERS:
                 raise HTTPException(status_code=503, detail="capacity reached")
 
-        backend = await asyncio.to_thread(_create_container, key)
+        backend, warm = await _new_backend(key)
         backend.session_count = 1
         state.backends[key] = backend
-        log.info("created container %s for %s at %s", backend.container_name, key, backend.address)
+        state.unkeyed.pop(backend.container_id, None)  # a returning owner after a restart
+        log.info(
+            "%s container %s for %s at %s",
+            "assigned warm" if warm else "created", backend.container_name, key, backend.address,
+        )
+        if WARM_POOL_SIZE:
+            asyncio.create_task(_fill_pool())
         return SessionResponse(
             host=backend.address,
             port=SSH_PORT,
@@ -463,8 +514,31 @@ def _existing_ancestors(container: Any, paths: list[str]) -> dict[str, tuple[str
     return found
 
 
+#: Writes one decoy from inside the container, so it lands in the filesystem the
+#: attacker sees. Arguments: path, mode (octal), owner ("" leaves it root's),
+#: mtime, first ("1" creates the file, "0" appends to it), last ("1" then sets
+#: mode, owner and time), and one base64 piece of the content. A first piece
+#: exits 3 if the path already exists, and writes under noclobber, so a file the
+#: attacker made after the existence check is not replaced either.
+_WRITE_SCRIPT = (
+    'p="$1"; d="${p%/*}"; if [ -n "$d" ]; then mkdir -p "$d" || exit 1; fi; '
+    'if [ "$5" = 1 ]; then '
+    'if [ -e "$p" ] || [ -L "$p" ]; then exit 3; fi; '
+    'set -C; printf %s "$7" | base64 -d > "$p" || exit 1; '
+    'else printf %s "$7" | base64 -d >> "$p" || exit 1; fi; '
+    'if [ "$6" = 1 ]; then chmod "$2" "$p" || exit 1; '
+    'if [ -n "$3" ]; then chown "$3:$3" "$p" || exit 1; fi; '
+    'touch -c -d "@$4" "$p" || exit 1; fi'
+)
+
+#: Raw bytes per write. In base64 that is 98,304 characters, under Linux's limit
+#: of 131,072 bytes for one argument, and a multiple of 3, so every piece
+#: decodes on its own.
+_WRITE_CHUNK_BYTES = 73728
+
+
 def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> tuple[int, int]:
-    """Place files inside a running container via the archive API.
+    """Place files inside a running container, writing them from inside it.
 
     Returns (written, skipped). A path that already exists is never
     overwritten: it is either something the attacker made or changed, a real
@@ -474,87 +548,79 @@ def _write_files(container_id: str, files: list[tuple[str, str, int]]) -> tuple[
     attacker's own history vanished and rsyslog went on writing to an unlinked
     file while `tail` showed model-written lines.
 
-    put_archive is used rather than `exec` because it leaves no process behind
-    in the container's own process table. An attacker running `ps` while a
-    decoy is being planted should see nothing at all — a stray `sh -c cat > ...`
-    appearing mid-session would give away both the mechanism and the fact that
-    something is watching them.
+    The writes run inside the container because under gVisor the filesystem
+    the attacker sees is the sandbox's own, not the one Docker's archive API
+    writes to. This used put_archive, which leaves no process behind, and on
+    the cloud it failed twice over (found 2026-11-07):
+      - a directory made inside the sandbox does not exist from outside, so
+        every decoy that needed one (`~/.aws/credentials`, `~/app/...`) failed
+        with a 404 -- every generated decoy and every planted credential;
+      - a file written from outside never appears in a directory the sandbox
+        has already listed, so even the decoys that did land could be
+        invisible to the attacker.
+    Without gVisor the two views are one, which is why local runs never showed
+    either. The price is a short-lived `sh` per file, as the existence check
+    and the dating step already were.
     """
-    import io
-    import tarfile
+    import base64
 
     container = _docker.containers.get(container_id)
     written = 0
     # Read once: every decoy in this container hangs off the same fixed point.
     anchor = _container_epoch(container)
     stamps: dict[str, int] = {}
+    chowned: set[str] = set()
 
     # Before anything is created; see _date_directories.
     ancestors = _existing_ancestors(container, [path for path, _, _ in files])
 
-    # Also creates any missing directories (.aws, /srv/exports and so on).
+    # Also creates any missing directories (.aws, /srv/exports and so on),
+    # inside the container, where the writes below happen too.
     present = _prepare_paths(container, [path for path, _, _ in files])
     fresh = [(path, content, mode) for path, content, mode in files if path not in present]
 
-    # Group by directory: put_archive extracts a tar relative to one path.
-    by_dir: dict[str, list[tuple[str, str, int]]] = {}
     for path, content, mode in fresh:
-        directory, _, name = path.rpartition("/")
-        by_dir.setdefault(directory or "/", []).append((name, content, mode))
-
-    for directory, entries in by_dir.items():
-        # Ownership must match the directory the file lands in. put_archive
-        # defaults to root:root, so decoys dropped into /home/devuser arrived
-        # owned by root while every neighbouring file was devuser:devuser --
-        # two root-owned files materialising mid-session is exactly the kind
-        # of thing `ls -la ~` shows and nothing explains.
+        directory = path.rpartition("/")[0] or "/"
+        # Ownership must match the directory the file lands in. Decoys dropped
+        # into /home/devuser once arrived owned by root while every
+        # neighbouring file was devuser:devuser -- two root-owned files
+        # materialising mid-session is exactly the kind of thing `ls -la ~`
+        # shows and nothing explains. `owner:owner`, not a bare owner: chown
+        # without a group leaves group root, which `ls -la` prints just as
+        # plainly.
         owner = _owner_for(directory)
-        mtimes = {name: _decoy_mtime(anchor, container_id, f"{directory}/{name}") for name, _, _ in entries}
+        mtime = _decoy_mtime(anchor, container_id, path)
+        payload = content.encode("utf-8")
+        pieces = [payload[i:i + _WRITE_CHUNK_BYTES] for i in range(0, len(payload), _WRITE_CHUNK_BYTES)] or [b""]
 
-        buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w") as archive:
-            for name, content, mode in entries:
-                payload = content.encode("utf-8")
-                info = tarfile.TarInfo(name=name)
-                info.size = len(payload)
-                info.mode = mode
-                info.uname = owner
-                info.gname = owner
-                info.mtime = mtimes[name]
-                archive.addfile(info, io.BytesIO(payload))
-        buffer.seek(0)
-
-        if container.put_archive(directory, buffer.read()):
-            written += len(entries)
-            stamps.update({f"{directory.rstrip('/')}/{name}": mtime for name, mtime in mtimes.items()})
-            # uname/gname in the tar only apply if those names resolve inside
-            # the container, so chown explicitly rather than trusting it.
+        for index, piece in enumerate(pieces):
+            first, last = index == 0, index == len(pieces) - 1
+            exit_code, output = container.exec_run(
+                ["sh", "-c", _WRITE_SCRIPT, "sh", path, f"{mode:o}",
+                 "" if owner == "root" else owner, str(mtime),
+                 "1" if first else "0", "1" if last else "0",
+                 base64.b64encode(piece).decode("ascii")],
+                user="root",
+            )
+            if first and exit_code == 3:
+                break  # the attacker made it after the existence check; theirs stays
+            if exit_code != 0:
+                raise RuntimeError(f"could not write {path} (exit {exit_code}): {output!r}")
+        else:
+            written += 1
+            stamps[path] = mtime
+            # Every directory `mkdir -p` had to create, not just the leaf. A
+            # path like /home/devuser/.config/gh creates BOTH .config and gh as
+            # root, and chowning only the leaf left `.config` sitting
+            # root-owned in a user's home -- the first line of `ls -la ~`.
             if owner != "root":
-                paths = " ".join(f"{directory}/{name}" for name, _, _ in entries)
-                container.exec_run(
-                    ["sh", "-c", f"chown {owner}:{owner} {paths}"], user="root"
-                )
-                # Every directory `mkdir -p` had to create, not just the leaf.
-                #
-                # A path like /home/devuser/.config/gh creates BOTH .config and
-                # gh as root, and chowning only the leaf left `.config` sitting
-                # root-owned in a user's home -- the first line of `ls -la ~`,
-                # and exactly the anomaly the comment above is about. Flat
-                # bundles never showed it because they had no intermediate
-                # directories; generated profiles have several.
-                #
-                # Also `owner:owner` rather than a bare `owner`: chown without
-                # a group leaves group root, which `ls -la` prints just as
-                # plainly as a wrong owner does.
-                owned = _owned_ancestors(directory, owner)
+                owned = [d for d in _owned_ancestors(directory, owner) if d not in chowned]
                 if owned:
-                    container.exec_run(
-                        ["sh", "-c", f"chown {owner}:{owner} {' '.join(owned)}"],
-                        user="root",
-                    )
+                    container.exec_run(["chown", f"{owner}:{owner}", *owned], user="root")
+                    chowned.update(owned)
 
     _date_directories(container, stamps, ancestors)
-    return written, len(files) - len(fresh)
+    return written, len(files) - written
 
 
 #: Sets atime and mtime from "<epoch> <path>" argument pairs.
@@ -997,7 +1063,30 @@ def _adopt_existing(name: str, key: str) -> Backend | None:
         container_id=container.id,
         container_name=name,
         address=_address_of(container),
+        network_name=_front_network_of(container, key),
     )
+
+
+def _front_network_of(container: Any, key: str) -> str:
+    """The attacker network a node is attached to.
+
+    A node created for its owner sits on `_network_name(key)`; a warm node
+    sits on the network it was started on. Read from the node itself, so a
+    broker restart finds the right one either way.
+    """
+    networks = container.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
+    for name in networks:
+        if name != NODE_NETWORK:
+            return name
+    return _network_name(key)
+
+
+def _network_of(backend: Any) -> Any:
+    """The network object for an owned node, creating it only for a keyed one."""
+    name = getattr(backend, "network_name", "") or _network_name(backend.key)
+    if name == _network_name(backend.key):
+        return _ensure_network(backend.key)
+    return _docker.networks.get(name)
 
 
 def _peer_hosts(network: Any) -> dict[str, str]:
@@ -1043,31 +1132,21 @@ def _create_container(key: str) -> Backend:
 
     adopted = _adopt_existing(name, key)
     if adopted is not None:
+        if adopted.network_name and adopted.network_name != network.name:
+            # A warm node handed out before a broker restart lives on the
+            # network it was started on, so the one just made for this key is
+            # not needed. Nothing is attached to it, so it goes quietly.
+            _detach_proxy(network.name)
+            network = _network_of(adopted)
         _attach_proxy(network)
         _claim_peer_addresses(key, network)
         return adopted
 
-    container = _docker.containers.run(
-        NODE_IMAGE,
-        name=name,
-        detach=True,
-        hostname=NODE_HOSTNAME,
-        domainname=NODE_DOMAIN,
-        network=network.name,
-        extra_hosts=_peer_hosts(network),
-        # Not the cloud host's search domain (ap-southeast-2.compute.internal on AWS).
-        dns_search=[NODE_DOMAIN],
-        mac_address=_kvm_style_mac(key),
-        **_runtime_options(),
-        cap_drop=["ALL"],
-        cap_add=NODE_CAPABILITIES,
-        mem_limit=MEM_LIMIT,
-        pids_limit=PIDS_LIMIT,
-        cpu_quota=CPU_QUOTA,
-        # No privileged mode, no host namespaces, no bind mounts, and no
-        # Docker socket. The container has no route off the deception network.
-        privileged=False,
-        labels={
+    container = _run_node(
+        name,
+        network,
+        _kvm_style_mac(key),
+        {
             "honeypot.role": "node",
             "honeypot.node": ENTRY_NODE_NAME,
             "honeypot.key": key,
@@ -1082,7 +1161,205 @@ def _create_container(key: str) -> Backend:
         container_id=container.id,
         container_name=name,
         address=address,
+        network_name=network.name,
     )
+
+
+def _run_node(name: str, network: Any, mac: str, labels: dict[str, str]) -> Any:
+    """Start one entry node on `network`. Shared by owned and warm nodes."""
+    return _docker.containers.run(
+        NODE_IMAGE,
+        name=name,
+        detach=True,
+        hostname=NODE_HOSTNAME,
+        domainname=NODE_DOMAIN,
+        network=network.name,
+        extra_hosts=_peer_hosts(network),
+        # Not the cloud host's search domain (ap-southeast-2.compute.internal on AWS).
+        dns_search=[NODE_DOMAIN],
+        mac_address=mac,
+        **_runtime_options(),
+        cap_drop=["ALL"],
+        cap_add=NODE_CAPABILITIES,
+        mem_limit=MEM_LIMIT,
+        pids_limit=PIDS_LIMIT,
+        cpu_quota=CPU_QUOTA,
+        # No privileged mode, no host namespaces, no bind mounts, and no
+        # Docker socket. The container has no route off the deception network.
+        privileged=False,
+        labels=labels,
+    )
+
+
+# --------------------------------------------------------------------------
+# warm sandboxes
+# --------------------------------------------------------------------------
+
+
+def _pool_network(pool_id: str) -> Any:
+    """A warm node's own attacker network.
+
+    Named like every other attacker network, so nothing about it reads as
+    spare. No `honeypot.key` label: it belongs to nobody yet, and
+    `_reap_orphans` only considers networks with an owner.
+    """
+    return _docker.networks.create(
+        _network_name(f"pool:{pool_id}"),
+        driver="bridge",
+        internal=True,
+        labels={"honeypot.role": "attacker-net", "honeypot.pool": "1"},
+    )
+
+
+def _create_pool_member() -> PoolMember:
+    """Start one unowned node, ready for whoever logs in next.
+
+    Its name looks like any other node's. On assignment it is renamed to the
+    name its owner's address produces, which is how that owner finds it again.
+    """
+    pool_id = secrets.token_hex(3)
+    name = f"{NODE_HOSTNAME}-{pool_id}"
+    network = _pool_network(pool_id)
+    container = _run_node(
+        name,
+        network,
+        _kvm_style_mac(f"pool:{pool_id}"),
+        {
+            "honeypot.role": "node",
+            "honeypot.node": ENTRY_NODE_NAME,
+            "honeypot.pool": "1",
+        },
+    )
+    # Ready for the proxy before anyone needs it, so assignment is a rename.
+    _attach_proxy(network)
+    _claim_peer_addresses(name, network)
+    container.reload()
+    return PoolMember(
+        container_id=container.id,
+        name=name,
+        network_name=network.name,
+        address=_address_of(container, network.name),
+    )
+
+
+def _name_taken(name: str) -> bool:
+    try:
+        _docker.containers.get(name)
+        return True
+    except NotFound:
+        return False
+
+
+def _assign(member: PoolMember, key: str) -> Backend | None:
+    """Give a warm node to `key`. None if it died in the meantime."""
+    name = _safe_name(key)
+    try:
+        container = _docker.containers.get(member.container_id)
+        container.reload()
+        if container.status != "running":
+            raise DockerException(f"warm node {member.name} is {container.status}")
+        container.rename(name)
+    except (NotFound, DockerException):
+        log.warning("warm node %s unusable, discarding it", member.name, exc_info=True)
+        _discard_member(member)
+        return None
+    return Backend(
+        key=key,
+        container_id=member.container_id,
+        container_name=name,
+        address=member.address,
+        network_name=member.network_name,
+    )
+
+
+async def _new_backend(key: str) -> tuple[Backend, bool]:
+    """A node for an attacker the broker holds nothing for: (backend, was_warm).
+
+    Their own node comes first: one that outlived a broker restart is found by
+    the name their address produces, and must not be shadowed by a warm one.
+    """
+    if state.pool and not await asyncio.to_thread(_name_taken, _safe_name(key)):
+        member = state.pool.pop(0)
+        backend = await asyncio.to_thread(_assign, member, key)
+        if backend is not None:
+            return backend, True
+    return await asyncio.to_thread(_create_container, key), False
+
+
+async def _fill_pool() -> None:
+    """Start warm nodes until the pool is full. One filler at a time."""
+    if state.pool_filling or _docker is None:
+        return
+    state.pool_filling = True
+    try:
+        while len(state.pool) < WARM_POOL_SIZE:
+            member = await asyncio.to_thread(_create_pool_member)
+            state.pool.append(member)
+            log.info("warm node %s ready (%d of %d)", member.name, len(state.pool), WARM_POOL_SIZE)
+    except Exception:
+        log.warning("could not start a warm node; the next session will start its own", exc_info=True)
+    finally:
+        state.pool_filling = False
+
+
+def _discard_member(member: PoolMember) -> None:
+    try:
+        _force_remove(member.container_id)
+    except (NotFound, DockerException):
+        pass
+    _detach_proxy(member.network_name)
+
+
+def _reconcile_unkeyed() -> list[Backend]:
+    """Warm nodes that outlived the broker, owner unknown (see "Warm sandboxes").
+
+    Idle ones are removed on shutdown, so these were handed out. Their owner
+    claims one by name on a return visit; the rest are reaped on the idle TTL.
+    """
+    if _docker is None:
+        return []
+    found: list[Backend] = []
+    try:
+        containers = _docker.containers.list(all=True, filters={"label": "honeypot.pool=1"})
+    except DockerException:
+        log.warning("could not list warm nodes", exc_info=True)
+        return []
+    for container in containers:
+        try:
+            found.append(
+                Backend(
+                    key="",
+                    container_id=container.id,
+                    container_name=container.name,
+                    address=_address_of(container),
+                    network_name=_front_network_of(container, container.name),
+                )
+            )
+        except Exception:
+            log.debug("skipping unusable warm node %s", container.name, exc_info=True)
+    return found
+
+
+def _clear_empty_pool_networks() -> int:
+    """Networks of warm nodes that are gone. Docker refuses to remove one a node is on."""
+    if _docker is None:
+        return 0
+    try:
+        networks = _docker.networks.list(filters={"label": "honeypot.pool=1"})
+    except DockerException:
+        return 0
+    cleared = 0
+    for network in networks:
+        try:
+            network.reload()
+            attached = {c.get("Name") for c in (network.attrs.get("Containers") or {}).values()}
+        except DockerException:
+            continue
+        if attached - {PROXY_CONTAINER}:
+            continue
+        _detach_proxy(network.name)
+        cleared += 1
+    return cleared
 
 
 def _peer_container_name(key: str, node: str) -> str:
@@ -1241,8 +1518,10 @@ async def _destroy(key: str) -> None:
     try:
         await asyncio.to_thread(_force_remove, backend.container_id)
         # The network goes with it, or we leak one per attacker we ever saw
-        # and eventually exhaust Docker's address pool.
-        await asyncio.to_thread(_detach_proxy, _network_name(key))
+        # and eventually exhaust Docker's address pool. A warm node's network
+        # is the one it was started on, not the one its owner's key names.
+        network_name = getattr(backend, "network_name", "") or _network_name(key)
+        await asyncio.to_thread(_detach_proxy, network_name)
         await asyncio.to_thread(_destroy_peers, key)
     except Exception:
         log.error("failed to remove %s", backend.container_name, exc_info=True)
@@ -1322,6 +1601,23 @@ async def _reaper() -> None:
             stale = [k for k, b in state.backends.items() if now - b.last_seen > IDLE_TTL_SECONDS]
             for key in stale:
                 await _destroy(key)
+            await _reap_unkeyed(now)
+
+
+async def _reap_unkeyed(now: float) -> None:
+    """Warm nodes whose owner never came back after a broker restart. Caller holds the lock."""
+    for container_id, backend in list(state.unkeyed.items()):
+        if now - backend.last_seen <= IDLE_TTL_SECONDS:
+            continue
+        state.unkeyed.pop(container_id, None)
+        changes = await asyncio.to_thread(_collect_changes, container_id)
+        log.info("reaping unclaimed warm node %s; %d changed path(s)", backend.container_name, len(changes))
+        _log_changes(changes)
+        try:
+            await asyncio.to_thread(_force_remove, container_id)
+        except (NotFound, DockerException):
+            pass
+        await asyncio.to_thread(_detach_proxy, backend.network_name)
 
 
 def _reconcile() -> list[Backend]:
@@ -1369,6 +1665,7 @@ def _reconcile() -> list[Backend]:
                     container_id=container.id,
                     container_name=container.name,
                     address=_address_of(container),
+                    network_name=_front_network_of(container, key),
                 )
             )
         except Exception:
@@ -1379,20 +1676,40 @@ def _reconcile() -> list[Backend]:
 @app.on_event("startup")
 async def _startup() -> None:
     recovered = await asyncio.to_thread(_reconcile)
+    unkeyed = await asyncio.to_thread(_reconcile_unkeyed)
     async with state.lock:
         for backend in recovered:
             state.backends[backend.key] = backend
+        for backend in unkeyed:
+            state.unkeyed[backend.container_id] = backend
     orphaned = await asyncio.to_thread(_reap_orphans, {b.key for b in recovered})
+    await asyncio.to_thread(_clear_empty_pool_networks)
 
     log.info(
-        "session broker up: image=%s network=%s runtime=%s idle_ttl=%ds max=%d | adopted %d "
-        "existing environment(s), cleaned up after %d departed attacker(s)",
+        "session broker up: image=%s network=%s runtime=%s idle_ttl=%ds max=%d warm=%d | adopted %d "
+        "existing environment(s) and %d handed-out warm node(s), cleaned up after %d departed attacker(s)",
         NODE_IMAGE,
         NODE_NETWORK,
         NODE_RUNTIME or "default",
         IDLE_TTL_SECONDS,
         MAX_CONTAINERS,
+        WARM_POOL_SIZE,
         len(recovered),
+        len(unkeyed),
         orphaned,
     )
     asyncio.create_task(_reaper())
+    if WARM_POOL_SIZE:
+        asyncio.create_task(_fill_pool())
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    """Remove idle warm nodes: they hold nothing, and a restart starts fresh ones.
+
+    Doing it here is what lets startup treat every warm node it finds as one
+    that was handed out (see _reconcile_unkeyed).
+    """
+    members, state.pool = list(state.pool), []
+    for member in members:
+        await asyncio.to_thread(_discard_member, member)

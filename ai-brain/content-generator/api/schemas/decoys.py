@@ -51,3 +51,11 @@ class GenerateDecoysResponse(BaseModel):
             "thinning every decoy set."
         ),
     )
+    source: Optional[str] = Field(
+        default=None,
+        description=(
+            "Where the model-written files came from: 'stock' (made ahead of time, "
+            "served to this attacker only) or 'live' (generated for this request). "
+            "Credentials are always made for the request."
+        ),
+    )

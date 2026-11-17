@@ -127,6 +127,10 @@ services:
       NODE_DOMAIN: cs.internal
       SESSION_IDLE_TTL: "${SESSION_IDLE_TTL:-21600}"
       MAX_CONTAINERS: "${MAX_CONTAINERS:-40}"
+      # Nodes kept started and unowned, so a new attacker's shell answers at
+      # once instead of in ~3.4 s under gVisor. 0 (off) locally; the cloud
+      # deploy sets 2. See "Warm sandboxes" in broker.py.
+      WARM_POOL_SIZE: "${WARM_POOL_SIZE:-0}"
       # "runsc" to sandbox attacker nodes under gVisor; empty for Docker's default.
       NODE_RUNTIME: "${NODE_RUNTIME:-}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
@@ -184,6 +188,11 @@ services:
       # reasoning.enabled=false. For a model whose reasoning is mandatory, set
       # LLM_REASONING= (empty) in .env; OpenRouter's docs say those reject it.
       LLM_REASONING: "${LLM_REASONING-off}"
+      # Model-written decoys made ahead of time and served once each, because a
+      # profile takes minutes and bots stay seconds (storage/decoy_stock.py).
+      # Kept on the brain-state volume; filled only when a model key is set.
+      DECOY_STOCK_ENABLED: "${DECOY_STOCK_ENABLED:-true}"
+      DECOY_STOCK_PER_KEY: "${DECOY_STOCK_PER_KEY:-2}"
       # Other free providers work the same way, with far larger quotas than
       # OpenRouter's 50 requests a day; .env.example lists them. Two traps
       # found testing them (2026-11-03/04): Gemma 4 on Google AI Studio writes

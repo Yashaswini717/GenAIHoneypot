@@ -57,10 +57,26 @@ import httpx
 
 log = logging.getLogger("sidecar.brain")
 
-#: Classify once a session has this many new commands. One command is rarely
-#: enough to infer intent, and waiting for many wastes the early window where
-#: adapting still changes the attacker's path.
+#: After the first decision, classify again once a session has this many new
+#: commands. One command is rarely enough to infer a *change* of intent, and
+#: waiting for many wastes the window where adapting still changes the
+#: attacker's path.
 CLASSIFY_EVERY = 2
+
+#: The first decision comes after this many commands.
+#:
+#: It was CLASSIFY_EVERY too, and on the cloud honeypot (2026-11) that cost the
+#: very attackers the decoys are for: the logged-in bots stayed 6 to 67
+#: seconds, and the ones that ran a single command (`cat /bin/echo`, the CPU
+#: check before a malware download) never got a decision or a decoy at all.
+#: A first guess from one command is weak, but the window and previous_intent
+#: correct it at the next classification, and a decoy that arrives while the
+#: attacker is still connected is worth more than a better-informed one after.
+FIRST_CLASSIFY_AFTER = 1
+
+#: The node attackers log in to from outside. Its sessions are always the
+#: attacker's own; pivot nodes have to learn whose session they are.
+ENTRY_SENSOR = "node-01-jump"
 
 #: Do not re-classify faster than this, however fast commands arrive. Protects
 #: the brain from a paste-bomb turning into a request flood.
@@ -166,6 +182,17 @@ class SessionState:
         return self.attacker or self.src_ip
 
     @property
+    def owner_known(self) -> bool:
+        """Whether a decoy planted now would reach this attacker's environment.
+
+        On node-01 the source address is the attacker's own. On a pivot the
+        first events can still carry the jump host's address as a stand-in (see
+        `attacker`), and a decision made then plants into nobody's environment
+        and is never retried -- which the first-command decision made likely.
+        """
+        return self.sensor in ("", ENTRY_SENSOR) or self.pivot
+
+    @property
     def pivot(self) -> bool:
         """Whether this session is on a host the attacker reached from node-01."""
         return bool(self.attacker) and self.attacker != self.src_ip
@@ -202,7 +229,7 @@ class SessionState:
         every attacker's jump host can have the same one.
         """
         safe_ip = (self.attacker or self.src_ip).replace(":", "-") or "unknown"
-        return f"{self.sensor or 'node-01-jump'}-{safe_ip}"
+        return f"{self.sensor or ENTRY_SENSOR}-{safe_ip}"
 
 
 class BrainCourier:
@@ -290,8 +317,9 @@ class BrainCourier:
             #
             # /intent-classify resolves the *previous* decision each time it is
             # called again for the same session, so a decision only ever scores
-            # if the session survives long enough to be classified twice. With
-            # CLASSIFY_EVERY = 2 that is four commands. Sessions shorter than
+            # if the session survives long enough to be classified twice: three
+            # commands, the first decision at one and the next two commands
+            # later (FIRST_CLASSIFY_AFTER, CLASSIFY_EVERY). Sessions shorter than
             # that -- a look around and a disconnect, which is the common case,
             # not the edge case -- left a decision pending forever, so the arms
             # the bandit picked most often were the ones it learned least about.
@@ -354,7 +382,10 @@ class BrainCourier:
         # an attacker can do and it must not wait for a rate limit.
         await self._check_tripwire(state, command)
 
-        if state.unclassified < CLASSIFY_EVERY:
+        if not state.owner_known:
+            return  # commands keep counting; decide once we know whose session it is
+        due = CLASSIFY_EVERY if state.last_classified else FIRST_CLASSIFY_AFTER
+        if state.unclassified < due:
             return
         if time.time() - state.last_classified < MIN_CLASSIFY_INTERVAL:
             return

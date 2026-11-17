@@ -53,6 +53,7 @@ from experiment import describe as describe_experiment, is_adaptive  # noqa: E40
 from hassh import HandshakeSniffer  # noqa: E402
 from peer_gateway import PeerGateway  # noqa: E402
 from recorder import CommandReconstructor, TranscriptWriter  # noqa: E402
+from teardown import close_inner  # noqa: E402
 import pivots  # noqa: E402
 
 log = logging.getLogger("ssh-proxy")
@@ -344,26 +345,31 @@ async def handle_session(process: asyncssh.SSHServerProcess) -> None:
     requested = process.command
     interactive = requested is None
 
+    backend_conn = shell = None
     try:
         if requested:
             # Emitted here because a one-shot command produces no shell echo
             # for the reconstructor to recover it from.
             await emitter.emit(events.command(requested))
 
-        async with await _connect_backend_when_ready(backend, username) as backend_conn:
-            async with backend_conn.create_process(
-                requested,
-                term_type=term_type if interactive else None,
-                term_size=term_size[:2] if interactive else None,
-                encoding=None,
-            ) as shell:
-                await _pump(process, shell, reconstructor, transcript, events)
+        backend_conn = await _connect_backend_when_ready(backend, username)
+        shell = await backend_conn.create_process(
+            requested,
+            term_type=term_type if interactive else None,
+            term_size=term_size[:2] if interactive else None,
+            encoding=None,
+        )
+        await _pump(process, shell, reconstructor, transcript, events)
     except asyncio.CancelledError:
         raise
     except Exception:
         log.error("backend session failed for %s", events.src_ip, exc_info=True)
         process.stderr.write(b"Connection to host closed.\r\n")
     finally:
+        # Closed outright, not with `async with`, which waited for the node to
+        # confirm the channel close -- 15 minutes on the cloud. See teardown.py.
+        if backend_conn is not None:
+            await close_inner(backend_conn, shell)
         for command in reconstructor.flush():
             await emitter.emit(pivots.mark(events, command))
         transcript.close()

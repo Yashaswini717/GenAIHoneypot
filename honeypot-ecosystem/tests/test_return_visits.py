@@ -24,15 +24,14 @@ Run with:  pytest honeypot-ecosystem/tests/ -v
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
-import io
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -363,10 +362,11 @@ def test_startup_also_clears_the_network_of_an_attacker_who_never_pivoted(broker
 
 
 class PlantingContainer:
-    """A container whose filesystem is a set of paths, as the broker sees it."""
+    """A container whose filesystem is a set of paths, as seen from inside it."""
 
     def __init__(self, prepare_script: str, existing: set[str],
-                 dirs: dict[str, int] | None = None, ancestor_script: str | None = None):
+                 dirs: dict[str, int] | None = None, ancestor_script: str | None = None,
+                 write_script: str | None = None, appears_meanwhile: set[str] | None = None):
         self.id = "c0ffee"
         self.attrs = {"Created": "2026-03-01T10:00:00.123456789Z"}
         self.prepare_script = prepare_script
@@ -374,13 +374,19 @@ class PlantingContainer:
         # Directories that exist, with their mtimes, for the ancestor script.
         self.dirs = dict(dirs or {})
         self.ancestor_script = ancestor_script
-        self.archived: list[str] = []
+        self.write_script = write_script
+        # Paths the "attacker" creates between the existence check and the write.
+        self.appears_meanwhile = set(appears_meanwhile or ())
+        self.planted: list[str] = []
+        self.contents: dict[str, bytes] = {}
+        self.finished: dict[str, tuple[str, str, int]] = {}  # path -> (mode, owner, mtime)
         self.execs: list[list[str]] = []
 
     def exec_run(self, command, user="root"):
         self.execs.append(command)
         if command[:3] == ["sh", "-c", self.prepare_script]:
             present = [p for p in command[4:] if p in self.files]
+            self.files |= self.appears_meanwhile
             return (0, "\n".join(present).encode())
         if self.ancestor_script and command[:3] == ["sh", "-c", self.ancestor_script]:
             lines = []
@@ -390,30 +396,39 @@ class PlantingContainer:
                     directory = directory.rpartition("/")[0] or "/"
                 lines.append(f"{self.dirs.get(directory, 0)} {directory}")
             return (0, "\n".join(lines).encode())
+        if self.write_script and command[:3] == ["sh", "-c", self.write_script]:
+            path, mode, owner, mtime, first, last, data = command[4:]
+            if first == "1":
+                if path in self.files:
+                    return (3, b"")
+                self.files.add(path)
+                self.planted.append(path)
+                self.contents[path] = b""
+            self.contents[path] += base64.b64decode(data)
+            if last == "1":
+                self.finished[path] = (mode, owner, int(mtime))
+            return (0, b"")
         return (0, b"")
 
     def put_archive(self, directory, data):
-        with tarfile.open(fileobj=io.BytesIO(data)) as archive:
-            for member in archive.getmembers():
-                path = f"{directory.rstrip('/')}/{member.name}"
-                self.archived.append(path)
-                self.files.add(path)
-        return True
+        raise AssertionError("decoys must be written from inside the container, not with put_archive")
 
 
 @pytest.fixture
 def writer():
     ns: dict[str, Any] = {"hashlib": hashlib, "time": time, "datetime": datetime, "log": logging.getLogger("t"), "Any": Any}
-    for const in ("_DECOY_AGE_MIN_DAYS", "_DECOY_AGE_MAX_DAYS"):
+    for const in ("_DECOY_AGE_MIN_DAYS", "_DECOY_AGE_MAX_DAYS", "_WRITE_CHUNK_BYTES"):
         ns[const] = int(re.search(rf"^{const} = (\d+)", BROKER_SRC, re.M).group(1))
-    for script in ("_PREPARE_SCRIPT", "_ANCESTOR_SCRIPT", "_BACKDATE_SCRIPT"):
+    for script in ("_PREPARE_SCRIPT", "_ANCESTOR_SCRIPT", "_BACKDATE_SCRIPT", "_WRITE_SCRIPT"):
         _extract_assignment(script, ns)
     _extract(["_prepare_paths", "_existing_ancestors", "_write_files", "_directory_times",
               "_date_directories", "_container_epoch", "_decoy_mtime", "_owner_for", "_owned_ancestors"], ns)
 
-    def run(existing: set[str], files: list[tuple[str, str, int]], dirs: dict[str, int] | None = None):
+    def run(existing: set[str], files: list[tuple[str, str, int]], dirs: dict[str, int] | None = None,
+            appears_meanwhile: set[str] | None = None):
         container = PlantingContainer(ns["_PREPARE_SCRIPT"], existing, dirs,
-                                      ns["_ANCESTOR_SCRIPT"] if dirs is not None else None)
+                                      ns["_ANCESTOR_SCRIPT"] if dirs is not None else None,
+                                      ns["_WRITE_SCRIPT"], appears_meanwhile)
         ns["_docker"] = SimpleNamespace(containers=SimpleNamespace(get=lambda _id: container))
         written, skipped = ns["_write_files"](container.id, files)
         return container, written, skipped
@@ -433,17 +448,83 @@ def test_existing_files_are_never_overwritten(writer):
         ],
     )
     assert (written, skipped) == (1, 2)
-    assert container.archived == ["/home/devuser/projects/app/README.md"]
+    assert container.planted == ["/home/devuser/projects/app/README.md"]
 
 
-def test_nothing_is_archived_when_everything_already_exists(writer):
+def test_nothing_is_written_when_everything_already_exists(writer):
     container, written, skipped = writer["run"](
         existing={"/home/devuser/.aws/credentials"},
         files=[("/home/devuser/.aws/credentials", "[default]\n", 0o600)],
     )
     assert (written, skipped) == (0, 1)
-    assert container.archived == []
+    assert container.planted == []
     assert all("chown" not in " ".join(e) for e in container.execs), "nothing written, nothing to chown"
+
+
+def test_decoys_are_written_from_inside_the_container(writer):
+    """Found on the cloud 2026-11-07: under gVisor, put_archive writes where the
+    attacker cannot see, and fails outright for a directory the sandbox made."""
+    container, written, skipped = writer["run"](
+        existing=set(),
+        files=[
+            ("/home/devuser/.aws/credentials", "[default]\naws_access_key_id = x\n", 0o600),
+            ("/srv/exports/students.csv", "id,name\n", 0o640),
+        ],
+    )
+    assert (written, skipped) == (2, 0)
+    assert container.planted == ["/home/devuser/.aws/credentials", "/srv/exports/students.csv"]
+    assert container.contents["/home/devuser/.aws/credentials"] == b"[default]\naws_access_key_id = x\n"
+    mode, owner, _ = container.finished["/home/devuser/.aws/credentials"]
+    assert (mode, owner) == ("600", "devuser")
+    mode, owner, _ = container.finished["/srv/exports/students.csv"]
+    assert (mode, owner) == ("640", ""), "root-owned paths are left as root wrote them"
+    chowns = [e for e in container.execs if e[0] == "chown"]
+    assert chowns == [["chown", "devuser:devuser", "/home/devuser/.aws"]]
+
+
+def test_a_large_decoy_is_written_in_pieces_that_reassemble(writer):
+    content = "".join(f"{i:07d} line of a long generated log\n" for i in range(6000))
+    container, written, _ = writer["run"](existing=set(), files=[("/var/log/app/big.log", content, 0o644)])
+    writes = [e for e in container.execs if e[:3] == ["sh", "-c", writer["_WRITE_SCRIPT"]]]
+    expected = -(-len(content.encode()) // writer["_WRITE_CHUNK_BYTES"])
+    assert written == 1 and len(writes) == expected > 1
+    assert [(e[8], e[9]) for e in writes] == [("1", "0")] + [("0", "0")] * (expected - 2) + [("0", "1")]
+    assert container.contents["/var/log/app/big.log"] == content.encode()
+    assert all(len(e[10]) <= 131_072 for e in writes), "each piece fits in one argument"
+
+
+def test_a_file_the_attacker_makes_meanwhile_is_left_alone(writer):
+    container, written, skipped = writer["run"](
+        existing=set(),
+        files=[("/home/devuser/notes.txt", "decoy\n", 0o644), ("/home/devuser/todo.txt", "decoy\n", 0o644)],
+        appears_meanwhile={"/home/devuser/notes.txt"},
+    )
+    assert (written, skipped) == (1, 1)
+    assert container.planted == ["/home/devuser/todo.txt"]
+
+
+@pytest.mark.skipif(shutil.which("sh") is None or shutil.which("base64") is None,
+                    reason="needs a POSIX sh and base64")
+def test_write_script_creates_appends_dates_and_never_replaces(writer, tmp_path):
+    target = tmp_path / "home" / "devuser" / ".aws" / "credentials"
+
+    def write(first, last, data, mode="600", stamp="1600000000"):
+        return subprocess.run(
+            ["sh", "-c", writer["_WRITE_SCRIPT"], "sh", target.as_posix(), mode, "", stamp, first, last,
+             base64.b64encode(data).decode()],
+            capture_output=True, text=True,
+        )
+
+    assert write("1", "0", b"[default]\n").returncode == 0
+    assert write("0", "1", b"key = x\n").returncode == 0
+    assert target.read_bytes() == b"[default]\nkey = x\n"
+    assert int(target.stat().st_mtime) == 1_600_000_000
+    if os.name != "nt":  # NTFS cannot hold Unix permission bits
+        assert target.stat().st_mode & 0o777 == 0o600
+
+    again = write("1", "1", b"replacement\n")
+    assert again.returncode == 3, again.stderr
+    assert target.read_bytes() == b"[default]\nkey = x\n"
 
 
 def test_one_exec_prepares_every_path(writer):

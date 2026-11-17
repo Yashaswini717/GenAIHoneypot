@@ -133,9 +133,12 @@ def test_a_peer_searches_the_estates_domain_not_the_cloud_hosts(index: int) -> N
 
 
 def test_the_entry_node_searches_the_estates_domain_too() -> None:
-    """jump-01 is created in _create_container, which is not extracted here."""
-    body = re.search(r"^def _create_container\(.*?(?=\n(?:def |#: |@|\Z))", SRC, re.S | re.M)
+    """jump-01 is started by _run_node, for owned and warm nodes alike; not extracted here."""
+    body = re.search(r"^def _run_node\(.*?(?=\n(?:def |#: |@|\Z))", SRC, re.S | re.M)
     assert body and "dns_search=[NODE_DOMAIN]" in body.group(0)
+    for caller in ("_create_container", "_create_pool_member"):
+        found = re.search(rf"^def {caller}\(.*?(?=\n(?:def |#: |@|\Z))", SRC, re.S | re.M)
+        assert found and "_run_node(" in found.group(0), f"{caller} no longer starts nodes through _run_node"
 
 
 @pytest.mark.parametrize("index", [0, 1])

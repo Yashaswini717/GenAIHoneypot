@@ -1,10 +1,14 @@
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.dependencies import get_decoy_stock, make_stock_content
 from api.middleware import RequestLoggingMiddleware, error_handler
+from populator.strategies import STOCK_CONTEXTS
+from storage.decoy_stock import StockFiller
 from api.routes import adaptive, decoys, generate, health, honeytokens, populate
 from api.routes.intent_classification import router as intent_classification_router
 from config.logging_config import get_logger, setup_logging
@@ -24,9 +28,23 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(get_intent_classifier)
     except Exception as exc:  # pragma: no cover - surfaced in the log
         get_logger(__name__).error("intent_model_warmup_failed", error=str(exc))
+
+    # Keep model-written decoys made ahead of time, so an attacker gets them in
+    # seconds rather than minutes (storage/decoy_stock.py). Every worker starts
+    # one; only the one holding the stock's lock file does any work.
+    filler_task = None
+    stock = get_decoy_stock()
+    if stock is not None and settings.llm_configured():
+        filler = StockFiller(
+            stock, STOCK_CONTEXTS, make_stock_content, poll_seconds=settings.decoy_stock_poll_seconds
+        )
+        filler_task = asyncio.create_task(filler.run())
     yield
     # Shutdown
-    pass
+    if filler_task is not None:
+        filler_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await filler_task
 
 
 app = FastAPI(

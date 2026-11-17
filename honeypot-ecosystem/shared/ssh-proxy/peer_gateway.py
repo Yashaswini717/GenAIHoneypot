@@ -40,6 +40,7 @@ from credentials import CredentialStore
 from emitter import EventEmitter
 from experiment import is_adaptive
 from recorder import CommandReconstructor, TranscriptWriter
+from teardown import close_inner
 import pivots
 
 log = logging.getLogger("ssh-proxy.peer")
@@ -151,25 +152,28 @@ class PeerGateway:
             "spawned" if target.get("spawned") else "existing",
         )
 
+        backend = shell = None
         try:
             if requested:
                 await self.emitter.emit(events.command(requested))
 
             backend = await _connect_when_ready(target["address"], username)
-            async with backend:
-                async with backend.create_process(
-                    requested,
-                    term_type=term_type if interactive else None,
-                    term_size=term_size[:2] if interactive else None,
-                    encoding=None,
-                ) as shell:
-                    await _pump(process, shell, reconstructor, transcript, events, self.emitter)
+            shell = await backend.create_process(
+                requested,
+                term_type=term_type if interactive else None,
+                term_size=term_size[:2] if interactive else None,
+                encoding=None,
+            )
+            await _pump(process, shell, reconstructor, transcript, events, self.emitter)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.error("pivot session to %s failed", target["hostname"], exc_info=True)
             process.stderr.write(b"Connection to host closed.\r\n")
         finally:
+            # Closed outright rather than waiting for the node; see teardown.py.
+            if backend is not None:
+                await close_inner(backend, shell)
             for command in reconstructor.flush():
                 await self.emitter.emit(pivots.mark(events, command))
             transcript.close()
