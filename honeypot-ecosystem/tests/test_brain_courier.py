@@ -3,7 +3,8 @@
 The bandit only learns from decisions that get *resolved*. `/intent-classify`
 resolves a session's previous decision each time it is called again for that
 session, which means a decision scores only if the session survives to be
-classified twice — four commands, at CLASSIFY_EVERY = 2. Anything shorter used
+classified twice -- three commands, the first decision at one command and the
+next at CLASSIFY_EVERY = 2 more. Anything shorter used
 to leave its decision pending forever, and short sessions are the common case,
 so the arms the bandit picked most often were the ones it learned least about.
 
@@ -184,8 +185,8 @@ GENERATED = {
 # --------------------------------------------------------------------------
 
 
-def test_decoy_the_attacker_never_saw_is_not_scored_as_a_failure():
-    """Two commands then an immediate disconnect.
+def test_decoy_the_attacker_never_saw_is_not_scored_as_a_failure(monkeypatch):
+    """A decision on the last command, then an immediate disconnect.
 
     This used to resolve as `session_terminated`, reward 0.0. That was wrong,
     and measurably so: `serve_fake_network_map` reached a 0.300 posterior over
@@ -197,10 +198,14 @@ def test_decoy_the_attacker_never_saw_is_not_scored_as_a_failure():
     means no observation, which is the honest record. The arm keeps its
     selection count and its posterior is untouched.
     """
+    import brain_courier
+
+    monkeypatch.setattr(brain_courier, "MIN_CLASSIFY_INTERVAL", 0)
     rec = Recorder()
     courier = build_courier(rec)
 
-    drive(courier, [command("s1", "whoami"), command("s1", "uname -a"), closed("s1")])
+    # Decisions at commands 1 and 3; the second is the one left unseen.
+    drive(courier, [command("s1", "whoami"), command("s1", "uname -a"), command("s1", "id"), closed("s1")])
 
     assert "/api/v1/intent-classify" in rec.paths(), "the session should have been classified"
     assert rec.feedback() == [], "an unseen decoy must not be scored at all"
@@ -254,16 +259,40 @@ def test_activity_after_the_decoy_scores_as_continued():
     assert feedback[0]["signal"] == "session_continued"
 
 
-def test_unclassified_session_sends_no_feedback():
-    """One command never reaches the bandit, so there is nothing to resolve."""
+def test_a_one_command_session_gets_a_decision_and_a_decoy():
+    """Found on the cloud honeypot: bots that ran one command (`cat /bin/echo`)
+    and left never reached the bandit, so they never got a decoy."""
     rec = Recorder()
     courier = build_courier(rec)
 
-    drive(courier, [command("s3", "whoami"), closed("s3")])
+    drive(courier, [command("s3", "echo 1 > /dev/null && cat /bin/echo")])
+
+    assert len(rec.classifies()) == 1, "the first command is enough for a first decision"
+    assert rec.plants(), "and that decision is planted while the bot is still connected"
+
+
+def test_a_one_command_session_that_leaves_at_once_is_not_scored():
+    """The decoy went in, but nobody was there long enough to see it."""
+    rec = Recorder()
+    courier = build_courier(rec)
+
+    drive(courier, [command("s3b", "whoami"), closed("s3b")])
 
     assert rec.feedback() == []
-    assert "/api/v1/intent-classify" not in rec.paths()
     assert courier.resolved == 0
+
+
+def test_after_the_first_decision_it_classifies_every_second_command(monkeypatch):
+    import brain_courier
+
+    monkeypatch.setattr(brain_courier, "MIN_CLASSIFY_INTERVAL", 0)
+    rec = Recorder()
+    courier = build_courier(rec)
+
+    drive(courier, [command("s3c", f"cmd-{i}") for i in range(1, 6)])
+
+    # Decisions at commands 1, 3 and 5.
+    assert [len(c["commands"]) for c in rec.classifies()] == [1, 3, 3]
 
 
 def test_close_without_any_session_state_is_harmless():
@@ -915,7 +944,21 @@ def test_the_fallback_owner_never_undoes_the_real_one():
     ])
 
     assert courier.sessions["p4"].attacker == "10.0.0.5"
-    assert all(p["attacker"] == "10.0.0.5" for p in rec.plants())
+    assert rec.plants() and all(p["attacker"] == "10.0.0.5" for p in rec.plants())
+
+
+def test_a_pivot_waits_for_its_real_owner_before_the_first_decision():
+    """The first-command decision must not plant into the jump host's address,
+    which owns no environment: that decoy would never arrive or be retried."""
+    rec = Recorder()
+    courier = build_courier(rec)
+
+    drive(courier, [{**pivot_command("p5", "hostname"), "attacker": "172.23.0.2"}])
+    assert rec.classifies() == [] and rec.plants() == []
+
+    second = build_courier(rec)  # this one sees the real owner from the start
+    drive(second, [pivot_command("p6", "hostname")])
+    assert [p["attacker"] for p in rec.plants()] == ["10.0.0.5"]
 
 
 def test_a_nested_line_neither_trips_nor_classifies():
