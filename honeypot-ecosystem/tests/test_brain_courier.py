@@ -978,3 +978,26 @@ def test_a_nested_line_neither_trips_nor_classifies():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_feed_waits_for_room_instead_of_dropping():
+    """The courier's own file reader waits on a full queue: nothing else waits
+    on that reader, so there is no reason to drop adaptive input."""
+
+    async def scenario():
+        courier = BrainCourier(brain_url="http://ai-brain:8000", broker_url="http://b:8080")
+        courier.queue = asyncio.Queue(maxsize=1)
+        await courier.feed({"n": 1})
+        waiting = asyncio.create_task(courier.feed({"n": 2}))
+        await asyncio.sleep(0.05)
+        assert not waiting.done()
+        assert await courier.queue.get() == {"n": 1}
+        await asyncio.wait_for(waiting, 1)
+        assert await courier.queue.get() == {"n": 2}
+        disabled = BrainCourier(brain_url="http://ai-brain:8000", broker_url="http://b:8080", enabled=False)
+        await disabled.feed({"n": 3})
+        assert disabled.queue.empty()
+        await courier.close()
+        await disabled.close()
+
+    asyncio.run(scenario())

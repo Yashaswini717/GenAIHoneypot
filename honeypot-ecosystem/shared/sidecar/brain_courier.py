@@ -276,6 +276,15 @@ class BrainCourier:
             # is not. The hub branch must never wait on this queue.
             log.warning("brain queue full, dropping an event for adaptation")
 
+    async def feed(self, event: dict[str, Any]) -> None:
+        """Hand an event over, waiting while the queue is full.
+
+        For the courier's own reader of the event file (shipper.CourierFeed).
+        Nothing else waits on that reader, so it can wait rather than drop.
+        """
+        if self.enabled:
+            await self.queue.put(event)
+
     # -- main loop ---------------------------------------------------------
 
     async def run(self) -> None:

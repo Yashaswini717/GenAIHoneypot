@@ -426,3 +426,102 @@ def test_a_run_of_blank_lines_is_not_read_forever(configured):
         assert await s.read_new_lines() == []
 
     run_with(FakeHub(), scenario)
+
+
+# --------------------------------------------------------------------------
+# the brain branch's own reader
+# --------------------------------------------------------------------------
+
+
+class Collector:
+    """Stands in for the brain courier: remembers what it was handed."""
+
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    async def feed(self, event: dict) -> None:
+        self.events.append(event)
+
+    def offer(self, event: dict) -> None:
+        raise AssertionError("the hub branch no longer hands events to the courier")
+
+    async def close(self) -> None:
+        pass
+
+
+def test_the_courier_sees_a_command_before_the_hub_has_it(configured):
+    """A decision used to wait until every earlier event had reached the hub:
+    3 s after a reboot, up to 13.5 s in a flood. The courier now reads first."""
+    hub = FakeHub()
+    events = [event(eventid="cowrie.session.connect"), event(input="uname -a")]
+    configured.event_path.write_bytes(b"\n".join(events) + b"\n")
+
+    async def scenario(s):
+        s.feed.courier = collector = Collector()
+        assert await s.feed.read() == 2
+        assert [e["eventid"] for e in collector.events] == ["cowrie.session.connect", "cowrie.command.input"]
+        assert hub.stored == []
+
+    run_with(hub, scenario)
+
+
+def test_the_hub_branch_no_longer_hands_events_to_the_courier(configured):
+    hub = FakeHub()
+    events = [event(input="whoami"), event(input="id")]
+    configured.event_path.write_bytes(b"\n".join(events) + b"\n")
+
+    async def scenario(s):
+        s.courier = Collector()  # its offer() fails the test if called
+        await s.ship(await s.read_new_lines())
+
+    run_with(hub, scenario)
+    assert hub.stored == events
+
+
+def test_the_courier_feed_waits_for_a_whole_line_and_skips_blank_ones(configured):
+    configured.event_path.write_bytes(b"\n" + event(input="whoami") + b"\n\n" + b'{"eventid": "cowrie.comm')
+
+    async def scenario(s):
+        s.feed.courier = collector = Collector()
+        assert await s.feed.read() == 1
+        assert await s.feed.read() == 0  # the proxy is still writing the next one
+        with configured.event_path.open("ab") as handle:
+            handle.write(b'and.input"}\n')
+        assert await s.feed.read() == 1
+        assert [e["eventid"] for e in collector.events] == ["cowrie.command.input"] * 2
+        assert collector.events[0]["input"] == "whoami"
+
+    run_with(FakeHub(), scenario)
+
+
+def test_after_a_restart_the_courier_feed_starts_at_the_hub_branchs_checkpoint(configured):
+    hub = FakeHub()
+    configured.event_path.write_bytes(event(input="whoami") + b"\n" + event(input="id") + b"\n")
+
+    async def before_restart(s):
+        await s.ship(await s.read_new_lines())
+
+    run_with(hub, before_restart)
+    with configured.event_path.open("ab") as handle:
+        handle.write(event(input="uname -a") + b"\n")
+
+    async def after_restart(s):
+        s.feed.courier = collector = Collector()
+        assert await s.feed.read() == 1
+        assert [e["input"] for e in collector.events] == ["uname -a"]
+
+    run_with(hub, after_restart)
+
+
+def test_the_courier_feed_follows_a_new_event_file(configured):
+    configured.event_path.write_bytes(event(input="whoami") + b"\n")
+
+    async def scenario(s):
+        s.feed.courier = collector = Collector()
+        assert await s.feed.read() == 1
+        configured.event_path.unlink()
+        configured.event_path.write_bytes(event(input="id") + b"\n")
+        assert await s.feed.read() == 1
+        assert [e["input"] for e in collector.events] == ["whoami", "id"]
+
+    run_with(FakeHub(), scenario)

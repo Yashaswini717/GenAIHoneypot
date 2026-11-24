@@ -35,8 +35,12 @@ happens, and it puts each event on the live WebSocket feed immediately.
 
 Ordering is preserved by sending sequentially. That matters: the hub upserts a
 session row on first sight, so `session.connect` has to arrive before the
-commands belonging to it. Throughput is not a concern at honeypot volumes —
-even heavy distributed brute force is a few tens of events per second.
+commands belonging to it. The price is throughput. On the cloud the hub took
+0.1 to 0.6 s per event, so the sidecar delivered at most about 9 a second, and
+during the brute-force floods of 2026-11-11 it fell behind by up to 13.5 s
+(0.3 s at the median). The audit trail can afford that. The adaptive side
+cannot, which is why the brain courier reads the event file itself
+(`CourierFeed`) instead of waiting for this loop.
 
 Delivery is at-least-once and durable, and the hub makes it exactly-once in
 effect. An event that cannot be delivered is written to a spool directory and
@@ -324,6 +328,75 @@ class DeadLetters:
 
 
 # --------------------------------------------------------------------------
+# the brain branch's own reader
+# --------------------------------------------------------------------------
+
+
+class CourierFeed:
+    """Hands each event to the brain courier as soon as the proxy writes it.
+
+    The courier used to be fed from the hub loop, which sends one event at a
+    time and waits for each answer, so it saw an attacker's command only once
+    every event before it had reached the hub. On the cloud, decisions waited
+    for that:
+    - after a reboot, 3 s for the hub's first ingest;
+    - on 2026-11-11, a day of brute-force floods, up to 13.5 s.
+    Now the courier reads the file itself, with its own watcher and offset,
+    and the hub's pace no longer matters to it.
+
+    It starts at the hub branch's checkpoint, so after a restart it sees the
+    events the hub branch has yet to handle, as before. Its offset lives in
+    memory only, like the courier's own state.
+    """
+
+    def __init__(self, path: Path, courier: BrainCourier, inode: int, offset: int) -> None:
+        self.path = path
+        self.courier = courier
+        self.inode = inode
+        self.offset = offset
+        self.watcher = EventWatcher(path)
+
+    async def read(self) -> int:
+        """Hand over every complete event appended since the last read; return how many."""
+        if not self.path.exists():
+            return 0
+        stat = self.path.stat()
+        if stat.st_ino != self.inode:
+            self.inode, self.offset = stat.st_ino, 0
+        elif stat.st_size < self.offset:
+            self.offset = 0
+        if stat.st_size == self.offset:
+            return 0
+        with self.path.open("rb") as handle:
+            handle.seek(self.offset)
+            chunk = handle.read(stat.st_size - self.offset)
+        last_newline = chunk.rfind(b"\n")
+        if last_newline == -1:
+            return 0  # the proxy is mid-write
+        self.offset += last_newline + 1
+        count = 0
+        for raw in chunk[: last_newline + 1].split(b"\n"):
+            if raw.strip():
+                await self.courier.feed(_parse(raw))
+                count += 1
+        return count
+
+    async def run(self) -> None:
+        while True:
+            try:
+                if not await self.read():
+                    await self.watcher.wait(config.flush_interval)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("courier feed error; retrying", exc_info=True)
+                await asyncio.sleep(1)
+
+    def close(self) -> None:
+        self.watcher.close()
+
+
+# --------------------------------------------------------------------------
 # shipping
 # --------------------------------------------------------------------------
 
@@ -340,6 +413,7 @@ class Shipper:
             broker_url=config.broker_url,
             enabled=config.brain_enabled,
         )
+        self.feed = CourierFeed(config.event_path, self.courier, self.position.inode, self.position.offset)
         self.delivered = 0
         self.duplicates = 0
         self.failed = 0
@@ -348,6 +422,7 @@ class Shipper:
     async def close(self) -> None:
         await self.client.aclose()
         await self.courier.close()
+        self.feed.close()
         self.watcher.close()
 
     async def deliver(self, body: bytes) -> Delivery:
@@ -482,7 +557,7 @@ class Shipper:
         hub answers 409 and it counts as delivered.
         """
         for line in lines:
-            self.courier.offer(_parse(line.body))
+            # The courier reads the file itself (CourierFeed); nothing to hand it here.
             result = await self.deliver(line.body)
             if result.outcome is Outcome.RETRY:
                 self.spool.add(line.body)
@@ -523,17 +598,15 @@ class Shipper:
                     await self.watcher.wait(config.flush_interval)
                     continue
 
-                # The fan-out. Both branches start from the same signed event.
-                #
-                # Hub branch: sequential and one at a time. Sequential because
-                # the hub upserts a session row on first sight, so
+                # The hub branch: sequential and one at a time. Sequential
+                # because the hub upserts a session row on first sight, so
                 # session.connect has to land before its commands; one at a
                 # time because only /ingest/ takes signed sensor events.
                 #
-                # Brain branch: queued and non-blocking. Intent is a property
-                # of a command sequence rather than of one event, and a slow
-                # or absent brain must never delay, reorder or drop what
-                # reaches the hub.
+                # The brain branch reads the same file on its own
+                # (CourierFeed), so neither waits for the other: a slow brain
+                # never delays what reaches the hub, and a slow hub never
+                # delays a decision.
                 await self.ship(lines)
 
                 if self.spool.depth:
@@ -558,12 +631,13 @@ def _parse(body: bytes) -> dict:
 
 async def main() -> None:
     shipper = Shipper()
-    courier_task = asyncio.create_task(shipper.courier.run())
+    branches = [asyncio.create_task(shipper.courier.run()), asyncio.create_task(shipper.feed.run())]
     try:
         await shipper.run()
     finally:
-        courier_task.cancel()
-        await asyncio.gather(courier_task, return_exceptions=True)
+        for task in branches:
+            task.cancel()
+        await asyncio.gather(*branches, return_exceptions=True)
         await shipper.close()
 
 
